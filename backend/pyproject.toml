@@ -36,6 +36,11 @@ dev = [
   "ruff==0.8.3",
   "pytest==8.3.4",
   "pytest-asyncio==0.24.0",
+  # CI-only safety net: fails a hung test loudly instead of blocking the job forever (see
+  # the "Warm up LangGraph checkpoint schema" CI step for the specific stall this guards
+  # against — AsyncPostgresSaver.setup()'s CREATE INDEX CONCURRENTLY blocking on a
+  # concurrently open transaction elsewhere in the test run).
+  "pytest-timeout==2.3.1",
 ]
 
 [tool.hatch.build.targets.wheel]
