@@ -226,19 +226,72 @@ UPDATE_SCORING_FORMULA_TOOL = ToolSpec(
     },
 )
 
-_TOOLS = [ASK_CLARIFICATION_TOOL, UPDATE_DRAFT_TOOL, UPDATE_SCORING_FORMULA_TOOL]
+RESPOND_CONVERSATIONALLY_TOOL = ToolSpec(
+    name="respond_conversationally",
+    description=(
+        "Reply to the user in free-text prose WITHOUT changing the draft in any way — no "
+        "KPIs, weights, guidelines, scalar fields, or scoring_formula are touched when you "
+        "call this. Use it when the user's latest message is exploratory/informational "
+        "rather than a decision: an open question ('what are common KPI frameworks for "
+        "vendor risk?'), a request to explain, compare, or discuss options, a follow-up "
+        "question about something you already said, or a reaction that doesn't itself "
+        "commit to anything. Also use it to report back what you found after an on-demand "
+        "web_search the user explicitly asked for ('can you look that up'), when they "
+        "haven't ALSO told you what to do with the result yet. Give a genuinely "
+        "informative, specific answer — weave in real findings from web_search or the "
+        "research context above when relevant, not vague generalities. "
+        "Do NOT call this when the user has expressed a clear decision or preference "
+        "('yes, use that one', 'I like the GDPR-based approach, add it', 'rename it to "
+        "X', 'looks good, save it') — call update_draft (or update_scoring_formula) "
+        "instead so the change actually happens, not just gets described. Do NOT call "
+        "this when you are missing information you genuinely need before you can proceed "
+        "— call ask_clarification instead."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "response": {
+                "type": "string",
+                "description": "Your free-text reply to show the user, as normal chat prose.",
+            },
+        },
+        "required": ["response"],
+    },
+)
+
+_TOOLS = [ASK_CLARIFICATION_TOOL, UPDATE_DRAFT_TOOL, UPDATE_SCORING_FORMULA_TOOL, RESPOND_CONVERSATIONALLY_TOOL]
 _TOOLS_WITH_SEARCH = [*_TOOLS, WEB_SEARCH_TOOL]
 
 # Bounds how many times propose_kpis will let the model call web_search within a single
 # node visit (i.e. per LLM "turn" as MAX_LLM_TURNS_PER_HUMAN_TURN counts them) before
-# forcing closure — offering only ask_clarification/update_draft (no web_search) on the
-# next call, which the model cannot route around since force_tool_use is always on. This
-# mirrors the reference project's "cap ~3 search iterations then force closure" pattern,
-# adapted to this project's strict-tool-choice mechanism instead of a prompt+regex loop.
-# Kept as a genuine fallback/follow-up budget even now that `research_kpis` (below) does
-# the primary, structured research fan-out once per session — e.g. for a later turn where
-# the user pivots the domain, or the fan-out itself was skipped/failed (see research_kpis).
+# forcing closure — offering only the non-search tools (which now include
+# respond_conversationally — see RESPOND_CONVERSATIONALLY_TOOL) on the next call, which the
+# model cannot route around since force_tool_use is always on. This mirrors the reference
+# project's "cap ~3 search iterations then force closure" pattern, adapted to this
+# project's strict-tool-choice mechanism instead of a prompt+regex loop. Kept as a genuine
+# fallback/follow-up budget even now that `research_kpis` (below) does the primary,
+# structured research fan-out once per session — e.g. for a later turn where the user
+# pivots the domain, asks an ad hoc follow-up research question mid-conversation (see
+# RESPOND_CONVERSATIONALLY_TOOL's own docstring/the module's "on-demand search" feature),
+# or the fan-out itself was skipped/failed (see research_kpis).
 MAX_WEB_SEARCH_CALLS_PER_PROPOSE = 3
+
+# Session-level ceiling on propose_kpis's OWN ad hoc web_search usage — separate from, and
+# in addition to, MAX_WEB_SEARCH_CALLS_PER_PROPOSE (which only bounds a single node VISIT,
+# i.e. a single LLM sub-loop within one human turn). Without this, a long-lived session
+# with many human turns could rack up unbounded real Gateway calls over its lifetime (e.g.
+# 3 searches x 4 propose_kpis visits x dozens of human turns) even though each individual
+# turn is itself bounded — exactly the "can't be abused into unbounded search cost" gap
+# flagged for the new on-demand-mid-conversation search capability. Deliberately generous
+# (not a tight per-message quota): a real user researching a scorecard across a long
+# conversation should rarely hit it, and once hit, web_search simply stops being offered
+# for the rest of the session — propose_kpis still works fine on its own knowledge/the
+# research_kpis fan-out's findings, exactly like the graceful-degradation path when no
+# web_search_client is wired in at all. Does NOT count research_kpis's own fan-out search
+# calls (those are already separately, tightly bounded by MAX_RESEARCH_ROUNDS x
+# MAX_RESEARCH_ANGLES x MAX_SEARCH_CALLS_PER_RESEARCH_AGENT — see those constants) — mixing
+# the two counters would conflate two independently-reasoned-about budgets for no benefit.
+MAX_WEB_SEARCH_CALLS_PER_SESSION = 15
 
 
 # --- Multi-agent research fan-out (research_kpis node) ----------------------------------
@@ -1427,7 +1480,31 @@ domain, an audience, a target score (0-10), and a set of weighted KPIs (max 4 le
 deep), each with an 11-level (0-10) qualitative + quantitative guideline.
 
 You MUST respond on every turn by calling exactly one of the available tools — never \
-reply in plain text.
+reply in plain text. This does NOT mean every turn must change the draft: \
+`respond_conversationally` is a real, first-class tool for genuinely talking with the \
+user (answering a question, discussing/comparing options, reporting back what you found) \
+without touching the draft at all — use it freely. Decide which tool fits the user's \
+LATEST message like this:
+- A clear decision/preference/instruction to change something ("yes, use that one", "I \
+like the GDPR-based approach, add it", "rename it to X", "looks good, save it", "make \
+compliance weigh more") -> `update_draft` (or `update_scoring_formula` for HOW the score \
+is computed — see below). This is the ONLY way an actual change happens; describing a \
+change inside `respond_conversationally` does NOT apply it.
+- An exploratory/informational question, a request to explain or compare options, or a \
+reaction that doesn't itself decide anything ("what are common KPI frameworks for X?", \
+"what's a reasonable way to weight A vs B?", "can you explain why you picked that \
+threshold?") -> `respond_conversationally`. Use `web_search` first (see below — it is \
+available on THIS and every turn, not just your very first) if you need current, real \
+information you don't already have, then report it back conversationally.
+- The user explicitly asks you to look something up ("can you look that up", "search for \
+current X benchmarks") -> use `web_search`, then report what you found via \
+`respond_conversationally` UNLESS they also told you what to do with the result (in which \
+case fold it straight into `update_draft`).
+- You are missing information you genuinely need before you can proceed at all -> \
+`ask_clarification`.
+Never let a genuine back-and-forth discussion get flattened into a rigid \
+ask_clarification chip-question or an unwanted draft mutation — `respond_conversationally` \
+exists precisely so a real conversation can happen in between.
 
 If the draft already has KPIs (e.g. merged in from the multi-agent research fan-out that \
 ran before your first turn this session — each already has a name, weight, and full \
@@ -1456,7 +1533,11 @@ published standards, and benchmark thresholds for the user's stated domain BEFOR
 proposing quantitative guideline thresholds via `update_draft` — the framework requires \
 replacing vague adjectives ("fast", "good") with real measures, and a real published \
 benchmark is far better than a plausible-sounding invented number. Weave what you find \
-into both the qualitative guideline text and the quantitative_criteria you propose.
+into both the qualitative guideline text and the quantitative_criteria you propose. \
+`web_search` is offered on EVERY turn it's configured for, not only your first — feel \
+free to search again later in the conversation if the user pivots domain, asks a new \
+research question, or explicitly asks you to look something up (see above); it isn't \
+limited to the very first message.
 
 The user may also ask you to change HOW the final score is computed — e.g. "weight X more \
 heavily than a plain average would" or "use the minimum of these two KPIs instead of \
@@ -1503,6 +1584,12 @@ class BuilderState(TypedDict):
     # rest of the session to ground its KPI/threshold proposals in.
     research_done: bool
     research_findings: list[dict[str, Any]] | None
+    # On-demand mid-conversation web_search wiring (see MAX_WEB_SEARCH_CALLS_PER_SESSION
+    # above and RESPOND_CONVERSATIONALLY_TOOL): total number of web_search calls
+    # propose_kpis's own ad hoc loop has made across the WHOLE session so far (every human
+    # turn, not just one node visit) — checkpointed like every other field here, so the
+    # budget survives a restart/resume exactly as robustly as the rest of this state.
+    web_search_calls_used: int
 
 
 def initial_state(session_id: str, first_user_message: str) -> BuilderState:
@@ -1519,6 +1606,7 @@ def initial_state(session_id: str, first_user_message: str) -> BuilderState:
         similar_suggestions=None,
         research_done=False,
         research_findings=None,
+        web_search_calls_used=0,
     )
 
 
@@ -1678,7 +1766,11 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
                 "missing_fields": draft.missing_fields(),
             },
         }
-        assistant_note = "[safety cutoff] paused after MAX_LLM_TURNS_PER_HUMAN_TURN consecutive LLM turns."
+        # The persisted/returned chat message must be the actual question text the user
+        # sees (this is what the frontend renders as the assistant's bubble content — see
+        # _to_turn_result/ChatTurnRead.assistant_message) — never an internal debug label;
+        # the cutoff itself is still logged server-side below for diagnosis.
+        assistant_note = pending_tool["input"]["question"]
         logger.warning("propose_kpis hit MAX_LLM_TURNS_PER_HUMAN_TURN; forcing a pause.")
         return {
             "pending_tool": pending_tool,
@@ -1699,6 +1791,11 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
     # duplicate everything already checkpointed.
     local_messages: list[ChatTurn] = list(state["messages"])
     search_calls_made = 0
+    # Session-level budget already spent in EARLIER human turns (see
+    # MAX_WEB_SEARCH_CALLS_PER_SESSION's own docstring) — `search_calls_made` above only
+    # counts calls made within THIS node visit; the two are summed below wherever the
+    # session cap is checked, and the running total is persisted back to state at the end.
+    web_search_calls_used_before = state.get("web_search_calls_used", 0)
 
     # Consolidated context from the (at-most-once-per-session) research fan-out — see
     # research_kpis/_run_research_agent above. Persists in state across every propose_kpis
@@ -1715,8 +1812,13 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
     )
 
     while True:
+        session_budget_available = (
+            web_search_calls_used_before + search_calls_made < MAX_WEB_SEARCH_CALLS_PER_SESSION
+        )
         search_budget_available = (
-            web_search_client is not None and search_calls_made < MAX_WEB_SEARCH_CALLS_PER_PROPOSE
+            web_search_client is not None
+            and search_calls_made < MAX_WEB_SEARCH_CALLS_PER_PROPOSE
+            and session_budget_available
         )
         tools = _TOOLS_WITH_SEARCH if search_budget_available else _TOOLS
 
@@ -1733,14 +1835,20 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
             scoring_formula_context=scoring_formula_context,
         )
         if web_search_client is not None and not search_budget_available:
-            # Forced-closure step (see MAX_WEB_SEARCH_CALLS_PER_PROPOSE): web_search is no
-            # longer offered in `tools` at all, so the model literally cannot call it
-            # again — force_tool_use means it must pick one of the two remaining tools.
-            # This instruction just makes the "why" explicit to the model too.
+            # Forced-closure step (see MAX_WEB_SEARCH_CALLS_PER_PROPOSE /
+            # MAX_WEB_SEARCH_CALLS_PER_SESSION): web_search is no longer offered in `tools`
+            # at all, so the model literally cannot call it again — force_tool_use means it
+            # must pick one of the remaining tools. This instruction just makes the "why"
+            # explicit to the model too.
+            budget_reason = (
+                "you've used this session's whole web research budget"
+                if not session_budget_available
+                else "you have used your web research budget for this turn"
+            )
             system_prompt += (
-                "\n\nYou have used your web research budget for this turn. You now have "
-                "enough information to proceed — respond with update_draft or "
-                "ask_clarification now; web_search is no longer available this turn."
+                f"\n\nweb_search is no longer available ({budget_reason}). You now have "
+                "enough information to proceed — respond with update_draft, "
+                "ask_clarification, or respond_conversationally now."
             )
         if draft.is_complete():
             # Convergence fix (found via a real live run: a fully-grounded, already-
@@ -1809,7 +1917,37 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
 
     if result.is_tool_use:
         pending_tool = {"name": result.tool_name, "input": result.tool_input or {}}
-        assistant_note = f"[called {result.tool_name}] {json.dumps(result.tool_input)}"
+        # The persisted/returned message content is what the frontend renders directly as
+        # the assistant's chat bubble (see _to_turn_result -> ChatTurnRead.assistant_message
+        # -> MessageBubble) — it must be real, user-facing text, never an internal
+        # "[called tool_name] {raw json}" debug label. `ask_clarification`'s structured
+        # question/options/missing_fields still flow separately via the interrupt payload
+        # itself (see ask_clarification node) for ClarifyingQuestionCard to render; this is
+        # just the plain-text echo of the same question shown in the transcript bubble
+        # above that card. `respond_conversationally` is the tool this whole mechanism
+        # exists for — its `response` field IS the user-facing message, verbatim.
+        tool_input = result.tool_input or {}
+        if result.tool_name == "ask_clarification":
+            assistant_note = str(tool_input.get("question") or "").strip() or (
+                "Could you tell me more about what this scorecard should measure?"
+            )
+        elif result.tool_name == "respond_conversationally":
+            assistant_note = str(tool_input.get("response") or "").strip() or (
+                "(The assistant didn't include a response — please try rephrasing.)"
+            )
+        elif result.tool_name == "update_scoring_formula":
+            formula = tool_input.get("formula")
+            assistant_note = (
+                f'Setting a custom scoring formula: {formula!r}'
+                if formula
+                else "Clearing the custom scoring formula — reverting to the default weighted average."
+            )
+        else:  # update_draft
+            assistant_note = (
+                "Confirming and saving the draft."
+                if tool_input.get("confirmed")
+                else "Updating the draft."
+            )
     else:
         # Defensive fallback: force_tool_use was requested but the model still replied
         # in plain text (e.g. a provider that silently ignores toolChoice). Convert it
@@ -1824,7 +1962,7 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
                 "missing_fields": draft.missing_fields(),
             },
         }
-        assistant_note = f"[fallback ask_clarification] {fallback_question}"
+        assistant_note = fallback_question
         logger.warning(
             "Model replied without a tool call despite force_tool_use; "
             "synthesized a fallback ask_clarification."
@@ -1835,6 +1973,8 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
 
     if pending_tool.get("name") == "ask_clarification":
         completed_message = f"Asking: {pending_tool.get('input', {}).get('question', '')}"
+    elif pending_tool.get("name") == "respond_conversationally":
+        completed_message = "Responding conversationally — draft left unchanged."
     elif (pending_tool.get("input") or {}).get("confirmed"):
         completed_message = "Draft confirmed — saving the scorecard."
     else:
@@ -1845,6 +1985,7 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
         "pending_tool": pending_tool,
         "messages": new_messages,
         "llm_turn_count": turn_count + 1,
+        "web_search_calls_used": web_search_calls_used_before + search_calls_made,
     }
 
 
@@ -1855,6 +1996,8 @@ def _route_after_propose(state: BuilderState) -> str:
         return "ask_clarification"
     if name == "update_scoring_formula":
         return "update_scoring_formula"
+    if name == "respond_conversationally":
+        return "respond_conversationally"
     return "update_draft"
 
 
@@ -1871,6 +2014,34 @@ def ask_clarification(state: BuilderState) -> dict[str, Any]:
         "messages": [{"role": "user", "content": str(answer)}],
         # The human just answered — give the model a fresh LLM-turn budget for whatever
         # comes next (see MAX_LLM_TURNS_PER_HUMAN_TURN).
+        "llm_turn_count": 0,
+    }
+
+
+def respond_conversationally(state: BuilderState) -> dict[str, Any]:
+    """Pauses the graph after a genuinely conversational, NON-mutating reply — the model
+    answered a question / discussed options / reported research findings via
+    `respond_conversationally` (see RESPOND_CONVERSATIONALLY_TOOL) without touching
+    `draft.kpis`/`draft.scoring_formula`/any scalar field. Mirrors `ask_clarification`'s
+    own `interrupt()` pattern exactly (same crash/restart safety — AsyncPostgresSaver has
+    already checkpointed everything up to this point): the human turn ends here, waiting
+    for the user's actual next message, and resuming re-enters this node with `answer`
+    bound to whatever they said, handled identically to `ask_clarification`'s own resume
+    path (a fresh `llm_turn_count` budget, the answer appended as a new user turn).
+
+    The interrupt VALUE's `kind: "conversational_response"` marker (as opposed to
+    `ask_clarification`'s bare `{question, options, missing_fields}` payload, or
+    `suggest_similar`'s `kind: "similar_suggestions"`) is what `_to_turn_result` uses to
+    map this turn to `status: "gathering"` with `question: None` — i.e. render as a plain
+    assistant chat bubble, never `ClarifyingQuestionCard`'s chip UI (see that function and
+    `ChatTurnRead.question` in app/schemas/chat.py)."""
+    response_payload = (state.get("pending_tool") or {}).get("input", {})
+    payload = {"kind": "conversational_response", "response": response_payload.get("response", "")}
+    answer = interrupt(payload)
+    return {
+        "pending_tool": None,
+        "pending_question": None,
+        "messages": [{"role": "user", "content": str(answer)}],
         "llm_turn_count": 0,
     }
 
@@ -1992,6 +2163,7 @@ def build_graph_definition() -> StateGraph:
     graph.add_node("research_kpis", research_kpis)
     graph.add_node("propose_kpis", propose_kpis)
     graph.add_node("ask_clarification", ask_clarification)
+    graph.add_node("respond_conversationally", respond_conversationally)
     graph.add_node("update_draft", update_draft)
     graph.add_node("update_scoring_formula", update_scoring_formula)
     graph.add_node("confirm", confirm)
@@ -2017,9 +2189,14 @@ def build_graph_definition() -> StateGraph:
             "ask_clarification": "ask_clarification",
             "update_draft": "update_draft",
             "update_scoring_formula": "update_scoring_formula",
+            "respond_conversationally": "respond_conversationally",
         },
     )
     graph.add_edge("ask_clarification", "propose_kpis")
+    # respond_conversationally mirrors ask_clarification's own edge exactly (see its
+    # docstring): it pauses via interrupt(), then resumes straight back into propose_kpis
+    # once the user's next real message arrives — never routes anywhere else.
+    graph.add_edge("respond_conversationally", "propose_kpis")
     graph.add_conditional_edges(
         "update_draft",
         _route_after_update,
@@ -2137,6 +2314,14 @@ def _to_turn_result(state: dict[str, Any]) -> BuilderTurnResult:
         if isinstance(value, dict) and value.get("kind") == "similar_suggestions":
             status = "awaiting_similar_choice"
             similar_suggestions = value.get("suggestions", [])
+        elif isinstance(value, dict) and value.get("kind") == "conversational_response":
+            # respond_conversationally paused here (see that node's own docstring) — a
+            # genuinely conversational, non-mutating reply. Deliberately status="gathering"
+            # with question left None (never "awaiting_clarification"): the frontend must
+            # render this as a normal assistant chat bubble, not ClarifyingQuestionCard's
+            # chip UI — see ChatTurnRead.question in app/schemas/chat.py and
+            # ChatWorkspace.tsx's `message.clarifyingQuestion` check.
+            status = "gathering"
         else:
             status = "awaiting_clarification"
             question = value
