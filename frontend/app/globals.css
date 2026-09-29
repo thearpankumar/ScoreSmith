@@ -1,0 +1,220 @@
+@import "tailwindcss";
+@plugin "tailwindcss-animate";
+
+/* ===========================================================================
+   Quality Scorecard System — design tokens
+   Glassmorphism, white + #FFF700 ("lemon"). See the plan's design-system
+   section for the source of truth. Hard rule: #FFF700 is a FILL colour
+   only — it is never used as text, icon, or a thin border directly on
+   white (~1.1:1 contrast, effectively invisible). Text in the yellow
+   family always uses --lemon-ink instead.
+   ========================================================================= */
+
+:root {
+  /* Base surfaces / ink */
+  --bg: #fafaf5;
+  --ink: #16161a;
+  --ink-muted: #5b5b63;
+
+  /* Brand lemon — fill-only, see rule above */
+  --lemon: #fff700;
+  --lemon-hover: #ede600;
+  --lemon-ink: #6b6100;
+  --lemon-soft: #fffce0;
+
+  /* Glass elevations: rgba(255,255,255, .55-.82) + blur(12-24px) */
+  --glass-1: rgba(255, 255, 255, 0.55);
+  --glass-1-blur: 12px;
+  --glass-2: rgba(255, 255, 255, 0.68);
+  --glass-2-blur: 16px;
+  --glass-3: rgba(255, 255, 255, 0.82);
+  --glass-3-blur: 24px;
+  --glass-border: rgba(255, 255, 255, 0.6);
+
+  /* Solid (dense-data) surfaces */
+  --solid: #ffffff;
+  --hairline: rgba(22, 22, 26, 0.09);
+
+  /* Elevation shadows */
+  --shadow-1: 0 1px 2px rgba(22, 22, 26, 0.05), 0 1px 1px rgba(22, 22, 26, 0.04);
+  --shadow-2: 0 6px 16px rgba(22, 22, 26, 0.08), 0 2px 6px rgba(22, 22, 26, 0.05);
+  --shadow-3: 0 16px 40px rgba(22, 22, 26, 0.14), 0 6px 12px rgba(22, 22, 26, 0.07);
+
+  /* Focus ring — deliberately NOT lemon (fails contrast on white); a
+     saturated blue reads clearly on both glass and solid surfaces. */
+  --focus: #1d4ed8;
+
+  /* RAG (red/amber/green) evaluation-score palette — separate from brand */
+  --rag-excellent: #1b5e20;
+  --rag-good: #66bb6a;
+  --rag-acceptable: #9e9e9e;
+  --rag-needs-improvement: #f9a825;
+  --rag-weak: #e65100;
+  --rag-poor: #d32f2f;
+  --rag-critical: #7f0000;
+}
+
+/* Users who've asked the OS to reduce transparency effects get solid
+   surfaces everywhere instead of glass — accessibility requirement from
+   the plan. */
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-1: #ffffff;
+    --glass-2: #ffffff;
+    --glass-3: #ffffff;
+    --glass-1-blur: 0px;
+    --glass-2-blur: 0px;
+    --glass-3-blur: 0px;
+  }
+}
+
+/* Wire the raw tokens into Tailwind v4's @theme so utilities like
+   bg-bg, text-ink, text-ink-muted, bg-lemon, text-lemon-ink, bg-lemon-soft,
+   bg-glass-1/2/3, border-glass-border, border-hairline, shadow-elev-1/2/3,
+   bg-solid, and ring-focus all work directly in JSX. */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+
+  --color-lemon: var(--lemon);
+  --color-lemon-hover: var(--lemon-hover);
+  --color-lemon-ink: var(--lemon-ink);
+  --color-lemon-soft: var(--lemon-soft);
+
+  --color-glass-1: var(--glass-1);
+  --color-glass-2: var(--glass-2);
+  --color-glass-3: var(--glass-3);
+  --color-glass-border: var(--glass-border);
+
+  --color-solid: var(--solid);
+  --color-hairline: var(--hairline);
+  --color-focus: var(--focus);
+
+  --color-rag-excellent: var(--rag-excellent);
+  --color-rag-good: var(--rag-good);
+  --color-rag-acceptable: var(--rag-acceptable);
+  --color-rag-needs-improvement: var(--rag-needs-improvement);
+  --color-rag-weak: var(--rag-weak);
+  --color-rag-poor: var(--rag-poor);
+  --color-rag-critical: var(--rag-critical);
+
+  --shadow-elev-1: var(--shadow-1);
+  --shadow-elev-2: var(--shadow-2);
+  --shadow-elev-3: var(--shadow-3);
+
+  --blur-glass-1: var(--glass-1-blur);
+  --blur-glass-2: var(--glass-2-blur);
+  --blur-glass-3: var(--glass-3-blur);
+
+  --font-sans: var(--font-geist-sans, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif);
+}
+
+/* ===========================================================================
+   Base
+   ========================================================================= */
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(600px 400px at 8% -5%, rgba(255, 247, 0, 0.16), transparent 60%),
+    radial-gradient(500px 380px at 100% 10%, rgba(255, 247, 0, 0.10), transparent 55%);
+  background-attachment: fixed;
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  border-color: var(--hairline);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* ===========================================================================
+   Glass surfaces
+   Three elevation levels for chrome / cards / modals / hero elements.
+   Dense data surfaces (tables, matrices, forms) must use .solid-panel
+   instead — never glass — per the plan's design-system rule.
+   ========================================================================= */
+
+.glass-elev-1,
+.glass-elev-2,
+.glass-elev-3 {
+  border: 1px solid var(--glass-border);
+}
+
+.glass-elev-1 {
+  background: var(--glass-1);
+  backdrop-filter: blur(var(--glass-1-blur));
+  -webkit-backdrop-filter: blur(var(--glass-1-blur));
+  box-shadow: var(--shadow-1);
+}
+
+.glass-elev-2 {
+  background: var(--glass-2);
+  backdrop-filter: blur(var(--glass-2-blur));
+  -webkit-backdrop-filter: blur(var(--glass-2-blur));
+  box-shadow: var(--shadow-2);
+}
+
+.glass-elev-3 {
+  background: var(--glass-3);
+  backdrop-filter: blur(var(--glass-3-blur));
+  -webkit-backdrop-filter: blur(var(--glass-3-blur));
+  box-shadow: var(--shadow-3);
+}
+
+/* Browsers without backdrop-filter support fall back to a near-solid
+   surface so text stays legible instead of rendering as flat transparency. */
+@supports not (backdrop-filter: blur(1px)) {
+  .glass-elev-1,
+  .glass-elev-2,
+  .glass-elev-3 {
+    background: rgba(255, 255, 255, 0.94);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass-elev-1,
+  .glass-elev-2,
+  .glass-elev-3 {
+    background: #ffffff;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+/* ===========================================================================
+   Solid data surfaces — mandatory for dense data (guideline matrix,
+   KPI/weight tables, evaluation tables, forms).
+   ========================================================================= */
+
+.solid-panel {
+  background: var(--solid);
+  border: 1px solid var(--hairline);
+  box-shadow: var(--shadow-1);
+}
+
+/* Thin scrollbars for the guideline matrix / tree table horizontal scroll. */
+.thin-scrollbar {
+  scrollbar-width: thin;
+}
+
+.thin-scrollbar::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  background: var(--hairline);
+  border-radius: 999px;
+}

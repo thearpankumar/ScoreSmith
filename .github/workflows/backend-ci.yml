@@ -1,0 +1,81 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+
+defaults:
+  run:
+    working-directory: backend
+
+env:
+  # Real Postgres service below, real psycopg (v3) URL — schema needs the `vector` and
+  # `ltree` extensions, which is why the service uses the pgvector/pgvector:pg17 image
+  # (see backend/alembic/versions/0001_initial_schema.py) rather than plain `postgres`.
+  DATABASE_URL: postgresql+psycopg://qs_app:qs_ci_password@localhost:5432/quality_scorecard
+  TEST_DATABASE_URL: postgresql+psycopg://qs_app:qs_ci_password@localhost:5432/quality_scorecard_test
+  # No real AWS/Bedrock/AgentCore calls happen anywhere in the test suite (every AI-layer
+  # test injects FakeBedrockClient / FakeWebSearchClient — see backend/tests/fakes.py), so
+  # these are dummy/empty values, matching infra/.env.example's defaults.
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: ""
+  AWS_SECRET_ACCESS_KEY: ""
+  AGENTCORE_GATEWAY_WEB_SEARCH_URL: ""
+  AGENTCORE_GATEWAY_WEB_SEARCH_TOOL_NAME: ""
+  AGENTCORE_GATEWAY_AWS_ACCESS_KEY_ID: ""
+  AGENTCORE_GATEWAY_AWS_SECRET_ACCESS_KEY: ""
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: qs_app
+          POSTGRES_PASSWORD: qs_ci_password
+          POSTGRES_DB: quality_scorecard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qs_app -d quality_scorecard"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv pip install --system -e ".[dev]"
+
+      - name: Create dedicated test database
+        run: |
+          PGPASSWORD=qs_ci_password psql -h localhost -U qs_app -d quality_scorecard \
+            -c "CREATE DATABASE quality_scorecard_test OWNER qs_app;"
+
+      - name: Run Alembic migrations
+        run: alembic upgrade head
+
+      - name: Run tests
+        run: pytest
+
+      - name: Run ruff
+        run: ruff check .
