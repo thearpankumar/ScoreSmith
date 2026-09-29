@@ -154,3 +154,4 @@ own transaction, creating a full sibling KPI group must go through the bulk endp
 (`POST /api/v1/scorecard-versions/{version_id}/kpi-nodes/bulk`,
 `PATCH /api/v1/kpi-nodes/weights`) rather than one-node-at-a-time — see the docstring at
 the top of `app/api/v1/kpi_nodes.py` for the full explanation.
+
