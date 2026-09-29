@@ -5,7 +5,7 @@ import { createContext, useCallback, useContext, useMemo, useState, type ReactNo
 import type { ChatSession } from "@/lib/types";
 
 interface ChatSessionsContextValue {
-  /** The live sidebar session list — seeded once from the server (see `app/chat/layout.tsx`)
+  /** The live sidebar session list — seeded once from the server (see the root `app/layout.tsx`)
    * and kept up to date entirely client-side afterward via the setters below. */
   sessions: ChatSession[];
   /** Reflects a real (or changed) session title into the sidebar without a page reload —
@@ -32,14 +32,22 @@ interface ChatSessionsContextValue {
 const ChatSessionsContext = createContext<ChatSessionsContextValue | null>(null);
 
 /**
- * Lives in `app/chat/layout.tsx`, which — unlike `app/chat/page.tsx` and
- * `app/chat/[sessionId]/page.tsx`, which Next.js unmounts and remounts on every
- * navigation between them (different route segments/params) — persists across
- * navigation within `/chat/*` (see Next.js's App Router layout-persistence model). That
- * makes this the one place the sidebar's session list can live in memory and survive
- * "create a chat" / "switch sessions" / "start a new one" without needing to be re-fetched
- * from the server or reset to a stale prop on every click — the actual fix for the
- * "shouldn't need to reload" gap (see SessionList/ChatWorkspace for the consuming side).
+ * Lives in the root `app/layout.tsx`, wrapping `AppShell` (and so both `NavRail` and
+ * every routed page) — which, like any layout above a route segment, Next.js does NOT
+ * unmount/remount on navigation between `app/chat/page.tsx` and
+ * `app/chat/[sessionId]/page.tsx` (different route segments/params get fresh page
+ * instances, but shared ancestor layouts persist — see Next.js's App Router
+ * layout-persistence model). That makes this the one place the sidebar's session list can
+ * live in memory and survive "create a chat" / "switch sessions" / "start a new one"
+ * without needing to be re-fetched from the server or reset to a stale prop on every click
+ * — the actual fix for the "shouldn't need to reload" gap (see ChatSessionNavList /
+ * ChatWorkspace for the consuming side).
+ *
+ * Originally scoped to `app/chat/layout.tsx` (fetched only on `/chat/*`). Hoisted to the
+ * root layout so `NavRail`'s merged "Chat" nav item — which renders on every page, not
+ * just `/chat/*` — can reach the same live list instead of NavRail growing a second,
+ * competing data source. See `NavRail`'s and the root layout's own docstrings for the
+ * full rationale and the fetch-cost tradeoff that hoist implies.
  */
 export function ChatSessionsProvider({
   initialSessions,
@@ -90,6 +98,6 @@ export function ChatSessionsProvider({
 
 export function useChatSessions(): ChatSessionsContextValue {
   const ctx = useContext(ChatSessionsContext);
-  if (!ctx) throw new Error("useChatSessions must be used within a ChatSessionsProvider (see app/chat/layout.tsx)");
+  if (!ctx) throw new Error("useChatSessions must be used within a ChatSessionsProvider (see the root app/layout.tsx)");
   return ctx;
 }

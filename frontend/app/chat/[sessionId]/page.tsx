@@ -19,7 +19,7 @@ export default async function ChatSessionPage({
   const { prompt } = await searchParams;
 
   // The sidebar's own session list is no longer fetched/passed down here — it lives in
-  // ChatSessionsContext (see app/chat/layout.tsx), which persists across navigation
+  // ChatSessionsContext (see the root app/layout.tsx), which persists across navigation
   // between this page and its siblings instead of being re-fetched on every switch.
 
   if (sessionId === "new") {

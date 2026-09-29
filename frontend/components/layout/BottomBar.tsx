@@ -6,7 +6,18 @@ import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { NAV_ITEMS } from "./nav-items";
 
-/** Mobile bottom bar. Glass chrome per the plan's nav styling rule. */
+/**
+ * Mobile bottom bar (replaces `NavRail`, which is `md:`-and-up only). Glass chrome per
+ * the plan's nav styling rule.
+ *
+ * Chat-session access on mobile: `NavRail`'s merged "Chat" nav item now nests the full
+ * session list underneath it (see `NavRail`'s docstring) — that doesn't fit a bottom bar,
+ * so it's not attempted here. The "Chat" icon below is still a plain link to `/chat` (as
+ * every item here always was); `app/chat/page.tsx` keeps its own compact, capped-height
+ * session list ONLY below the `md` breakpoint (i.e. exactly while this bar is the one in
+ * use) as the mobile entry point for browsing/switching past chats — that's the existing
+ * pattern this bar already relied on, preserved as-is rather than reimplemented here.
+ */
 export function BottomBar() {
   const pathname = usePathname();
 

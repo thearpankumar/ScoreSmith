@@ -16,7 +16,6 @@ import {
   Undo2,
 } from "lucide-react";
 
-import { SessionList } from "./SessionList";
 import { useChatSessions } from "./ChatSessionsContext";
 import { MessageBubble } from "./MessageBubble";
 import { ClarifyingQuestionCard } from "./ClarifyingQuestionCard";
@@ -92,7 +91,7 @@ export function ChatWorkspace({
   const isRefineSession = !!session.targetScorecardId && !initialSavedScorecardId;
   const [refineTargetName] = useState(initialDraft.name);
   // Issue 1 (see task notes): the sidebar session list now lives in ChatSessionsContext
-  // (see app/chat/layout.tsx), not local state here — this component (rendered by
+  // (see the root app/layout.tsx), not local state here — this component (rendered by
   // app/chat/[sessionId]/page.tsx) is itself remounted on every session switch, so any
   // state kept here wouldn't survive one anyway. `upsertSessionTitle` below is folded
   // into the same polling this component already runs for turn_in_progress/turn-events
@@ -659,17 +658,18 @@ export function ChatWorkspace({
   );
 
   return (
-    // Responsive layout: at xl+ the session list, chat, and live preview sit side by
-    // side at full viewport height, and the chat/preview split is drag-resizable. Below
-    // xl (laptop-width / non-maximized windows) they STACK — chat first, then the preview
-    // full-width underneath — so the preview can never be pushed off-screen by a
-    // fixed-width flex row. A "Preview" jump link in the chat header makes the stacked
-    // preview reachable in one click.
+    // Responsive layout: at xl+ the chat and live preview sit side by side at full
+    // viewport height, and the split is drag-resizable. Below xl (laptop-width /
+    // non-maximized windows) they STACK — chat first, then the preview full-width
+    // underneath — so the preview can never be pushed off-screen by a fixed-width flex
+    // row. A "Preview" jump link in the chat header makes the stacked preview reachable
+    // in one click.
+    //
+    // The session list that used to render here as its own column (`SessionList`,
+    // `hidden shrink-0 xl:block`) has moved into `NavRail`'s merged "Chat" section (see
+    // that component's docstring) — this workspace is now just the chat/preview split,
+    // no second sidebar column.
     <div className="flex flex-col gap-4 xl:h-[calc(100vh-2rem)] xl:flex-row">
-      <div className="hidden shrink-0 xl:block">
-        <SessionList activeSessionId={activeSessionId} />
-      </div>
-
       {isDesktop ? (
         <ResizablePanelGroup orientation="horizontal" className="min-h-[28rem] flex-1">
           <ResizablePanel minSize={360} className="flex min-w-0 flex-col">

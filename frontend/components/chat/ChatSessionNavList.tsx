@@ -1,11 +1,10 @@
 "use client";
 
-import { useId, useState } from "react";
+import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { AlertTriangle, Loader2, Plus, PanelLeftClose, PanelLeftOpen, Trash2 } from "lucide-react";
+import { AlertTriangle, Loader2, Trash2 } from "lucide-react";
 
-import { GlassCard } from "@/components/design-system/GlassCard";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -19,12 +18,9 @@ import {
 import { UnsavedChangesDialog } from "./UnsavedChangesDialog";
 import { useChatSessions } from "./ChatSessionsContext";
 import { useUnsavedChangesGuard } from "@/lib/useUnsavedChangesGuard";
-import { usePersistedState } from "@/lib/usePersistedState";
 import { deleteChatSession } from "@/lib/api-client";
 import type { ChatSession } from "@/lib/types";
 import { cn, formatDateTime } from "@/lib/utils";
-
-const STORAGE_KEY = "qs.sessionListCollapsed";
 
 const STATUS_VARIANT: Record<ChatSession["status"], "soft" | "muted" | "default"> = {
   active: "soft",
@@ -32,22 +28,25 @@ const STATUS_VARIANT: Record<ChatSession["status"], "soft" | "muted" | "default"
   abandoned: "muted",
 };
 
-export function SessionList({
-  activeSessionId,
-}: {
-  activeSessionId: string;
-}) {
+/**
+ * The actual chat-session list — cards, status badge, timestamp, hover-delete + confirm
+ * dialog. Extracted from the old standalone `SessionList` column (now removed) so the
+ * exact same rendering/delete logic is reused, not reimplemented, now that it's nested
+ * inside `NavRail`'s "Chat" section (desktop/tablet) and inside a compact mobile card on
+ * `app/chat/page.tsx` (see that file's own docstring for the mobile case).
+ *
+ * Deliberately has NO chrome of its own (no GlassCard surface, no collapse toggle, no
+ * "New scorecard" button) — those now live exactly once, in `NavRail` itself, rather than
+ * being duplicated here. Callers own layout/scroll-container sizing.
+ */
+export function ChatSessionNavList({ activeSessionId }: { activeSessionId: string }) {
   // Live session list + "does the current chat have unsent edits" flag — both shared via
   // context (see ChatSessionsContext) so they survive session-switch/new-chat navigation
-  // instead of resetting to a server-fetched prop on every click (see app/chat/layout.tsx).
+  // instead of resetting to a server-fetched prop on every click.
   const { sessions, removeSession, dirty } = useChatSessions();
   const { linkProps, isConfirmOpen, confirmLeave, cancelLeave } = useUnsavedChangesGuard(dirty);
-  const [collapsed, setCollapsed] = usePersistedState(STORAGE_KEY, false);
-  const bodyId = useId();
   const router = useRouter();
 
-  // Hover-delete (Part B): a session pending confirmation, plus in-flight/error state for
-  // the confirm dialog's own request — see confirmDelete below.
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -102,58 +101,12 @@ export function SessionList({
     </Dialog>
   );
 
-  if (collapsed) {
-    // Slim strip: same problem as NavRail (one card of content, the rest of the column
-    // was dead space) — collapse down to just the essentials (new-scorecard + expand)
-    // rather than a still-mostly-empty narrower list.
-    return (
-      <GlassCard elevation={1} className="flex h-full w-14 flex-col items-center gap-2 p-2">
-        <Button asChild variant="default" size="icon" title="New scorecard">
-          <Link {...linkProps("/chat/new")} aria-label="New scorecard">
-            <Plus className="size-4" aria-hidden />
-          </Link>
-        </Button>
-        <button
-          type="button"
-          onClick={() => setCollapsed(false)}
-          aria-expanded={false}
-          aria-controls={bodyId}
-          aria-label="Expand chat list"
-          title="Expand chat list"
-          className="mt-auto rounded-full p-1.5 text-ink-muted hover:bg-black/5 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
-        >
-          <PanelLeftOpen className="size-4" aria-hidden />
-        </button>
-        <UnsavedChangesDialog open={isConfirmOpen} onConfirmLeave={confirmLeave} onCancel={cancelLeave} />
-        {deleteDialog}
-      </GlassCard>
-    );
-  }
-
   return (
-    <GlassCard elevation={1} className="flex h-full w-60 flex-col gap-2 p-3">
-      <div className="flex items-center gap-1.5">
-        <Button asChild variant="default" size="sm" className="flex-1">
-          <Link {...linkProps("/chat/new")}>
-            <Plus className="size-3.5" aria-hidden />
-            New scorecard
-          </Link>
-        </Button>
-        <button
-          type="button"
-          onClick={() => setCollapsed(true)}
-          aria-expanded={true}
-          aria-controls={bodyId}
-          aria-label="Collapse chat list"
-          title="Collapse chat list"
-          className="shrink-0 rounded-full p-1.5 text-ink-muted hover:bg-black/5 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
-        >
-          <PanelLeftClose className="size-4" aria-hidden />
-        </button>
-      </div>
-
-      <div id={bodyId} className="flex-1 space-y-1 overflow-y-auto thin-scrollbar">
-        {sessions.map((session) => {
+    <div className="flex h-full flex-col gap-1">
+      {sessions.length === 0 ? (
+        <p className="px-3 py-2 text-xs text-ink-muted">No chats yet.</p>
+      ) : (
+        sessions.map((session) => {
           const active = session.id === activeSessionId;
           return (
             // `group relative` wraps the row's Link + its hover-reveal delete button as
@@ -210,11 +163,11 @@ export function SessionList({
               </button>
             </div>
           );
-        })}
-      </div>
+        })
+      )}
 
       <UnsavedChangesDialog open={isConfirmOpen} onConfirmLeave={confirmLeave} onCancel={cancelLeave} />
       {deleteDialog}
-    </GlassCard>
+    </div>
   );
 }

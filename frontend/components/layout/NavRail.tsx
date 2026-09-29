@@ -2,25 +2,63 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { PanelLeftClose, PanelLeftOpen, Plus } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { usePersistedState } from "@/lib/usePersistedState";
+import { useChatSessions } from "@/components/chat/ChatSessionsContext";
+import { ChatSessionNavList } from "@/components/chat/ChatSessionNavList";
 import { NAV_ITEMS } from "./nav-items";
 
 const STORAGE_KEY = "qs.navRailCollapsed";
 
 /**
- * Desktop left rail. Glass chrome per the plan's nav styling rule.
+ * Desktop/tablet left rail. Glass chrome per the plan's nav styling rule.
  *
- * Fixed-height (`h-[calc(100vh-2rem)]`) but its content is only ~200px tall — the rest
- * was dead space with no way to reclaim it. Now collapsible to a narrow icon-only rail;
- * the state is a per-viewer UI preference (not app data), so it's persisted to
- * localStorage rather than the backend, and restored on the next page load.
+ * Fixed-height (`h-[calc(100vh-2rem)]`). Vertical order: logo -> "+ New scorecard" ->
+ * nav items, with the chat session list nested directly under the "Chat" item (only
+ * populated/expanded while on a `/chat*` route — see the merged-sidebar note below) ->
+ * remaining nav items -> collapse toggle pinned to the bottom via `mt-auto`. The
+ * surrounding group used to be vertically centered (`justify-center`) back when it was a
+ * handful of fixed-height rows with nothing else below — that no longer works now that an
+ * open-ended, independently-scrollable session list can sit in the middle of it, so the
+ * group is top-aligned instead and the session-list slot alone is what grows/scrolls
+ * (`flex-1 min-h-0 overflow-y-auto`), while everything else (logo, button, nav items,
+ * collapse toggle) keeps its natural height. Collapsible to a narrow icon-only rail; the
+ * state is a per-viewer UI preference (not app data), so it's persisted to localStorage
+ * rather than the backend, and restored on the next page load.
+ *
+ * --- Merged sidebar (chat session list lives here now) ---
+ * This used to be a plain nav with no data dependency. There used to be a SEPARATE
+ * `SessionList` column rendered only on the Chat tab, fed by `ChatSessionsContext` (a
+ * provider scoped to `/chat/*`, see `app/chat/layout.tsx`'s old docstring). Per the
+ * owner's request, that column is now merged into this rail, nested under the "Chat" nav
+ * item. The catch: `NavRail` renders on EVERY page (inside the root `AppShell`), outside
+ * where that `/chat/*`-scoped provider used to live — a React context only flows to
+ * descendants, and this rail is a sibling of the routed page content, not a descendant of
+ * it, so it structurally can't reach a provider scoped under `/chat/*`.
+ *
+ * Resolution: `ChatSessionsProvider` was hoisted from `app/chat/layout.tsx` up to the
+ * root `app/layout.tsx` (wrapping `AppShell`, so both this rail and every page can reach
+ * it) — see that file's docstring for the fetch-cost tradeoff this implies and why it was
+ * accepted. This rail then does its own, separate gating: the nested list is only
+ * rendered (and only takes up layout space) when `pathname` is actually under `/chat` —
+ * on every other page (Charts/Evaluations/Settings) the Chat item renders as a plain link
+ * with nothing nested beneath it, exactly as before this change. That keeps a single real
+ * data source (`ChatSessionsContext`) instead of a second, competing one, while avoiding
+ * chat-list clutter on unrelated pages.
  */
 export function NavRail() {
   const pathname = usePathname();
   const [collapsed, setCollapsed] = usePersistedState(STORAGE_KEY, false);
+  const { sessions } = useChatSessions();
+
+  const onChatRoute = pathname === "/chat" || pathname.startsWith("/chat/");
+  // "/chat/abc123" -> "abc123"; "/chat", "/chat/new"'s own page resolves "new" itself, so
+  // passing "new" through here (no real session to highlight yet) is harmless.
+  const activeSessionId = onChatRoute ? (pathname.match(/^\/chat\/([^/]+)/)?.[1] ?? "") : "";
+
+  const [chatItem, ...restItems] = NAV_ITEMS;
 
   return (
     <nav
@@ -30,36 +68,47 @@ export function NavRail() {
         collapsed ? "w-[4.5rem] items-center px-2" : "w-60",
       )}
     >
-      <div className={cn("mb-4 flex items-center gap-2", collapsed ? "justify-center px-0" : "px-2")}>
-        <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-lemon text-sm font-bold text-lemon-ink">
-          QS
-        </span>
-        {!collapsed && <span className="text-sm font-semibold text-ink">Quality Scorecards</span>}
+      <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-hidden">
+        <div className={cn("mb-4 flex shrink-0 items-center gap-2", collapsed ? "justify-center px-0" : "px-2")}>
+          <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-lemon text-sm font-bold text-lemon-ink">
+            QS
+          </span>
+          {!collapsed && <span className="text-sm font-semibold text-ink">Quality Scorecards</span>}
+        </div>
+
+        <Link
+          href="/chat/new"
+          title={collapsed ? "New scorecard" : undefined}
+          className={cn(
+            "mb-3 flex shrink-0 items-center gap-2 rounded-full bg-lemon px-4 py-2.5 text-sm font-semibold text-lemon-ink shadow-sm transition-colors hover:bg-lemon-hover",
+            "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]",
+            collapsed ? "size-10 justify-center px-0 py-0" : "justify-center",
+          )}
+        >
+          <Plus className="size-4.5 shrink-0" aria-hidden />
+          <span className={cn(collapsed && "sr-only")}>New scorecard</span>
+        </Link>
+
+        <NavItemLink item={chatItem} pathname={pathname} collapsed={collapsed} sessionCount={sessions.length} onChatRoute={onChatRoute} />
+
+        {/* Nested chat-session list: only meaningfully present on a /chat* route. When
+            collapsed, the rail can't show full session cards (no room, same as every
+            other item losing its label) — it's dropped entirely rather than squeezed, in
+            keeping with the collapsed rail's existing icon+tooltip-only pattern (no other
+            item shows extra content collapsed either); the Chat item's tooltip gains a
+            session count instead, so that information isn't just lost. */}
+        {onChatRoute && !collapsed && (
+          <div className="mb-1 min-h-0 flex-1 overflow-y-auto thin-scrollbar">
+            <ChatSessionNavList activeSessionId={activeSessionId} />
+          </div>
+        )}
+
+        {restItems.map((item) => (
+          <NavItemLink key={item.href} item={item} pathname={pathname} collapsed={collapsed} />
+        ))}
       </div>
 
-      {NAV_ITEMS.map((item) => {
-        const active = pathname.startsWith(item.href);
-        const Icon = item.icon;
-        return (
-          <Link
-            key={item.href}
-            href={item.href}
-            aria-current={active ? "page" : undefined}
-            title={collapsed ? item.label : undefined}
-            className={cn(
-              "flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors",
-              "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]",
-              collapsed && "w-full justify-center px-0",
-              active ? "bg-lemon text-lemon-ink font-semibold shadow-sm" : "text-ink-muted hover:bg-black/5 hover:text-ink",
-            )}
-          >
-            <Icon className="size-4.5 shrink-0" aria-hidden />
-            <span className={cn(collapsed && "sr-only")}>{item.label}</span>
-          </Link>
-        );
-      })}
-
-      <div className="mt-auto flex justify-center pt-2">
+      <div className="mt-auto flex shrink-0 justify-center pt-2">
         <button
           type="button"
           onClick={() => setCollapsed(!collapsed)}
@@ -72,5 +121,46 @@ export function NavRail() {
         </button>
       </div>
     </nav>
+  );
+}
+
+function NavItemLink({
+  item,
+  pathname,
+  collapsed,
+  sessionCount,
+  onChatRoute,
+}: {
+  item: (typeof NAV_ITEMS)[number];
+  pathname: string;
+  collapsed: boolean;
+  /** Chat item only: folded into its collapsed tooltip so the session count isn't just
+   * silently lost when the nested list can't be shown (see the collapsed-rail note above). */
+  sessionCount?: number;
+  onChatRoute?: boolean;
+}) {
+  const active = pathname.startsWith(item.href);
+  const Icon = item.icon;
+  const tooltip =
+    collapsed && onChatRoute && sessionCount
+      ? `${item.label} (${sessionCount})`
+      : collapsed
+        ? item.label
+        : undefined;
+  return (
+    <Link
+      href={item.href}
+      aria-current={active ? "page" : undefined}
+      title={tooltip}
+      className={cn(
+        "flex shrink-0 items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors",
+        "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]",
+        collapsed && "w-full justify-center px-0",
+        active ? "bg-lemon text-lemon-ink font-semibold shadow-sm" : "text-ink-muted hover:bg-black/5 hover:text-ink",
+      )}
+    >
+      <Icon className="size-4.5 shrink-0" aria-hidden />
+      <span className={cn(collapsed && "sr-only")}>{item.label}</span>
+    </Link>
   );
 }
