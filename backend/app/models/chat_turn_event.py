@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, Index, Text, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -38,6 +38,16 @@ class ChatTurnEvent(Base, UUIDPKMixin):
     - `message` is the actual human-readable text the frontend renders verbatim (e.g.
       `"Searching: 'ISO 27001 vendor security certification requirements'"`) — NOT just the
       bare `event_type` code.
+    - `round` (added by migration 0007_chat_turn_event_round, default 1) distinguishes
+      WHICH research round an event belongs to, now that `research_kpis`'s multi-agent
+      fan-out can run more than one bounded round when the master isn't yet confident
+      coverage is sufficient (see `MAX_RESEARCH_ROUNDS`/`_assess_research_coverage` in
+      `scorecard_builder.py`). Deliberately a separate integer column rather than folded
+      into `actor` (e.g. `research_agent_r2_1`): it keeps `actor` stable/parseable exactly
+      as it already was (`"master"` / `"research_agent_{i+1}"`, index-based WITHIN a
+      round), lets the frontend group by round with a plain sort/filter instead of string
+      parsing, and every event outside the research fan-out (all of `propose_kpis`'s own
+      master events) simply stays at the default `round=1` with no special-casing needed.
 
     Writes are best-effort (see `app/ai/turn_events.py::emit_turn_event`): a failure to
     write one of these must never break the real chat turn it's describing.
@@ -52,6 +62,7 @@ class ChatTurnEvent(Base, UUIDPKMixin):
     actor: Mapped[str] = mapped_column(Text, nullable=False)
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
+    round: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

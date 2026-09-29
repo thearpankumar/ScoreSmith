@@ -12,7 +12,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { validateScoringFormula, type FormulaValidation } from "@/lib/api-client";
+import type { FormulaValidation } from "@/lib/api-client";
 import { cn } from "@/lib/utils";
 
 const VALIDATE_DEBOUNCE_MS = 350;
@@ -45,25 +45,25 @@ const FUNCTIONS = [
  * actual need (per the task) doesn't call for more sophistication than this.
  *
  * Uses the shadcn `Dialog` primitive + design tokens, consistent with every other modal in
- * this app (see ScorecardActions.tsx's confirm dialogs). Live validation here calls the
- * SAME real backend endpoint as the plain-text editor (ScoringFormulaPanel), so the two
- * surfaces can never disagree about what's valid.
+ * this app (see ScorecardActions.tsx's confirm dialogs). Live validation here calls
+ * `onValidate` — the SAME real backend validation the plain-text editor (ScoringFormulaPanel)
+ * uses, injected by the caller (a saved scorecard's version, or an in-progress chat draft —
+ * see Issue 2's task notes), so the two surfaces can never disagree about what's valid.
  */
 export function ScoringFormulaBuilderDialog({
   open,
   onOpenChange,
-  scorecardId,
-  versionId,
   initialText,
   leafKpiNames,
+  onValidate,
   onApply,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  scorecardId: string;
-  versionId: string;
   initialText: string;
   leafKpiNames: string[];
+  /** Real backend validation — see ScoringFormulaPanel's own `onValidate` prop. */
+  onValidate: (formula: string) => Promise<FormulaValidation>;
   onApply: (text: string) => void;
 }) {
   const [text, setText] = useState(initialText);
@@ -95,7 +95,7 @@ export function ScoringFormulaBuilderDialog({
     const myRequestId = ++requestIdRef.current;
     debounceRef.current = setTimeout(async () => {
       try {
-        const result = await validateScoringFormula(scorecardId, versionId, text);
+        const result = await onValidate(text);
         if (requestIdRef.current !== myRequestId) return;
         setValidation(result);
       } catch (err) {
@@ -109,7 +109,7 @@ export function ScoringFormulaBuilderDialog({
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onValidate is stable per mount (bound at call site)
   }, [text, open]);
 
   /** Inserts `token` at the current cursor position (replacing any selection), then

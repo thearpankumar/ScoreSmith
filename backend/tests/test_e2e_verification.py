@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient
 
 from app.deps import get_bedrock_client
 from app.main import app
-from tests.fakes import FakeBedrockClient, tool_use_result
+from tests.fakes import FakeBedrockClient, text_result, tool_use_result
 
 # --- Section 1: chat iteration genuinely updates the draft before it is saved ----------
 
@@ -121,6 +121,10 @@ def test_chat_iteration_edits_survive_to_saved_scorecard(client: TestClient, see
     # more turn and asks whether to adjust anything before saving.
     turn1_bedrock = FakeBedrockClient(
         script=[
+            # A brand-new session's first message triggers title generation (Issue 1 —
+            # see app/api/v1/chat.py::_generate_and_persist_title) BEFORE the graph's own
+            # first call — one fast/cheap plain-text Bedrock call, scripted first here.
+            text_result("Internal Tooling Uptime Reports"),
             tool_use_result(
                 "update_draft",
                 {

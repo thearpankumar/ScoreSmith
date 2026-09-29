@@ -1,7 +1,7 @@
 import { notFound } from "next/navigation";
 
 import { ChatWorkspace } from "@/components/chat/ChatWorkspace";
-import { getChatSession, listChatSessions } from "@/lib/api-client";
+import { getChatSession } from "@/lib/api-client";
 import { MOCK_CURRENT_USER } from "@/lib/mock-data";
 import type { ChatSession, ScorecardDraft } from "@/lib/types";
 
@@ -18,7 +18,9 @@ export default async function ChatSessionPage({
   const { sessionId } = await params;
   const { prompt } = await searchParams;
 
-  const allSessions = await listChatSessions();
+  // The sidebar's own session list is no longer fetched/passed down here — it lives in
+  // ChatSessionsContext (see app/chat/layout.tsx), which persists across navigation
+  // between this page and its siblings instead of being re-fetched on every switch.
 
   if (sessionId === "new") {
     const now = new Date().toISOString();
@@ -40,16 +42,11 @@ export default async function ChatSessionPage({
       scope: null,
       targetScore: null,
       kpis: [],
+      scoringFormula: null,
     };
 
     return (
-      <ChatWorkspace
-        session={session}
-        allSessions={allSessions}
-        initialMessages={[]}
-        initialDraft={draft}
-        initialPrompt={prompt}
-      />
+      <ChatWorkspace session={session} initialMessages={[]} initialDraft={draft} initialPrompt={prompt} />
     );
   }
 
@@ -59,7 +56,6 @@ export default async function ChatSessionPage({
   return (
     <ChatWorkspace
       session={result.session}
-      allSessions={allSessions}
       initialMessages={result.messages}
       initialDraft={result.draft}
       initialSavedScorecardId={result.savedScorecardId}

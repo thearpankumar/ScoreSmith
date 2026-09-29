@@ -67,12 +67,22 @@ class ChatTurnRead(BaseModel):
     # refresh checks this via GET /chat/sessions/{id} to show "still working" instead of a
     # blank composer, and polls until it clears.
     turn_in_progress: bool = False
+    # Real, AI-generated (or deterministically derived) session title — see
+    # app/models/chat_session.py::ChatSession.title and app/ai/session_title.py. Set on
+    # EVERY turn response (not just GET), so a brand-new session's very first, blocking
+    # POST /chat/sessions response already carries it — the frontend never needs a second
+    # round-trip just to learn the title it was generated with (see ChatWorkspace).
+    title: str | None = None
 
 
 class ChatSessionRead(ORMBase):
     id: uuid.UUID
     user_id: uuid.UUID
     status: ChatSessionStatus
+    # Real, AI-generated (or, for a "Refine with assistant" session, deterministically
+    # derived) title — see app/models/chat_session.py::ChatSession.title. Replaces the old
+    # frontend-side `synthesizeTitle` truncation hack (see api-client.ts).
+    title: str | None = None
     # Additive (Wave 3 integration): the frontend session list / "continue where you left
     # off" surfaces this directly instead of re-deriving it from chat_messages.
     context_summary: str | None = None
@@ -102,7 +112,8 @@ class ChatTurnEventRead(ORMBase):
     """One granular step of the AI pipeline's live trace for the CURRENT/most recent turn
     (see `app/models/chat_turn_event.py` and `GET /chat/sessions/{id}/turn-events`) —
     `actor` is `"master"` or `"research_agent_{n}"` (see `app/ai/scorecard_builder.py`),
-    `message` is the human-readable text the frontend renders directly."""
+    `message` is the human-readable text the frontend renders directly. `round` (default 1)
+    distinguishes which research round (see `MAX_RESEARCH_ROUNDS`) this event belongs to."""
 
     id: uuid.UUID
     session_id: uuid.UUID
@@ -110,4 +121,5 @@ class ChatTurnEventRead(ORMBase):
     actor: str
     event_type: str
     message: str
+    round: int
     created_at: datetime

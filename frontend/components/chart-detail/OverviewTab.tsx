@@ -1,4 +1,7 @@
+"use client";
+
 import type { ReactNode } from "react";
+import { useRouter } from "next/navigation";
 import { CheckCircle2, XCircle } from "lucide-react";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
@@ -10,6 +13,7 @@ import { KpiStructureTree, type StructureEditing } from "./KpiStructureTree";
 import { ScoringFormulaPanel } from "./ScoringFormulaPanel";
 import { guidelineCoverage, leafKpiNodes, validateSiblingWeights } from "@/lib/kpi-tree";
 import { formatDate } from "@/lib/utils";
+import { updateScoringFormula, validateScoringFormula } from "@/lib/api-client";
 import type { Scorecard, ScorecardVersion } from "@/lib/types";
 
 /**
@@ -31,6 +35,7 @@ export function OverviewTab({
   /** Evaluations scored against THIS version. */
   evaluationCount: number;
 }) {
+  const router = useRouter();
   const nodes = version.kpiNodes;
   const editing: StructureEditing = {
     versionId: version.id,
@@ -91,10 +96,13 @@ export function OverviewTab({
       <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[minmax(0,1fr)_20rem]">
         <KpiStructureTree kpiNodes={nodes} editing={editing} />
         <ScoringFormulaPanel
-          scorecardId={scorecard.id}
-          versionId={version.id}
           initialFormula={version.scoringFormula}
           leafKpiNames={leaves.map((l) => l.name)}
+          onValidate={(formula) => validateScoringFormula(scorecard.id, version.id, formula)}
+          onSave={async (formula) => {
+            await updateScoringFormula(scorecard.id, version.id, formula);
+            router.refresh();
+          }}
         />
       </div>
 

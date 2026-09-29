@@ -1,13 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
 import { AlertTriangle, CheckCircle2, LayoutGrid, Loader2, Sigma, X } from "lucide-react";
 
 import { SolidPanel } from "@/components/design-system/SolidPanel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ApiError, updateScoringFormula, validateScoringFormula, type FormulaValidation } from "@/lib/api-client";
+import { ApiError, type FormulaValidation } from "@/lib/api-client";
 import { cn } from "@/lib/utils";
 import { ScoringFormulaBuilderDialog } from "./ScoringFormulaBuilderDialog";
 
@@ -16,30 +15,40 @@ const VALIDATE_DEBOUNCE_MS = 400;
 /**
  * Part 2b — custom scoring formula editor (required piece; see
  * backend/app/ai/scoring_formula.py for the shared safe-expression evaluator this talks
- * to). Placed on the Overview tab, alongside the KPI structure tree, since a formula only
- * makes sense in the context of the KPI names it references.
+ * to). Used in two places: the saved scorecard's Overview tab (chart-detail), and — since
+ * this pass (Issue 2 — see task notes) — the chat live-preview panel for an in-progress
+ * draft, which has no `scorecard_id`/`version_id` yet. Both callers inject `onValidate`/
+ * `onSave` rather than this component hardcoding a scorecardId/versionId-bound network
+ * call, so the SAME validation/save UI works for either a materialized version or a
+ * not-yet-saved draft without a second, possibly-inconsistent implementation.
  *
  * `NULL` (shown as an empty editor with the "using the default weighted average" note) is
  * the default for every scorecard unless explicitly customized — clearing the text and
  * saving reverts to that, byte-for-byte unchanged default behavior.
  *
- * Live validation calls the REAL backend endpoint (`POST .../validate-formula`) on every
- * keystroke (debounced), rather than re-implementing formula parsing client-side, so this
- * can never drift from what actually gets accepted/evaluated (the same rule "Save" itself
- * is checked against server-side).
+ * Live validation calls `onValidate` (backed by the REAL backend endpoint either way — see
+ * callers) on every keystroke (debounced), rather than re-implementing formula parsing
+ * client-side, so this can never drift from what actually gets accepted/evaluated.
  */
 export function ScoringFormulaPanel({
-  scorecardId,
-  versionId,
   initialFormula,
   leafKpiNames,
+  onValidate,
+  onSave,
+  savedNotice = { custom: "Custom formula saved.", cleared: "Reverted to the default weighted average." },
 }: {
-  scorecardId: string;
-  versionId: string;
   initialFormula: string | null;
   leafKpiNames: string[];
+  /** Real backend validation — see module docstring. */
+  onValidate: (formula: string) => Promise<FormulaValidation>;
+  /** Persists an already-validated formula (`null` clears it). May be a real network call
+   * (saved scorecard) or a purely local state update (chat draft — see LivePreviewPanel,
+   * where "saving" just means "apply to the in-memory draft", carried to the assistant on
+   * the next message like every other live-preview edit). */
+  onSave: (formula: string | null) => Promise<void>;
+  /** Success-message text, since "saved" means something different in each mode. */
+  savedNotice?: { custom: string; cleared: string };
 }) {
-  const router = useRouter();
   const [text, setText] = useState(initialFormula ?? "");
   const [savedFormula, setSavedFormula] = useState(initialFormula);
   const [validation, setValidation] = useState<FormulaValidation | null>(null);
@@ -74,7 +83,7 @@ export function ScoringFormulaPanel({
     const myRequestId = ++requestIdRef.current;
     debounceRef.current = setTimeout(async () => {
       try {
-        const result = await validateScoringFormula(scorecardId, versionId, text);
+        const result = await onValidate(text);
         if (requestIdRef.current !== myRequestId) return; // a newer keystroke superseded this
         setValidation(result);
       } catch (err) {
@@ -89,7 +98,7 @@ export function ScoringFormulaPanel({
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- scorecardId/versionId are stable per mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onValidate is stable per mount (bound at call site)
   }, [text]);
 
   async function save() {
@@ -99,10 +108,9 @@ export function ScoringFormulaPanel({
     setSaveNotice(null);
     const next = isBlank ? null : text.trim();
     try {
-      await updateScoringFormula(scorecardId, versionId, next);
+      await onSave(next);
       setSavedFormula(next);
-      setSaveNotice(next ? "Custom formula saved." : "Reverted to the default weighted average.");
-      router.refresh();
+      setSaveNotice(next ? savedNotice.custom : savedNotice.cleared);
     } catch (err) {
       setSaveError(
         err instanceof ApiError ? err.message : err instanceof Error ? err.message : "Could not save the formula.",
@@ -253,10 +261,9 @@ export function ScoringFormulaPanel({
       <ScoringFormulaBuilderDialog
         open={builderOpen}
         onOpenChange={setBuilderOpen}
-        scorecardId={scorecardId}
-        versionId={versionId}
         initialText={text}
         leafKpiNames={leafKpiNames}
+        onValidate={onValidate}
         onApply={(next) => {
           setText(next);
           setBuilderOpen(false);

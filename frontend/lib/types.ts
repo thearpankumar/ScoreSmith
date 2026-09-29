@@ -165,12 +165,20 @@ export interface ChatSession {
  * running research workers (see `backend/app/ai/scorecard_builder.py`). Replaces the old
  * generic "Assistant is thinking…" indicator — `message` is the real, human-readable text
  * rendered directly by `TurnTraceCard`.
+ *
+ * `round` (default 1 — see migration `0007_chat_turn_event_round`) distinguishes WHICH
+ * research round an event belongs to, now that `research_kpis` can run more than one
+ * bounded round when the master isn't yet confident coverage is sufficient (see
+ * `MAX_RESEARCH_ROUNDS`/`_assess_research_coverage` in `scorecard_builder.py`). `actor`
+ * alone is ambiguous across rounds (it resets to `research_agent_1`, ... at the start of
+ * every round) — `round` is what `TurnTraceCard` groups by to show each round distinctly.
  */
 export interface ChatTurnEvent {
   id: string;
   actor: string;
   eventType: string;
   message: string;
+  round: number;
   createdAt: string;
 }
 
@@ -245,6 +253,16 @@ export interface ScorecardDraft {
   scope: string | null;
   targetScore: number | null;
   kpis: DraftKpi[];
+  /**
+   * Custom scoring formula for this in-progress draft (mirrors
+   * `ScorecardVersion.scoringFormula` — see `backend/app/ai/draft_schema.py`'s
+   * `ScorecardDraft.scoring_formula`). `null` means the default weighted-average
+   * behavior. Editable both by the assistant (via its `update_scoring_formula` tool,
+   * bound on every chat turn) and directly in the live preview panel (see
+   * LivePreviewPanel/ChatWorkspace's `describeDraftEdits`), same as every other field
+   * here — local edits are unsent until folded into the next chat message.
+   */
+  scoringFormula: string | null;
 }
 
 // ---------------------------------------------------------------------------

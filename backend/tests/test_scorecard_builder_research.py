@@ -17,6 +17,20 @@ Covers exactly what the task calls out:
 `FakeBedrockClient.converse`'s `converse_fn` mode is invoked OUTSIDE its bookkeeping lock
 (see tests/fakes.py) specifically so these tests can prove genuine thread-level concurrency
 across the `asyncio.to_thread`-dispatched `.converse()` calls research agents make.
+
+**Iterative / multi-round research**: every `converse_fn` below now explicitly scripts
+`assess_research_coverage` (the confidence check `research_kpis` runs after round 1 — see
+`_assess_research_coverage`/`MAX_RESEARCH_ROUNDS` in `scorecard_builder.py`) to return
+`sufficient: True` — these tests are all deliberately exercising the SINGLE-round golden
+path (proving no regression from the multi-round feature), so they answer "yes, coverage
+is sufficient" immediately rather than letting the call fall through to a test's catch-all
+branch (which would return a mismatched tool response — that's still handled safely by
+`_assess_research_coverage`'s own fail-safe, but explicitly scripting it here keeps each
+test's own call-count/content assertions exact and intentional). The dedicated multi-round
+mechanism itself (a scripted "not confident" response genuinely triggering round 2 with new
+angles/more KPIs, and the round cap actually stopping an always-insufficient script) is
+covered by its own tests at the bottom of this file, under "Iterative / multi-round
+research".
 """
 
 from __future__ import annotations
@@ -30,6 +44,11 @@ from app.ai import scorecard_builder as sb
 from tests.fakes import FakeBedrockClient, FakeWebSearchClient, tool_use_result
 
 pytestmark = pytest.mark.usefixtures("_migrated_db")
+
+_SUFFICIENT_COVERAGE = tool_use_result(
+    "assess_research_coverage",
+    {"sufficient": True, "reasoning": "Coverage looks adequate for this domain.", "next_angles": []},
+)
 
 _COMPLETE_PATCH = {
     "name": "Vendor Security Compliance Review Quality",
@@ -117,6 +136,9 @@ async def test_research_agents_run_concurrently_not_sequentially() -> None:
         if "decide_research_angles" in names:
             return tool_use_result("decide_research_angles", {"angles": _ANGLES})
 
+        if "assess_research_coverage" in names:
+            return _SUFFICIENT_COVERAGE
+
         if "record_research_finding" in names:
             angle = _angle_from_messages(messages)
             # Every per-angle worker's first call lands here — synchronize on the barrier
@@ -190,6 +212,9 @@ async def test_one_failing_research_agent_does_not_crash_the_turn() -> None:
         if "decide_research_angles" in names:
             return tool_use_result("decide_research_angles", {"angles": _ANGLES})
 
+        if "assess_research_coverage" in names:
+            return _SUFFICIENT_COVERAGE
+
         if "record_research_finding" in names:
             angle = _angle_from_messages(messages)
             if angle == failing_angle:
@@ -247,6 +272,9 @@ async def test_final_proposal_grounded_in_multiple_angles() -> None:
         names = _tools_offered(tools)
         if "decide_research_angles" in names:
             return tool_use_result("decide_research_angles", {"angles": _ANGLES})
+
+        if "assess_research_coverage" in names:
+            return _SUFFICIENT_COVERAGE
 
         if "record_research_finding" in names:
             angle = _angle_from_messages(messages)
@@ -377,6 +405,9 @@ async def test_kpi_batches_merge_from_multiple_agents() -> None:
         if "decide_research_angles" in names:
             return tool_use_result("decide_research_angles", {"angles": _ANGLES})
 
+        if "assess_research_coverage" in names:
+            return _SUFFICIENT_COVERAGE
+
         if "record_research_finding" in names:
             angle = _angle_from_messages(messages)
             return tool_use_result(
@@ -477,3 +508,217 @@ async def test_angle_decision_failure_falls_back_gracefully_without_crashing_tur
     )
 
     assert turn.status == "confirmed"
+
+
+# --- Iterative / multi-round research (end of file) ---------------------------------------
+#
+# Covers the task's three explicit requirements for this feature: (1) a scripted "not
+# confident" response genuinely triggers a second round with NEW angles and MORE KPIs
+# merged in; (2) the round cap (MAX_RESEARCH_ROUNDS) is actually enforced — a client
+# scripted to ALWAYS say "not confident" still stops at the cap, not an infinite loop; (3) a
+# normal "confident after round 1" path still works with no regression (single round, same
+# as before this feature existed).
+
+_ROUND_2_ANGLES = [
+    {
+        "angle": "Third-party audit cadence expectations",
+        "query_focus": "recommended vendor security audit frequency benchmarks",
+    },
+]
+
+
+def _guideline_rungs_research(base_text: str) -> dict[str, dict]:
+    return {str(lvl): {"qualitative_text": f"{base_text} — level {lvl}."} for lvl in range(11)}
+
+
+async def test_low_confidence_triggers_second_round_with_new_angles() -> None:
+    """The confidence check (`assess_research_coverage`) reporting `sufficient: False` with
+    genuinely NEW angles after round 1 causes a real second round: round 2's research
+    agent(s) actually run (against the NEW angle, never a repeat of a round-1 angle), their
+    own KPI batch is merged in on top of round 1's, and the consolidated findings include
+    both rounds — proving this is a real second fan-out, not just a re-decided round 1."""
+    session_id = str(uuid.uuid4())
+    assess_calls: list[dict] = []
+
+    def converse_fn(*, messages, system, tools, force_tool_use, model_id):
+        names = _tools_offered(tools)
+        if "decide_research_angles" in names:
+            return tool_use_result("decide_research_angles", {"angles": _ANGLES})
+
+        if "assess_research_coverage" in names:
+            assess_calls.append({"system": system})
+            return tool_use_result(
+                "assess_research_coverage",
+                {
+                    "sufficient": False,
+                    "reasoning": "Missing coverage on third-party audit cadence expectations.",
+                    "next_angles": _ROUND_2_ANGLES,
+                },
+            )
+
+        if "record_research_finding" in names:
+            angle = _angle_from_messages(messages)
+            return tool_use_result(
+                "record_research_finding",
+                {"summary": f"Finding for {angle}", "suggested_kpis": [], "suggested_thresholds": [], "sources": []},
+            )
+
+        if "propose_kpi_batch" in names:
+            angle = _angle_from_system(system)
+            kpi_name = f"KPI for {angle}"
+            return tool_use_result(
+                "propose_kpi_batch",
+                {"kpis": [{"name": kpi_name, "weight": 100, "guidelines": _guideline_rungs_research(kpi_name)}]},
+            )
+
+        # propose_kpis's real (only) turn: fill in the remaining top-level scalar fields
+        # ONLY, deliberately OMITTING "kpis" from the patch — so update_draft's merge
+        # leaves the already-merged (both-rounds) KPI set from research_kpis untouched,
+        # proving it landed in draft state BEFORE this call ever ran (mirrors
+        # test_kpi_batches_merge_from_multiple_agents's own pattern for the same reason).
+        return tool_use_result(
+            "update_draft",
+            {
+                "patch": {k: v for k, v in _COMPLETE_PATCH.items() if k != "kpis"},
+                "confirmed": True,
+            },
+        )
+
+    fake_bedrock = FakeBedrockClient(converse_fn=converse_fn)
+    fake_search = FakeWebSearchClient(search_fn=lambda q: [])
+
+    turn = await sb.start_session(
+        session_id,
+        "I want a scorecard to rate our vendor security compliance reviews.",
+        fake_bedrock,
+        web_search_client=fake_search,
+    )
+
+    assert turn.status == "confirmed"
+    # Exactly one confidence check happened (round 2 == MAX_RESEARCH_ROUNDS, so the cap is
+    # reached right after round 2 completes and no third assessment is ever made).
+    assert len(assess_calls) == 1
+
+    kpi_names_final = [k["name"] for k in turn.draft["kpis"]]
+    round1_kpi_names = [f"KPI for {a['angle']}" for a in _ANGLES]
+    round2_kpi_names = [f"KPI for {a['angle']}" for a in _ROUND_2_ANGLES]
+    for expected in round1_kpi_names + round2_kpi_names:
+        assert expected in kpi_names_final, (expected, kpi_names_final)
+    # Genuinely MORE KPIs than round 1 alone would have produced.
+    assert len(kpi_names_final) == len(round1_kpi_names) + len(round2_kpi_names)
+
+    compiled = await sb.get_graph_manager().get_compiled_graph()
+    snapshot = await compiled.aget_state({"configurable": {"thread_id": session_id}})
+    findings = snapshot.values.get("research_findings") or []
+    angles_present = {f["angle"] for f in findings}
+    # Both rounds' angles are present in the consolidated findings — round 2 is a REAL
+    # additional fan-out, not a no-op or a re-run of round 1's own angles.
+    for a in _ANGLES + _ROUND_2_ANGLES:
+        assert a["angle"] in angles_present, angles_present
+
+
+async def test_round_cap_enforced_even_if_always_low_confidence() -> None:
+    """A client scripted to ALWAYS report `sufficient: False` (with a fresh, never-repeated
+    angle every time it's asked) still stops at MAX_RESEARCH_ROUNDS — proving the cap is a
+    genuine hard stop, not a suggestion the model could talk its way past into an unbounded
+    (or effectively infinite) loop."""
+    session_id = str(uuid.uuid4())
+    assess_call_count = [0]
+
+    def converse_fn(*, messages, system, tools, force_tool_use, model_id):
+        names = _tools_offered(tools)
+        if "decide_research_angles" in names:
+            return tool_use_result("decide_research_angles", {"angles": _ANGLES})
+
+        if "assess_research_coverage" in names:
+            assess_call_count[0] += 1
+            n = assess_call_count[0]
+            return tool_use_result(
+                "assess_research_coverage",
+                {
+                    "sufficient": False,
+                    "reasoning": f"Still missing something (assessment #{n}) — never satisfied.",
+                    "next_angles": [{"angle": f"Extra angle {n}", "query_focus": f"focus {n}"}],
+                },
+            )
+
+        if "record_research_finding" in names:
+            angle = _angle_from_messages(messages)
+            return tool_use_result(
+                "record_research_finding",
+                {"summary": f"Finding for {angle}", "suggested_kpis": [], "suggested_thresholds": [], "sources": []},
+            )
+
+        if "propose_kpi_batch" in names:
+            return tool_use_result("propose_kpi_batch", {"kpis": []})
+
+        return tool_use_result("update_draft", {"patch": _COMPLETE_PATCH, "confirmed": True})
+
+    fake_bedrock = FakeBedrockClient(converse_fn=converse_fn)
+    fake_search = FakeWebSearchClient(search_fn=lambda q: [])
+
+    turn = await sb.start_session(
+        session_id,
+        "I want a scorecard to rate our vendor security compliance reviews.",
+        fake_bedrock,
+        web_search_client=fake_search,
+    )
+
+    # The turn completed at all (no hang) AND used its full budget "confidently" — both are
+    # part of proving boundedness. MAX_RESEARCH_ROUNDS=2, so exactly ONE assessment ever
+    # runs (after round 1; round 2 hits the cap and skips assessing entirely — see
+    # research_kpis's own "reached_cap" short-circuit) even though the script would have
+    # happily said "not confident" forever if asked again.
+    assert turn.status == "confirmed"
+    assert assess_call_count[0] == 1, "expected the cap to stop further assessment calls, not just further rounds"
+
+    compiled = await sb.get_graph_manager().get_compiled_graph()
+    snapshot = await compiled.aget_state({"configurable": {"thread_id": session_id}})
+    findings = snapshot.values.get("research_findings") or []
+    angles_present = {f["angle"] for f in findings}
+    # Exactly round 1's angles (3) + round 2's one new angle ("Extra angle 1") — never a
+    # round 3's "Extra angle 2", which would only exist if the cap failed to stop the loop.
+    assert angles_present == {*(a["angle"] for a in _ANGLES), "Extra angle 1"}
+    assert "Extra angle 2" not in angles_present
+
+
+async def test_confident_after_round_one_runs_single_round_no_regression() -> None:
+    """The ordinary/common case: the confidence check reports `sufficient: True` right
+    after round 1 — exactly one round of research agents ever runs, identical to this
+    feature's pre-multi-round behavior. Explicit regression coverage for the task's third
+    required case, on top of every OTHER test in this file already exercising this same
+    single-round path via `_SUFFICIENT_COVERAGE`."""
+    session_id = str(uuid.uuid4())
+    record_calls: list[str] = []
+
+    def converse_fn(*, messages, system, tools, force_tool_use, model_id):
+        names = _tools_offered(tools)
+        if "decide_research_angles" in names:
+            return tool_use_result("decide_research_angles", {"angles": _ANGLES})
+        if "assess_research_coverage" in names:
+            return _SUFFICIENT_COVERAGE
+        if "record_research_finding" in names:
+            angle = _angle_from_messages(messages)
+            record_calls.append(angle)
+            return tool_use_result(
+                "record_research_finding",
+                {"summary": f"Finding for {angle}", "suggested_kpis": [], "suggested_thresholds": [], "sources": []},
+            )
+        if "propose_kpi_batch" in names:
+            return tool_use_result("propose_kpi_batch", {"kpis": []})
+        return tool_use_result("update_draft", {"patch": _COMPLETE_PATCH, "confirmed": True})
+
+    fake_bedrock = FakeBedrockClient(converse_fn=converse_fn)
+    fake_search = FakeWebSearchClient(search_fn=lambda q: [])
+
+    turn = await sb.start_session(
+        session_id,
+        "I want a scorecard to rate our vendor security compliance reviews.",
+        fake_bedrock,
+        web_search_client=fake_search,
+    )
+
+    assert turn.status == "confirmed"
+    # record_research_finding was called exactly once per round-1 angle, never again for a
+    # "round 2" — the confidence check genuinely stopped the loop after one round.
+    assert sorted(record_calls) == sorted(a["angle"] for a in _ANGLES)

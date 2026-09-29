@@ -10,6 +10,7 @@ any consumer that doesn't know about LangGraph.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -25,11 +26,13 @@ from app.ai.draft_schema import ScorecardDraft
 from app.ai.embeddings import upsert_scorecard_embedding
 from app.ai.scorecard_builder import (
     BuilderTurnResult,
+    delete_session_checkpoints,
     get_session_state,
     seed_session,
     send_message,
     start_session,
 )
+from app.ai.session_title import generate_session_title
 from app.ai.web_search import WebSearchClientProtocol
 from app.config import get_settings
 from app.db import get_db
@@ -98,6 +101,30 @@ async def _clear_turn_in_progress(db: AsyncSession, session_id: uuid.UUID) -> No
         update(ChatSession).where(ChatSession.id == session_id).values(pending_turn_started_at=None)
     )
     await db.commit()
+
+
+async def _generate_and_persist_title(
+    db: AsyncSession, session: ChatSession, bedrock: BedrockClientProtocol, first_message: str
+) -> str | None:
+    """Issue 1 (see task notes): a brand-new session's title must be generated as the
+    VERY FIRST thing on its first turn — before check_similarity/research_kpis/
+    propose_kpis (the heavier LangGraph work — see scorecard_builder.py) ever run — via
+    ONE fast/cheap Bedrock call (settings.bedrock_judge_model_id, not the heavier chat
+    model), and persisted immediately so a concurrent request (a different tab's session
+    list poll, or this same request's own eventual response) can see it well before the
+    graph call returns. Best-effort: never raises, never blocks session creation on a
+    cosmetic feature — see generate_session_title's own "never raise" contract."""
+    settings = get_settings()
+    title = await asyncio.to_thread(
+        generate_session_title, bedrock, settings.bedrock_judge_model_id, first_message
+    )
+    if not title:
+        return None
+    await db.execute(update(ChatSession).where(ChatSession.id == session.id).values(title=title))
+    await db.commit()
+    session.title = title
+    logger.info("Generated chat session title for session_id=%s: %r", session.id, title)
+    return title
 
 
 def _turn_to_response(session_id: uuid.UUID, turn: BuilderTurnResult) -> ChatTurnRead:
@@ -247,6 +274,14 @@ async def start_chat_session(
     session = ChatSession(id=session_id, user_id=current_user.id)
     db.add(session)
     await db.commit()
+    # Issue 1 (see task notes): generate the session's real title as the VERY FIRST thing
+    # on its first turn — one fast/cheap Bedrock call, well before the heavier LangGraph
+    # work below (check_similarity/research_kpis/propose_kpis) even starts. Persisted
+    # immediately (see _generate_and_persist_title) so it's visible to a concurrent
+    # request long before this one returns. If the graph call below fails and this
+    # session row is deleted, the title is deleted right along with it — no orphaned
+    # title left behind either.
+    await _generate_and_persist_title(db, session, bedrock, payload.message)
     turn_started_at = await _mark_turn_in_progress(db, session_id)
     try:
         turn = await start_session(
@@ -284,6 +319,7 @@ async def start_chat_session(
     response = _turn_to_response(session.id, turn)
     response.materialized_scorecard_id = scorecard_id
     response.materialized_scorecard_version_id = version_id
+    response.title = session.title
     return response
 
 
@@ -333,6 +369,9 @@ async def _start_refine_session(
         user_id=current_user.id,
         target_scorecard_id=scorecard.id,
         context_summary=f'Refining "{scorecard.name}"',
+        # Deterministic — no Bedrock call needed (or wanted: the scorecard being refined
+        # already gives a perfectly specific title for free) — see Issue 1's task notes.
+        title=f'Refining "{scorecard.name}"',
     )
     db.add(session)
     await db.flush()
@@ -372,9 +411,12 @@ async def _start_refine_session(
         response = _turn_to_response(session.id, turn)
         response.materialized_scorecard_id = scorecard_out
         response.materialized_scorecard_version_id = version_out
+        response.title = session.title
         return response
 
-    return _turn_to_response(session.id, turn)
+    no_message_response = _turn_to_response(session.id, turn)
+    no_message_response.title = session.title
+    return no_message_response
 
 
 @router.post("/sessions/{session_id}/messages", response_model=ChatTurnRead)
@@ -430,6 +472,7 @@ async def send_chat_message(
     response = _turn_to_response(session.id, turn)
     response.materialized_scorecard_id = scorecard_id
     response.materialized_scorecard_version_id = version_id
+    response.title = session.title
     return response
 
 
@@ -457,18 +500,64 @@ async def get_chat_session(session_id: uuid.UUID, db: AsyncSession = Depends(get
                 status="gathering",
                 draft={},
                 turn_in_progress=True,
+                # The title-generation call (see start_chat_session) runs and persists
+                # BEFORE the graph call that produces the first checkpoint this branch is
+                # covering the absence of — so it's already reliably set here, even this
+                # early. This is exactly the "second connection sees the title before the
+                # first request returns" path the task's live-verification asks for.
+                title=session.title,
             )
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, detail="Chat session has no LangGraph state yet."
         )
     response = _turn_to_response(session_id, turn)
     response.turn_in_progress = in_progress
+    response.title = session.title
     # Only report a materialized scorecard once something was actually saved: a
     # "Refine with assistant" session carries target_scorecard_id from the start, before
     # anything has been confirmed.
     if session.status == ChatSessionStatus.COMPLETED:
         response.materialized_scorecard_id = session.target_scorecard_id
     return response
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+async def delete_chat_session(
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+) -> None:
+    """Deletes a chat session (the hover-delete action in the sidebar's session list).
+    Follows the same auth pattern as `DELETE /scorecards/{id}` / `DELETE /evaluations/{id}`
+    (just the dev-auth-stub dependency — see app/deps.py; neither of those routes filters
+    by ownership either, so this doesn't add a check they don't have).
+
+    Cascades: `chat_messages` and `chat_turn_events` both have `session_id` FKs with
+    `ondelete="CASCADE"` (see their models), so deleting the `chat_sessions` row removes
+    them at the DB level automatically — no explicit query needed for either. LangGraph's
+    OWN checkpoint tables (`checkpoints`/`checkpoint_writes`/`checkpoint_blobs`) are a
+    separate schema it manages itself (see `scorecard_builder.py::GraphManager`), so those
+    are cleaned up separately via `delete_session_checkpoints`, best-effort: a failure
+    there must not leave the relational row (and thus the now-undeletable-looking session)
+    behind, and a stray orphaned checkpoint row for an id nothing references any more is
+    harmless (never read again, since nothing can look it up).
+    """
+    session = await db.get(ChatSession, session_id)
+    if session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Chat session not found.")
+
+    await db.delete(session)
+    await db.commit()
+
+    try:
+        await delete_session_checkpoints(str(session_id))
+    except Exception:  # noqa: BLE001 — best-effort, see docstring
+        logger.warning(
+            "Failed to delete LangGraph checkpoint rows for deleted chat session_id=%s; "
+            "the relational row is already gone.",
+            session_id,
+            exc_info=True,
+        )
 
 
 @router.get("/sessions/{session_id}/turn-events", response_model=list[ChatTurnEventRead])

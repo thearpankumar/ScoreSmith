@@ -63,6 +63,33 @@ async def suggest_similar_scorecards(
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
 
+class ValidateFormulaDraftRequest(BaseModel):
+    formula: str | None = None
+    kpi_names: list[str] = []
+
+
+class ValidateFormulaDraftResponse(BaseModel):
+    valid: bool
+    error: str | None = None
+    unused_kpis: list[str] = []
+
+
+@router.post("/validate-formula", response_model=ValidateFormulaDraftResponse)
+async def validate_formula_draft_endpoint(payload: ValidateFormulaDraftRequest) -> ValidateFormulaDraftResponse:
+    """Issue 2 (see task notes): the SAME formula-editing capability the chart-detail
+    page's `ScoringFormulaPanel`/`ScoringFormulaBuilderDialog` already has, but for a
+    chat draft that has no `scorecard_id`/`version_id` yet (it isn't materialized until
+    the user confirms — see `app/ai/draft_materialize.py`). Takes the KPI names directly
+    (from the in-progress `ScorecardDraft.kpis`, not looked up from a DB row) rather than
+    requiring a real version to validate against. Uses the exact same
+    `app/ai/scoring_formula.py::validate` as `/{scorecard_id}/versions/{version_id}/
+    validate-formula` below, so the two surfaces can never disagree about what's valid —
+    see `ScoringFormulaPanel`'s `onValidate` prop, now injected differently by the chat
+    live-preview panel vs. the chart-detail Overview tab."""
+    result = validate_scoring_formula_expr(payload.formula, payload.kpi_names)
+    return ValidateFormulaDraftResponse(**result.to_dict())
+
+
 @router.get("", response_model=list[ScorecardRead])
 async def list_scorecards(
     skip: int = 0,

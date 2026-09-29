@@ -1,15 +1,25 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Search } from "lucide-react";
+import { AlertTriangle, Loader2, Search } from "lucide-react";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { ScorecardCard } from "./ScorecardCard";
+import { deleteScorecard } from "@/lib/api-client";
 import type { Scorecard, ScorecardStatus } from "@/lib/types";
 
 export function ChartsLibraryClient({
-  scorecards,
+  scorecards: initialScorecards,
   domains,
   owners,
 }: {
@@ -17,10 +27,33 @@ export function ChartsLibraryClient({
   domains: string[];
   owners: Array<{ id: string; name: string }>;
 }) {
+  // Held as state (seeded from the server-rendered prop) so a successful hover-delete
+  // removes the card from the visible grid immediately, without a full page reload.
+  const [scorecards, setScorecards] = useState<Scorecard[]>(initialScorecards);
   const [search, setSearch] = useState("");
   const [domain, setDomain] = useState("all");
   const [owner, setOwner] = useState("all");
   const [status, setStatus] = useState<ScorecardStatus | "all">("all");
+
+  // Hover-delete (Part B): one confirm dialog shared by every card in the grid.
+  const [pendingDelete, setPendingDelete] = useState<Scorecard | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  async function confirmDelete() {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteScorecard(pendingDelete.id);
+      setScorecards((prev) => prev.filter((s) => s.id !== pendingDelete.id));
+      setPendingDelete(null);
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : "Couldn't delete this scorecard. Try again.");
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -76,10 +109,37 @@ export function ChartsLibraryClient({
       ) : (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {filtered.map((s) => (
-            <ScorecardCard key={s.id} scorecard={s} />
+            <ScorecardCard key={s.id} scorecard={s} onRequestDelete={setPendingDelete} />
           ))}
         </div>
       )}
+
+      <Dialog open={!!pendingDelete} onOpenChange={(open) => !open && !deleting && setPendingDelete(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete “{pendingDelete?.name ?? "this scorecard"}”?</DialogTitle>
+            <DialogDescription>
+              This permanently deletes the scorecard, every version of it, and its evaluations. This can&apos;t be
+              undone.
+            </DialogDescription>
+          </DialogHeader>
+          {deleteError && (
+            <p role="alert" className="flex items-start gap-1.5 text-xs text-[var(--rag-poor)]">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+              {deleteError}
+            </p>
+          )}
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => setPendingDelete(null)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button type="button" variant="destructive" onClick={confirmDelete} disabled={deleting}>
+              {deleting && <Loader2 className="size-3.5 animate-spin" aria-hidden />}
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

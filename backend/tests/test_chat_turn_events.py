@@ -173,6 +173,98 @@ async def test_research_fanout_writes_distinct_actor_events(async_db_session, se
     assert _ANGLES[1]["angle"] in deciding.message
 
 
+async def test_multi_round_research_writes_distinct_round_tagged_events(async_db_session, seed_user_id: str) -> None:
+    """When the confidence check (`assess_research_coverage`) reports insufficient coverage
+    after round 1, round 2's events are written with `round=2` — genuinely distinguishable
+    from round 1's `round=1` events for the SAME actor labels (both rounds have their own
+    `research_agent_1`) — proving the `round` column (migration
+    0007_chat_turn_event_round), not `actor` alone, is what lets the live-trace UI
+    (`TurnTraceCard.tsx`) tell them apart."""
+    session_id = uuid.uuid4()
+    async_db_session.add(ChatSession(id=session_id, user_id=uuid.UUID(seed_user_id)))
+    await async_db_session.commit()
+
+    round2_angle = {
+        "angle": "Escalation timing benchmarks",
+        "query_focus": "recommended incident escalation SLAs",
+    }
+
+    def converse_fn(*, messages, system, tools, force_tool_use, model_id):
+        names = _tools_offered(tools)
+        if "decide_research_angles" in names:
+            return tool_use_result("decide_research_angles", {"angles": _ANGLES})
+        if "assess_research_coverage" in names:
+            return tool_use_result(
+                "assess_research_coverage",
+                {
+                    "sufficient": False,
+                    "reasoning": "Missing escalation timing coverage.",
+                    "next_angles": [round2_angle],
+                },
+            )
+        if "record_research_finding" in names:
+            angle = _angle_from_messages(messages)
+            return tool_use_result(
+                "record_research_finding",
+                {
+                    "summary": f"Finding for {angle}",
+                    "suggested_kpis": [],
+                    "suggested_thresholds": [],
+                    "sources": [],
+                },
+            )
+        return tool_use_result("update_draft", {"patch": _COMPLETE_PATCH, "confirmed": True})
+
+    fake_bedrock = FakeBedrockClient(converse_fn=converse_fn)
+    fake_search = FakeWebSearchClient(
+        search_fn=lambda q: [search_result("Result", "https://example.com", "snippet")]
+    )
+    turn_started_at = datetime.now(UTC)
+
+    turn = await sb.start_session(
+        str(session_id),
+        "I want a scorecard to rate our vendor security compliance reviews.",
+        fake_bedrock,
+        web_search_client=fake_search,
+        turn_started_at=turn_started_at,
+    )
+    assert turn.status == "confirmed"
+
+    rows = (
+        (
+            await async_db_session.execute(
+                select(ChatTurnEvent)
+                .where(ChatTurnEvent.session_id == session_id)
+                .order_by(ChatTurnEvent.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows, "expected chat_turn_events rows to have been written"
+
+    round1_rows = [r for r in rows if r.round == 1]
+    round2_rows = [r for r in rows if r.round == 2]
+    assert round1_rows, "expected round-1 events"
+    assert round2_rows, "expected round-2 events"
+
+    # Round 2 has its own "research_agent_1" (one agent, for round2_angle) — same actor
+    # label as round 1's first agent, but a genuinely distinct round.
+    round2_agent_rows = [r for r in round2_rows if r.actor == "research_agent_1"]
+    assert round2_agent_rows
+    assert any(round2_angle["angle"] in r.message for r in round2_agent_rows)
+    assert not any(round2_angle["angle"] in r.message for r in round1_rows), (
+        "round 2's angle leaked into round 1's events — rounds are not being kept distinct"
+    )
+
+    # Master's round-2 "deciding_angles" event uses genuinely distinct wording from round 1's.
+    round2_master_deciding = next(
+        r for r in round2_rows if r.actor == "master" and r.event_type == "deciding_angles"
+    )
+    assert round2_angle["angle"] in round2_master_deciding.message
+    assert "Round 2" in round2_master_deciding.message
+
+
 async def test_emit_turn_event_is_a_silent_no_op_with_no_turn_started_at(async_db_session, seed_user_id: str) -> None:
     """`turn_started_at=None` (e.g. a seeded "Refine with assistant" session that never
     ran through the API's turn-marking wrapper) must not write anything and must not

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.deps import get_bedrock_client
 from app.main import app
-from tests.fakes import FakeBedrockClient, tool_use_result
+from tests.fakes import FakeBedrockClient, text_result, tool_use_result
 
 _COMPLETE_DRAFT_PATCH = {
     "name": "Support Ticket Quality",
@@ -53,10 +53,15 @@ def test_start_session_asks_clarification_then_confirms(client: TestClient, seed
 
     fake1 = FakeBedrockClient(
         script=[
+            # Issue 1: the very first Bedrock call on a brand-new session's first message
+            # is the fast/cheap title-generation call (see
+            # app/api/v1/chat.py::_generate_and_persist_title) — BEFORE the graph's own
+            # first call. Order matters here (FakeBedrockClient pops its script in order).
+            text_result("Support Ticket Quality Review"),
             tool_use_result(
                 "ask_clarification",
                 {"question": "What is this scorecard's purpose?", "options": [], "missing_fields": ["purpose"]},
-            )
+            ),
         ]
     )
     app.dependency_overrides[get_bedrock_client] = lambda: fake1
@@ -70,12 +75,22 @@ def test_start_session_asks_clarification_then_confirms(client: TestClient, seed
     body = r.json()
     assert body["status"] == "awaiting_clarification"
     assert body["question"]["question"] == "What is this scorecard's purpose?"
+    # Real, AI-generated title — not a truncated raw message — already present on the
+    # very first response, before any follow-up turn.
+    assert body["title"] == "Support Ticket Quality Review"
     session_id = body["session_id"]
 
-    # GET reflects the same pending question without advancing the graph.
+    # GET reflects the same pending question without advancing the graph, and still
+    # carries the same title (generated once, never regenerated).
     r = client.get(f"/api/v1/chat/sessions/{session_id}")
     assert r.status_code == 200
     assert r.json()["status"] == "awaiting_clarification"
+    assert r.json()["title"] == "Support Ticket Quality Review"
+
+    # The session list (what the sidebar polls) reflects it too, with no page reload
+    # needed — this is the same real title, visible from a completely separate request.
+    sessions = client.get("/api/v1/chat/sessions", params={"user_id": user["id"]}).json()
+    assert any(s["id"] == session_id and s["title"] == "Support Ticket Quality Review" for s in sessions)
 
     fake2 = FakeBedrockClient(
         script=[tool_use_result("update_draft", {"patch": _COMPLETE_DRAFT_PATCH, "confirmed": True})]
@@ -157,10 +172,11 @@ def test_failed_first_message_leaves_no_orphaned_session(client: TestClient, see
     # session — proving the fix doesn't break the legitimate, successful path.
     app.dependency_overrides[get_bedrock_client] = lambda: FakeBedrockClient(
         script=[
+            text_result("Status Meeting Quality"),  # title-generation call (Issue 1) — see above
             tool_use_result(
                 "ask_clarification",
                 {"question": "What should we call it?", "options": [], "missing_fields": ["name"]},
-            )
+            ),
         ]
     )
     r3 = client.post(
@@ -341,6 +357,10 @@ def test_refine_session_seeds_draft_without_bedrock_and_saves_new_version(
     body = r.json()
     assert body["status"] == "gathering"
     assert body["materialized_scorecard_id"] is None
+    # Refine-session titles are deterministic (the scorecard name gives a perfectly good
+    # title for free) — no Bedrock call needed, which is also why FakeBedrockClient(script=[])
+    # above is safe here (nothing ever calls .converse() on this path until the real turn below).
+    assert body["title"] == 'Refining "Refinable Scorecard"'
     draft = body["draft"]
     assert draft["name"] == "Refinable Scorecard"
     assert draft["audience"] == "Support leads"
@@ -508,3 +528,222 @@ def test_turn_in_progress_marker_cleared_even_on_bedrock_failure(
         row = db.get(ChatSession, session_id)
         assert row is not None
         assert row.pending_turn_started_at is None, "marker must be cleared even when the turn fails"
+
+
+def test_update_scoring_formula_reachable_from_chat_and_materializes(
+    client: TestClient, seed_user_id: str
+) -> None:
+    """Issue 2 (see task notes): `update_scoring_formula` is a bound chat tool on every
+    turn (see `_TOOLS` in app/ai/scorecard_builder.py, unconditional — not gated behind
+    "already materialized" the way the chart-detail-only UI previously made it feel), and
+    setting it through chat updates `draft.scoring_formula` in live LangGraph state
+    exactly like `update_draft` patches KPIs — then carries through to the real,
+    materialized `ScorecardVersion.scoring_formula` on confirm."""
+    user = client.post(
+        "/api/v1/users",
+        json={"email": "chat-formula@example.com", "name": "Chat Formula User"},
+        headers={"X-User-Id": seed_user_id},
+    ).json()
+
+    formula = 'min(kpi["Accuracy"], kpi["Tone"])'
+
+    fake1 = FakeBedrockClient(
+        script=[
+            text_result("Support Formula Scorecard"),  # title-generation call (Issue 1)
+            # A non-confirming update_draft always loops back to propose_kpis for another
+            # LLM turn within the same human turn (see scorecard_builder.py's graph
+            # edges) — script a second response (ask_clarification, to pause) to close it.
+            tool_use_result("update_draft", {"patch": _COMPLETE_DRAFT_PATCH, "confirmed": False}),
+            tool_use_result(
+                "ask_clarification",
+                {"question": "Anything else before I save it?", "options": [], "missing_fields": []},
+            ),
+        ]
+    )
+    app.dependency_overrides[get_bedrock_client] = lambda: fake1
+    r = client.post(
+        "/api/v1/chat/sessions",
+        json={"message": "I want to build a scorecard rating accuracy and tone."},
+        headers={"X-User-Id": user["id"]},
+    )
+    assert r.status_code == 201, r.text
+    session_id = r.json()["session_id"]
+    assert r.json()["draft"]["scoring_formula"] is None
+
+    fake2 = FakeBedrockClient(
+        script=[
+            tool_use_result("update_scoring_formula", {"formula": formula}),
+            # update_scoring_formula never completes the draft by itself and always loops
+            # back to propose_kpis for another LLM turn within the same human turn (see
+            # scorecard_builder.py's graph edges) — script a second response to close it.
+            tool_use_result(
+                "ask_clarification",
+                {"question": "Anything else to change?", "options": [], "missing_fields": []},
+            ),
+        ]
+    )
+    app.dependency_overrides[get_bedrock_client] = lambda: fake2
+    r = client.post(
+        f"/api/v1/chat/sessions/{session_id}/messages",
+        json={"message": "Use the minimum of Accuracy and Tone instead of averaging them."},
+        headers={"X-User-Id": user["id"]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["draft"]["scoring_formula"] == formula
+
+    # GET reflects the same live LangGraph state (no turn advanced).
+    r = client.get(f"/api/v1/chat/sessions/{session_id}")
+    assert r.json()["draft"]["scoring_formula"] == formula
+
+    fake3 = FakeBedrockClient(script=[tool_use_result("update_draft", {"patch": {}, "confirmed": True})])
+    app.dependency_overrides[get_bedrock_client] = lambda: fake3
+    r = client.post(
+        f"/api/v1/chat/sessions/{session_id}/messages",
+        json={"message": "Looks good, save it."},
+        headers={"X-User-Id": user["id"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "confirmed"
+    version_id = body["materialized_scorecard_version_id"]
+    assert version_id is not None
+
+    version = client.get(
+        f"/api/v1/scorecards/{body['materialized_scorecard_id']}/versions/{version_id}"
+    ).json()
+    assert version["scoring_formula"] == formula
+
+
+def test_validate_formula_draft_endpoint_checks_against_given_kpi_names(client: TestClient) -> None:
+    """The generic, scorecard-less validator (Issue 2) that the chat live-preview panel's
+    formula editor calls — same underlying `app/ai/scoring_formula.py::validate` the
+    per-version endpoint uses, just given KPI names directly instead of looking them up
+    from a materialized version (the chat draft has none yet)."""
+    r = client.post(
+        "/api/v1/scorecards/validate-formula",
+        json={"formula": 'min(kpi["Accuracy"], kpi["Tone"])', "kpi_names": ["Accuracy", "Tone"]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"valid": True, "error": None, "unused_kpis": []}
+
+    r = client.post(
+        "/api/v1/scorecards/validate-formula",
+        json={"formula": 'kpi["Nonexistent"]', "kpi_names": ["Accuracy", "Tone"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["valid"] is False
+    assert body["error"]
+
+    r = client.post("/api/v1/scorecards/validate-formula", json={"formula": None, "kpi_names": []})
+    assert r.status_code == 200, r.text
+    assert r.json()["valid"] is True
+
+
+# --- DELETE /chat/sessions/{id} (hover-delete in the SessionList sidebar) ---------------
+
+
+def test_delete_chat_session_requires_auth(client: TestClient, seed_user_id: str) -> None:
+    """Matches the existing pattern (`DELETE /scorecards/{id}` / `DELETE /evaluations/{id}`
+    — see app/api/v1/scorecards.py / evaluations.py): just the dev-auth-stub dependency,
+    no `X-User-Id` -> 401, same as every other mutating route in this app."""
+    user = client.post(
+        "/api/v1/users",
+        json={"email": "chat-delete-auth@example.com", "name": "Chat Delete Auth User"},
+        headers={"X-User-Id": seed_user_id},
+    ).json()
+    app.dependency_overrides[get_bedrock_client] = lambda: FakeBedrockClient(
+        script=[
+            text_result("Delete Me"),
+            tool_use_result(
+                "ask_clarification",
+                {"question": "What's the purpose?", "options": [], "missing_fields": ["purpose"]},
+            ),
+        ]
+    )
+    r = client.post(
+        "/api/v1/chat/sessions", json={"message": "delete me"}, headers={"X-User-Id": user["id"]}
+    )
+    assert r.status_code == 201, r.text
+    session_id = r.json()["session_id"]
+
+    r = client.delete(f"/api/v1/chat/sessions/{session_id}")
+    assert r.status_code == 401
+
+
+def test_delete_chat_session_unknown_returns_404(client: TestClient, seed_user_id: str) -> None:
+    import uuid as uuid_mod
+
+    r = client.delete(f"/api/v1/chat/sessions/{uuid_mod.uuid4()}", headers={"X-User-Id": seed_user_id})
+    assert r.status_code == 404
+
+
+def test_delete_chat_session_removes_row_messages_and_checkpoints(
+    client: TestClient, seed_user_id: str, db_session
+) -> None:
+    """Real end-to-end proof (per the task's "verify for real" instruction, and matching
+    how a prior pass had to manually clean up orphaned test sessions via raw SQL against
+    these exact tables — see app/ai/scorecard_builder.py::delete_session_checkpoints):
+    deleting a chat session removes (a) the `chat_sessions` row itself, (b) its
+    `chat_messages`/`chat_turn_events` rows via their `ON DELETE CASCADE` FKs, and (c)
+    every LangGraph checkpoint row for its `thread_id` in the `checkpoints`/
+    `checkpoint_writes` tables — a completely separate schema LangGraph owns, which no
+    plain relational cascade would ever touch."""
+    from sqlalchemy import text as sa_text
+
+    user = client.post(
+        "/api/v1/users",
+        json={"email": "chat-delete@example.com", "name": "Chat Delete User"},
+        headers={"X-User-Id": seed_user_id},
+    ).json()
+
+    app.dependency_overrides[get_bedrock_client] = lambda: FakeBedrockClient(
+        script=[
+            text_result("Delete Me"),
+            tool_use_result(
+                "ask_clarification",
+                {"question": "What's the purpose?", "options": [], "missing_fields": ["purpose"]},
+            ),
+        ]
+    )
+    r = client.post(
+        "/api/v1/chat/sessions",
+        json={"message": "I want to build a scorecard to delete."},
+        headers={"X-User-Id": user["id"]},
+    )
+    assert r.status_code == 201, r.text
+    session_id = r.json()["session_id"]
+
+    # Real LangGraph checkpoint state exists for this thread_id (the same GET the
+    # frontend uses to load a resumed session).
+    assert client.get(f"/api/v1/chat/sessions/{session_id}").status_code == 200
+    checkpoints_before = db_session.execute(
+        sa_text("SELECT count(*) FROM checkpoints WHERE thread_id = :tid"), {"tid": session_id}
+    ).scalar_one()
+    assert checkpoints_before > 0
+
+    messages_before = client.get(f"/api/v1/chat/sessions/{session_id}/messages").json()
+    assert len(messages_before) > 0
+
+    r = client.delete(f"/api/v1/chat/sessions/{session_id}", headers={"X-User-Id": user["id"]})
+    assert r.status_code == 204, r.text
+
+    # The relational row — and its messages/turn-events via ON DELETE CASCADE — are gone.
+    assert client.get(f"/api/v1/chat/sessions/{session_id}/messages").status_code == 404
+    sessions = client.get("/api/v1/chat/sessions", params={"user_id": user["id"]}).json()
+    assert sessions == []
+
+    # LangGraph's own checkpoint rows for this thread_id are gone too — not just the
+    # relational chat_sessions/chat_messages rows.
+    checkpoints_after = db_session.execute(
+        sa_text("SELECT count(*) FROM checkpoints WHERE thread_id = :tid"), {"tid": session_id}
+    ).scalar_one()
+    assert checkpoints_after == 0
+    writes_after = db_session.execute(
+        sa_text("SELECT count(*) FROM checkpoint_writes WHERE thread_id = :tid"), {"tid": session_id}
+    ).scalar_one()
+    assert writes_after == 0
+
+    # Deleting it again is a clean 404, not a crash.
+    r = client.delete(f"/api/v1/chat/sessions/{session_id}", headers={"X-User-Id": user["id"]})
+    assert r.status_code == 404

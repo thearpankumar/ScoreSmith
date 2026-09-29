@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 
 import { SessionList } from "./SessionList";
+import { useChatSessions } from "./ChatSessionsContext";
 import { MessageBubble } from "./MessageBubble";
 import { ClarifyingQuestionCard } from "./ClarifyingQuestionCard";
 import { SimilarScorecardSuggestion } from "./SimilarScorecardSuggestion";
@@ -53,7 +54,6 @@ const PREVIEW_WIDTH_STORAGE_KEY = "qs.livePreviewPanelWidth";
 
 export function ChatWorkspace({
   session,
-  allSessions,
   initialMessages,
   initialDraft,
   initialPrompt,
@@ -62,7 +62,6 @@ export function ChatWorkspace({
   initialTurnEvents,
 }: {
   session: ChatSession;
-  allSessions: ChatSession[];
   initialMessages: ChatMessage[];
   initialDraft: ScorecardDraft;
   /** When present (e.g. arriving from the Home prompt box), auto-sent as the first user turn. */
@@ -92,6 +91,14 @@ export function ChatWorkspace({
   );
   const isRefineSession = !!session.targetScorecardId && !initialSavedScorecardId;
   const [refineTargetName] = useState(initialDraft.name);
+  // Issue 1 (see task notes): the sidebar session list now lives in ChatSessionsContext
+  // (see app/chat/layout.tsx), not local state here — this component (rendered by
+  // app/chat/[sessionId]/page.tsx) is itself remounted on every session switch, so any
+  // state kept here wouldn't survive one anyway. `upsertSessionTitle` below is folded
+  // into the same polling this component already runs for turn_in_progress/turn-events
+  // (see the two poll effects below and runAssistantTurn's own success path), so a real,
+  // AI-generated (or just-changed) title appears in the sidebar without a page reload.
+  const { upsertSessionTitle: upsertSessionTitleInContext, setDirty: setContextDirty } = useChatSessions();
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   // `serverDraft` is the last draft the (authoritative) backend returned; `draft` is what
   // the live preview shows and lets the user edit inline. They differ exactly when the
@@ -112,6 +119,14 @@ export function ChatWorkspace({
   const [activeSessionId, setActiveSessionId] = useState(session.id);
   const initialPromptSentRef = useRef(false);
 
+  /** Reflects a real (or changed) title into the sidebar's session list, live — see the
+   * context docstring above. Adds a not-yet-listed session (a brand-new chat whose first
+   * turn just resolved server-side, adopting a real id in place of "new") so it appears
+   * immediately, without waiting for a full page/list reload. */
+  function upsertSessionTitle(id: string, title: string | null | undefined) {
+    upsertSessionTitleInContext(id, title, { userId: session.userId, targetScorecardId: session.targetScorecardId });
+  }
+
   // Refresh-recovery (Part A): a turn already in flight server-side when this page
   // loaded/refreshed (see initialTurnInProgress prop docstring above).
   const [turnInProgress, setTurnInProgress] = useState(!!initialTurnInProgress);
@@ -127,7 +142,7 @@ export function ChatWorkspace({
     let cancelled = false;
     const poll = async () => {
       try {
-        const [{ turnInProgress: stillRunning }, events] = await Promise.all([
+        const [{ turnInProgress: stillRunning, title }, events] = await Promise.all([
           getChatTurnStatus(activeSessionId),
           // Best-effort alongside the authoritative turnInProgress flag — a failed
           // events fetch must never stop the "is it still running" poll from working.
@@ -135,6 +150,11 @@ export function ChatWorkspace({
         ]);
         if (cancelled) return;
         if (events) setTurnEvents(events);
+        // Issue 1: the same poll that already watches turn_in_progress also carries the
+        // session's title (generated fast, well before this poll's turn even finishes —
+        // see backend app/api/v1/chat.py::_generate_and_persist_title) — reflect it into
+        // the sidebar live, no reload needed.
+        upsertSessionTitle(activeSessionId, title);
         if (!stillRunning) {
           // The turn finished (or its marker went stale) while we weren't watching —
           // reload the real message log + draft it produced, rather than guessing.
@@ -229,6 +249,15 @@ export function ChatWorkspace({
 
   const editSummary = useMemo(() => describeDraftEdits(serverDraft, draft), [serverDraft, draft]);
   const dirty = editSummary !== null;
+  // Mirrors `dirty` into ChatSessionsContext so the sidebar's own navigation links (which
+  // live outside this component's render tree once mounted via SessionList, but are fed
+  // by the same context — see ChatSessionsContext) get the same unsaved-changes guard
+  // this component's own links already use (via `navGuard` below).
+  useEffect(() => {
+    setContextDirty(dirty);
+    return () => setContextDirty(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirty]);
   // Nothing to preview yet on a brand-new chat (no purpose, no KPIs, no target score) —
   // don't show an empty "Live preview" card as the default state; it appears once the
   // assistant has proposed something, or the user has made a local edit to show.
@@ -277,6 +306,10 @@ export function ChatWorkspace({
         setActiveSessionId(result.sessionId);
         router.replace(`/chat/${result.sessionId}`, { scroll: false });
       }
+      // Issue 1: a brand-new session's real title is already on THIS response (generated
+      // fast, before the graph even ran — see _generate_and_persist_title) — reflect it
+      // into the sidebar immediately, same mechanism as the poll above.
+      upsertSessionTitle(result.sessionId, result.title);
       if (result.similarSuggestions && result.similarSuggestions.length > 0) {
         // The chat graph's own check_similarity node (see
         // backend/app/ai/scorecard_builder.py) paused *before* propose_kpis ran — "reuse
@@ -634,7 +667,7 @@ export function ChatWorkspace({
     // preview reachable in one click.
     <div className="flex flex-col gap-4 xl:h-[calc(100vh-2rem)] xl:flex-row">
       <div className="hidden shrink-0 xl:block">
-        <SessionList sessions={allSessions} activeSessionId={activeSessionId} dirty={dirty} />
+        <SessionList activeSessionId={activeSessionId} />
       </div>
 
       {isDesktop ? (
@@ -775,6 +808,18 @@ function describeDraftEdits(server: ScorecardDraft, local: ScorecardDraft): stri
       })
       .join("; ");
     changes.push(`- KPI list should now be exactly: ${list || "(none)"} (use each KPI's included_in_scoring flag as noted)`);
+  }
+
+  // Issue 2 (see task notes): a scoring-formula edit made directly in the live preview
+  // panel (see LivePreviewPanel) is carried to the assistant the same way as every other
+  // field here — it applies it via its own `update_scoring_formula` tool, never a direct
+  // draft field write.
+  if ((server.scoringFormula ?? null) !== (local.scoringFormula ?? null)) {
+    changes.push(
+      local.scoringFormula
+        ? `- Scoring formula: set it to exactly ${JSON.stringify(local.scoringFormula)}`
+        : "- Scoring formula: clear the custom formula (revert to the default weighted average)",
+    );
   }
 
   if (changes.length === 0) return null;

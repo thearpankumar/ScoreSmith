@@ -26,6 +26,19 @@ import type { ChatTurnEvent } from "@/lib/types";
  * `ChatWorkspace`) controls whether a still-in-progress actor shows a spinner; when false
  * (e.g. rendering a just-finished turn's trace momentarily before it's cleared), every
  * actor renders in its finished state instead.
+ *
+ * **Multi-round research** (see `MAX_RESEARCH_ROUNDS`/`_assess_research_coverage` in
+ * `backend/app/ai/scorecard_builder.py`): `research_kpis` can now run more than one
+ * bounded round of the fan-out when the master isn't yet confident coverage is sufficient.
+ * Every event carries a `round` (default 1 — see `ChatTurnEvent`'s own docstring). The
+ * COMMON case (a single round, the overwhelming majority of turns) renders exactly as
+ * before — no "Round" header — so there's no visual regression for it. Only once a SECOND
+ * round genuinely appears does this render one "Round N" section per round (each with its
+ * own Master trace + per-agent grid, reusing the same `ActorTrace` component/visual
+ * pattern below unchanged), oldest first, so a multi-round run reads top-to-bottom as
+ * "what happened, round by round" instead of interleaving two rounds' agents together.
+ * Only the LATEST round is ever shown as still "live" (spinner-eligible) — every earlier
+ * round necessarily already finished before the next one's angles were even decided.
  */
 export function TurnTraceCard({ events, active }: { events: ChatTurnEvent[]; active: boolean }) {
   if (events.length === 0) {
@@ -41,10 +54,9 @@ export function TurnTraceCard({ events, active }: { events: ChatTurnEvent[]; act
     );
   }
 
-  const masterEvents = events.filter((e) => e.actor === "master");
-  const agentActors = Array.from(new Set(events.map((e) => e.actor).filter((a) => a !== "master"))).sort(
-    (a, b) => agentIndex(a) - agentIndex(b),
-  );
+  const rounds = Array.from(new Set(events.map((e) => e.round ?? 1))).sort((a, b) => a - b);
+  const maxRound = rounds[rounds.length - 1];
+  const showRoundHeaders = rounds.length > 1;
 
   return (
     <GlassCard
@@ -57,6 +69,45 @@ export function TurnTraceCard({ events, active }: { events: ChatTurnEvent[]; act
         <Sparkles className="size-3.5 text-lemon-ink" aria-hidden />
         {active ? "Working on it" : "Last turn's activity"}
       </div>
+
+      {rounds.map((round) => (
+        <RoundTrace
+          key={round}
+          round={round}
+          events={events.filter((e) => (e.round ?? 1) === round)}
+          // Only the most recent round can still be live — every earlier round already
+          // ran to completion before the next round's angles were decided.
+          active={active && round === maxRound}
+          showHeader={showRoundHeaders}
+        />
+      ))}
+    </GlassCard>
+  );
+}
+
+function RoundTrace({
+  round,
+  events,
+  active,
+  showHeader,
+}: {
+  round: number;
+  events: ChatTurnEvent[];
+  active: boolean;
+  showHeader: boolean;
+}) {
+  const masterEvents = events.filter((e) => e.actor === "master");
+  const agentActors = Array.from(new Set(events.map((e) => e.actor).filter((a) => a !== "master"))).sort(
+    (a, b) => agentIndex(a) - agentIndex(b),
+  );
+
+  return (
+    <div className="space-y-2.5">
+      {showHeader && (
+        <div className="flex items-center gap-1.5 border-t border-hairline pt-2.5 text-[11px] font-semibold uppercase tracking-wide text-ink-muted first:border-t-0 first:pt-0">
+          Round {round}
+        </div>
+      )}
 
       {masterEvents.length > 0 && (
         <ActorTrace label="Master" events={masterEvents} active={active} />
@@ -75,7 +126,7 @@ export function TurnTraceCard({ events, active }: { events: ChatTurnEvent[]; act
           ))}
         </div>
       )}
-    </GlassCard>
+    </div>
   );
 }
 

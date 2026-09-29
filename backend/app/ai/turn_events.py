@@ -30,6 +30,8 @@ async def emit_turn_event(
     actor: str,
     event_type: str,
     message: str,
+    *,
+    round: int = 1,
 ) -> None:
     """Persist one turn-trace event. NEVER raises — a failure to write a UX-only trace
     event must never break the actual chat turn it's describing (mirrors the "never raise"
@@ -38,6 +40,11 @@ async def emit_turn_event(
     `turn_started_at=None` is a valid, silent no-op: some callers (`seed_session`, this
     module's own tests exercising graph logic in isolation with no HTTP request/turn
     marker) genuinely have no turn to correlate events to.
+
+    `round` (default 1, keyword-only) distinguishes which research round this event
+    belongs to (see `MAX_RESEARCH_ROUNDS`/`research_kpis` in `scorecard_builder.py`) —
+    every call site outside the multi-round research loop simply omits it and gets the
+    correct default, so this is a purely additive parameter.
     """
     if turn_started_at is None:
         return
@@ -56,6 +63,7 @@ async def emit_turn_event(
                     actor=actor,
                     event_type=event_type,
                     message=message,
+                    round=round,
                 )
             )
             await db.commit()

@@ -1015,6 +1015,7 @@ export const MOCK_SCORECARD_DRAFTS: Record<string, ScorecardDraft> = {
     scope: "Applies to new third-party vendor onboarding cases handled by procurement ops.",
     targetScore: null,
     kpis: [],
+    scoringFormula: null,
   },
   "chat-3": {
     sessionId: "chat-3",
@@ -1024,6 +1025,7 @@ export const MOCK_SCORECARD_DRAFTS: Record<string, ScorecardDraft> = {
     scope: null,
     targetScore: null,
     kpis: [],
+    scoringFormula: null,
   },
 };
 

@@ -299,6 +299,47 @@ MAX_SEARCH_CALLS_PER_RESEARCH_AGENT = 2
 MAX_KPIS_PER_RESEARCH_BATCH = 4
 MAX_TOTAL_MERGED_KPIS = 24
 
+# --- Iterative / multi-round research (bounded) -----------------------------------------
+#
+# Originally `research_kpis` ran exactly ONE round: decide angles -> fan out -> merge ->
+# fall through to propose_kpis, unconditionally. The owner's ask: if the master isn't
+# confident that round's research is genuinely sufficient, let it launch ONE MORE bounded
+# round of research agents — with NEW/REFINED angles targeting whatever gap it identified
+# (see `_assess_research_coverage`), not a repeat of the same searches — before ever
+# reaching propose_kpis.
+#
+# Why the cap is 2, not 3+ (explicit latency/cost reasoning, not a reflexive round number):
+# each round is itself 2-4 CONCURRENT research agents, and each agent makes up to
+# MAX_SEARCH_CALLS_PER_RESEARCH_AGENT (2) web_search calls PLUS one record_research_finding
+# call PLUS one propose_kpi_batch call — i.e. up to ~4 sequential Bedrock/web_search round-
+# trips per agent, observed live (per this project's own prior live-testing passes) to take
+# 20-90+ seconds for a SINGLE round depending on model/Gateway latency. A second round adds
+# one more `_assess_research_coverage` call (cheap, one Bedrock call) plus a second full
+# agent fan-out (another 20-90+s) — already a meaningful chunk of a synchronous HTTP
+# request's total latency (the chat-turn endpoints block for the whole LangGraph run per
+# this module's docstring). A THIRD round would compound that same cost again for
+# diminishing returns (by round 3, coverage gaps worth a dedicated concurrent fan-out are
+# rare — see `_ASSESS_COVERAGE_SYSTEM_PROMPT`'s explicit "most domains ARE adequately
+# covered after one round" framing) while risking a chat turn that feels broken/hung to a
+# user waiting on a single HTTP response. 2 is therefore the default; bumping to 3 is a
+# one-line change here if the product later decides the extra latency is worth it for
+# specific domains, but nothing in this implementation hardcodes "exactly 2" anywhere else.
+#
+# Interaction with MAX_LLM_TURNS_PER_HUMAN_TURN (the real bug from an earlier pass this
+# task explicitly calls out: propose_kpis running out of turns before ever confirming) —
+# **this cannot recur from multi-round research**, by construction: every round of the
+# loop, the angle-decision call, AND every `_assess_research_coverage` call all happen
+# INSIDE this one `research_kpis` node invocation (a plain Python `while` loop below, not
+# additional LangGraph nodes/edges) — `research_kpis` still runs at MOST once per session
+# (guarded by `research_done`, unchanged) and still never touches `llm_turn_count` (that
+# counter only increments on each `propose_kpis` node VISIT — see that counter's own
+# docstring). So however many research rounds run (1 or MAX_RESEARCH_ROUNDS), propose_kpis
+# always starts its own turn budget completely fresh at MAX_LLM_TURNS_PER_HUMAN_TURN (4) —
+# research rounds and the reconciliation/confirmation turns that follow are accounted
+# entirely separately, by simply never sharing a counter, rather than needing any new
+# bookkeeping to keep them apart.
+MAX_RESEARCH_ROUNDS = 2
+
 DECIDE_RESEARCH_ANGLES_TOOL = ToolSpec(
     name="decide_research_angles",
     description=(
@@ -446,6 +487,60 @@ PROPOSE_KPI_BATCH_TOOL = ToolSpec(
     },
 )
 
+ASSESS_RESEARCH_COVERAGE_TOOL = ToolSpec(
+    name="assess_research_coverage",
+    description=(
+        "Given the research findings and KPIs gathered so far for this domain, decide "
+        "whether research coverage is genuinely SUFFICIENT to proceed to KPI proposal now, "
+        "or whether an important, DISTINCT angle/gap remains unresearched. This is the "
+        "confidence check between research rounds — be honest: most domains ARE adequately "
+        "covered after one round; only report insufficient coverage when you can name a "
+        "real, specific, meaningfully different concern the research so far hasn't touched."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "sufficient": {
+                "type": "boolean",
+                "description": (
+                    "true if coverage is genuinely adequate to propose a comprehensive, "
+                    "well-grounded KPI set now; false only if there's a real, specific gap."
+                ),
+            },
+            "reasoning": {
+                "type": "string",
+                "description": (
+                    "Brief reasoning for this judgment, grounded in the actual findings/KPIs "
+                    "listed above — not a generic statement."
+                ),
+            },
+            "next_angles": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": MAX_RESEARCH_ANGLES,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "angle": {"type": "string", "description": "A short label for this NEW research angle."},
+                        "query_focus": {
+                            "type": "string",
+                            "description": "A specific, researchable question or focus for this angle.",
+                        },
+                    },
+                    "required": ["angle", "query_focus"],
+                },
+                "description": (
+                    "ONLY populate when sufficient=false: 1 or more NEW angles that are "
+                    "genuinely DIFFERENT from every angle already investigated (never a "
+                    "repeat/rephrasing of one already covered) and that specifically target "
+                    "the gap identified in `reasoning`. Leave empty when sufficient=true."
+                ),
+            },
+        },
+        "required": ["sufficient", "reasoning", "next_angles"],
+    },
+)
+
 _DECIDE_ANGLES_SYSTEM_PROMPT = f"""You are the research-planning step for the Quality \
 Scorecard System's scorecard-design assistant. Given what the user has said so far about \
 the scorecard they want, decide which DISTINCT research angles (0 to {MAX_RESEARCH_ANGLES}) \
@@ -506,6 +601,35 @@ FULL 11-level (0-10) qualitative + quantitative guideline. Use the suggested_thr
 above to ground the quantitative_criteria at each level wherever relevant, rather than \
 inventing plausible-sounding numbers. Call `propose_kpi_batch` exactly once."""
 
+_ASSESS_COVERAGE_SYSTEM_PROMPT = f"""You are the research-planning step for the Quality \
+Scorecard System's scorecard-design assistant, reviewing the results of research round \
+{{rounds_so_far}} to decide whether to propose KPIs now or investigate a genuine gap first. \
+THIS is the real confidence check the multi-round research loop is built on — your \
+judgment here, grounded in the actual findings below, decides whether a second (bounded) \
+round of concurrent research agents runs at all.
+
+What the user has said so far (most recent message last):
+{{conversation_context}}
+
+Research angle(s) already investigated so far: {{angles_covered}}
+
+Consolidated findings and KPIs gathered so far:
+{{findings_summary}}
+
+Decide honestly: is this coverage genuinely SUFFICIENT to propose a comprehensive, well- \
+grounded set of KPIs for this domain now, or is there a real, DISTINCT gap — an important \
+angle or concern this domain needs that none of the above touched? Most domains ARE \
+adequately covered after one round of focused research — only report `sufficient: false` \
+when you can name a SPECIFIC, meaningful, missing concern, never merely "more research is \
+always better" or a marginal refinement/rephrasing of an angle already covered above.
+
+If (and only if) insufficient, propose 1 to {MAX_RESEARCH_ANGLES} NEW research angles that \
+are genuinely DIFFERENT from every angle listed above and specifically target the gap you \
+identified — the whole point of a second round is covering NEW ground, not re-searching \
+the same territory.
+
+Call `assess_research_coverage` exactly once."""
+
 
 @dataclass
 class ResearchFinding:
@@ -535,6 +659,21 @@ class ResearchFinding:
         return bool(
             self.summary or self.suggested_kpis or self.suggested_thresholds or self.sources or self.proposed_kpis
         )
+
+
+@dataclass
+class CoverageAssessment:
+    """Result of one `assess_research_coverage` call (see `_assess_research_coverage`) —
+    THE confidence-check mechanism `research_kpis` uses to decide whether to launch
+    another bounded research round. `sufficient=True` (including the fail-safe default
+    used on any malformed/unusable tool response or failed call — see
+    `_assess_research_coverage`'s own docstring) always means "stop here and proceed to
+    propose_kpis": a broken or ambiguous assessment can only ever cause the loop to STOP
+    early, never spin an extra round on garbage input, and never loop forever."""
+
+    sufficient: bool
+    reasoning: str
+    next_angles: list[dict[str, str]]
 
 
 def _decide_research_angles(
@@ -577,6 +716,79 @@ def _decide_research_angles(
     return cleaned
 
 
+def _clean_angle_items(raw_angles: list[Any]) -> list[dict[str, str]]:
+    """Shared cleaning logic for a list of `{angle, query_focus}` dicts, however they were
+    produced (`decide_research_angles`'s `angles` or `assess_research_coverage`'s
+    `next_angles` — both use the identical shape) — factored out of `_decide_research_angles`
+    so `_assess_research_coverage` doesn't duplicate the same defensive parsing."""
+    cleaned: list[dict[str, str]] = []
+    for raw in raw_angles[:MAX_RESEARCH_ANGLES]:
+        if not isinstance(raw, dict):
+            continue
+        angle = str(raw.get("angle") or "").strip()
+        query_focus = str(raw.get("query_focus") or "").strip()
+        if angle and query_focus:
+            cleaned.append({"angle": angle, "query_focus": query_focus})
+    return cleaned
+
+
+def _assess_research_coverage(
+    bedrock: BedrockClientProtocol,
+    model_id: str | None,
+    draft: ScorecardDraft,
+    conversation_context: str,
+    findings: list[ResearchFinding],
+    angles_covered: list[dict[str, str]],
+    rounds_so_far: int,
+) -> CoverageAssessment:
+    """One synchronous Bedrock call (run via `asyncio.to_thread` by the caller, mirrors
+    `_decide_research_angles`'s own shape) — the confidence-check mechanism behind the
+    multi-round research loop (see `research_kpis` and `MAX_RESEARCH_ROUNDS`'s own
+    docstring). A REAL judgment: the model is shown the actual consolidated findings and
+    the KPIs merged so far and asked to decide, grounded in that real content, whether a
+    genuine gap remains — never a hardcoded heuristic, a coin flip, or an always-true/
+    always-false stub (per the task's explicit requirement).
+
+    Fails SAFE: any malformed tool response, wrong tool name, or exception is treated as
+    `sufficient=True` (see `CoverageAssessment`'s own docstring) — so a Bedrock hiccup on
+    this one call degrades to "proceed with what we have", exactly what happened before
+    this feature existed, never an infinite or stuck research loop."""
+    findings_summary = _format_research_findings_for_prompt([asdict(f) for f in findings]) or "(no findings yet)"
+    current_kpi_names = ", ".join(kpi.name for kpi in draft.kpis) or "(none yet)"
+    angles_text = (
+        "; ".join(f'"{a["angle"]}" (focus: {a["query_focus"]})' for a in angles_covered) or "(none)"
+    )
+    system_prompt = _ASSESS_COVERAGE_SYSTEM_PROMPT.format(
+        rounds_so_far=rounds_so_far,
+        conversation_context=conversation_context or "(nothing yet)",
+        angles_covered=angles_text,
+        findings_summary=f"{findings_summary}\n\nKPIs merged so far: {current_kpi_names}",
+    )
+    result = bedrock.converse(
+        messages=[{"role": "user", "content": [{"text": "Assess research coverage for this scorecard."}]}],
+        system=system_prompt,
+        tools=[ASSESS_RESEARCH_COVERAGE_TOOL],
+        force_tool_use=True,
+        model_id=model_id,
+    )
+    if not result.is_tool_use or result.tool_name != "assess_research_coverage":
+        logger.warning(
+            "_assess_research_coverage: no usable assess_research_coverage tool call "
+            "(stop_reason=%r); treating as sufficient (fail-safe).",
+            getattr(result, "stop_reason", None),
+        )
+        return CoverageAssessment(sufficient=True, reasoning="(no usable assessment returned)", next_angles=[])
+
+    data = result.tool_input or {}
+    next_angles = _clean_angle_items(data.get("next_angles") or [])
+    # sufficient=True OR no usable next_angles both mean "stop" — an "insufficient" verdict
+    # with nothing concrete to research next is functionally the same as "sufficient" here.
+    sufficient = bool(data.get("sufficient", True)) or not next_angles
+    return CoverageAssessment(
+        sufficient=sufficient, reasoning=str(data.get("reasoning") or ""), next_angles=next_angles
+    )
+
+
 async def _run_research_agent(
     angle: str,
     query_focus: str,
@@ -587,6 +799,7 @@ async def _run_research_agent(
     session_id: str,
     turn_started_at: datetime | None,
     actor: str,
+    round_num: int = 1,
 ) -> ResearchFinding:
     """THE single research-agent definition (instantiated/invoked N times concurrently by
     `research_kpis` via `asyncio.gather`, never duplicated in code) — a bounded ReAct-style
@@ -594,11 +807,16 @@ async def _run_research_agent(
     then forced to close with `record_research_finding`, mirroring propose_kpis's own
     bounded web_search loop (see MAX_WEB_SEARCH_CALLS_PER_PROPOSE).
 
-    `actor` (e.g. `"research_agent_2"`, assigned index-based by the caller — see
-    `research_kpis`) is this specific concurrent invocation's stable identifier for the
-    live-trace event log (see `app/ai/turn_events.py`): every event this worker emits is
-    tagged with it, so a reader can tell which of the N concurrently-running agents
-    produced which event even though they interleave in `created_at` order.
+    `actor` (e.g. `"research_agent_2"`, assigned index-based by the caller WITHIN its
+    round — see `research_kpis`) is this specific concurrent invocation's stable identifier
+    for the live-trace event log (see `app/ai/turn_events.py`): every event this worker
+    emits is tagged with it, so a reader can tell which of the N concurrently-running
+    agents produced which event even though they interleave in `created_at` order.
+    `round_num` (default 1) additionally tags every event with which research ROUND this
+    invocation belongs to (see `MAX_RESEARCH_ROUNDS`) — `actor` alone is ambiguous across
+    rounds since it resets to `research_agent_1`, `research_agent_2`, ... at the start of
+    every round; `round_num` is what lets a reader (or `TurnTraceCard.tsx`) tell round 2's
+    `research_agent_1` apart from round 1's.
 
     Contract: NEVER raises — mirrors web_search.py's own "return [], never raise" contract
     (see that module's docstring) one level up. Any failure anywhere in this worker (a
@@ -608,7 +826,7 @@ async def _run_research_agent(
     tasks and are completely unaffected by this one's exception either way)."""
     try:
         await emit_turn_event(
-            session_id, turn_started_at, actor, "started", f'Researching "{angle}": {query_focus}'
+            session_id, turn_started_at, actor, "started", f'Researching "{angle}": {query_focus}', round=round_num
         )
         local_messages: list[dict[str, Any]] = [
             {
@@ -636,6 +854,7 @@ async def _run_research_agent(
                 await emit_turn_event(
                     session_id, turn_started_at, actor, "synthesizing",
                     f'Synthesizing findings for "{angle}"…',
+                    round=round_num,
                 )
 
             result = await asyncio.to_thread(
@@ -651,7 +870,7 @@ async def _run_research_agent(
                 query = str((result.tool_input or {}).get("query") or "").strip()
                 search_calls_made += 1
                 await emit_turn_event(
-                    session_id, turn_started_at, actor, "searching", f'Searching: "{query}"'
+                    session_id, turn_started_at, actor, "searching", f'Searching: "{query}"', round=round_num
                 )
                 logger.info(
                     "research agent angle=%r: web_search (%d/%d) query=%r",
@@ -672,6 +891,7 @@ async def _run_research_agent(
                 await emit_turn_event(
                     session_id, turn_started_at, actor, "search_result",
                     f'Found {len(results)} result(s) for "{query}"',
+                    round=round_num,
                 )
                 logger.info(
                     "research agent angle=%r: web_search query=%r -> %d result(s)%s",
@@ -709,7 +929,8 @@ async def _run_research_agent(
             # finding itself (finding.proposed_kpis simply stays [] — the finding above
             # is already fully formed and returned regardless).
             await emit_turn_event(
-                session_id, turn_started_at, actor, "proposing_kpis", f'Proposing KPIs for "{angle}"…'
+                session_id, turn_started_at, actor, "proposing_kpis", f'Proposing KPIs for "{angle}"…',
+                round=round_num,
             )
             try:
                 batch_system_prompt = _PROPOSE_KPI_BATCH_SYSTEM_PROMPT_TEMPLATE.format(
@@ -746,17 +967,20 @@ async def _run_research_agent(
                 await emit_turn_event(
                     session_id, turn_started_at, actor, "proposed_kpis",
                     f'Proposed {len(finding.proposed_kpis)} KPI(s) for "{angle}": {names}',
+                    round=round_num,
                 )
             else:
                 await emit_turn_event(
                     session_id, turn_started_at, actor, "proposed_kpis",
                     f'"{angle}": no KPIs proposed from this angle.',
+                    round=round_num,
                 )
 
             await emit_turn_event(
                 session_id, turn_started_at, actor, "completed",
                 f'Finished "{angle}": {len(finding.proposed_kpis)} KPI(s) proposed, '
                 f"{len(finding.suggested_thresholds)} threshold(s), {len(finding.sources)} source(s).",
+                round=round_num,
             )
             return finding
 
@@ -769,12 +993,14 @@ async def _run_research_agent(
         await emit_turn_event(
             session_id, turn_started_at, actor, "error",
             f'"{angle}": model did not produce a usable finding — skipping this angle.',
+            round=round_num,
         )
         return ResearchFinding(angle=angle, summary=(result.text if result else "") or "", degraded=True)
     except Exception:  # noqa: BLE001 — this worker's whole-agent "never raise" contract; see docstring
         logger.warning("research agent angle=%r failed entirely; returning a degraded finding.", angle, exc_info=True)
         await emit_turn_event(
-            session_id, turn_started_at, actor, "error", f'"{angle}": research agent failed — skipping this angle.'
+            session_id, turn_started_at, actor, "error", f'"{angle}": research agent failed — skipping this angle.',
+            round=round_num,
         )
         return ResearchFinding(angle=angle, degraded=True)
 
@@ -932,13 +1158,27 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
     web_search calls are in flight together, not one after another), and consolidates the
     structured findings into state for `propose_kpis` to ground its proposal in.
 
+    **Iterative / multi-round research**: after round 1's fan-out and merge, if
+    `MAX_RESEARCH_ROUNDS` (2) hasn't been reached yet, the master runs ONE real confidence
+    check (`_assess_research_coverage` — a genuine Bedrock judgment grounded in the actual
+    consolidated findings/KPIs gathered so far, never a hardcoded heuristic) asking whether
+    coverage is genuinely sufficient or whether a real, distinct gap remains. If the model
+    identifies a real gap AND proposes new/refined angles for it, a SECOND bounded round of
+    the same concurrent fan-out runs against those NEW angles (given full context on what
+    round 1 already covered, so it targets an actual gap rather than re-searching the same
+    ground — see `_ASSESS_COVERAGE_SYSTEM_PROMPT`). This whole multi-round loop is a plain
+    Python `while` loop INSIDE this one node invocation, not additional LangGraph nodes —
+    see `MAX_RESEARCH_ROUNDS`'s own docstring for why that's what keeps this feature from
+    ever affecting `MAX_LLM_TURNS_PER_HUMAN_TURN`.
+
     Runs at most ONCE per session (guarded by `research_done`, set on every path out of this
-    node) — see the module-level comment above MAX_RESEARCH_ANGLES for why this keeps
-    MAX_LLM_TURNS_PER_HUMAN_TURN unaffected. A no-op (research_done=True, no findings) when
-    no `web_search_client` is wired in (mirrors propose_kpis's own gating), or when angle
-    decision itself fails/returns nothing — propose_kpis then simply proceeds exactly as it
-    did before this feature existed (its own ad hoc web_search + the model's own knowledge),
-    which is the graceful-degradation path required when Bedrock/web_search is unavailable."""
+    node, unchanged by this feature) — see `MAX_RESEARCH_ROUNDS`'s own docstring for why
+    this (now potentially multi-round) node still can't affect MAX_LLM_TURNS_PER_HUMAN_TURN.
+    A no-op (research_done=True, no findings) when no `web_search_client` is wired in
+    (mirrors propose_kpis's own gating), or when round 1's angle decision itself fails/
+    returns nothing — propose_kpis then simply proceeds exactly as it did before this
+    feature existed (its own ad hoc web_search + the model's own knowledge), which is the
+    graceful-degradation path required when Bedrock/web_search is unavailable."""
     if state.get("research_done"):
         return {}
 
@@ -978,81 +1218,175 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
         )
         return {"research_done": True}
 
-    logger.info("research_kpis: dispatching %d research agent(s) concurrently: %s", len(angles), angles)
-    await emit_turn_event(
-        session_id, turn_started_at, "master", "deciding_angles",
-        f"Decided on {len(angles)} research angle(s): "
-        + "; ".join(f'"{a["angle"]}"' for a in angles),
-    )
-
-    raw_findings = await asyncio.gather(
-        *(
-            _run_research_agent(
-                a["angle"],
-                a["query_focus"],
-                bedrock,
-                web_search_client,
-                model_id,
-                session_id=session_id,
-                turn_started_at=turn_started_at,
-                actor=f"research_agent_{i + 1}",
-            )
-            for i, a in enumerate(angles)
-        ),
-        return_exceptions=True,  # belt-and-suspenders — _run_research_agent already never raises
-    )
-
-    findings: list[ResearchFinding] = []
-    for item in raw_findings:
-        if isinstance(item, BaseException):
-            logger.warning("research_kpis: a research agent raised unexpectedly; excluding it.", exc_info=item)
-            continue
-        findings.append(item)
-
-    usable = [f for f in findings if f.has_content()]
-    logger.info(
-        "research_kpis: %d/%d agent(s) returned usable findings (%d degraded/empty excluded).",
-        len(usable),
-        len(angles),
-        len(findings) - len(usable),
-    )
-
-    # --- Merge point (Part 1 fix) — see _merge_research_kpi_batches's own docstring and
-    # the module comment above MAX_RESEARCH_ANGLES. Each agent's own batch is already
-    # fully-specified (name/weight/11-level guidelines); this only dedupes/caps/
-    # renormalizes across agents, it does not call the LLM again.
-    total_proposed_before_merge = sum(len(f.proposed_kpis) for f in usable)
-    merged_kpis = _merge_research_kpi_batches(usable)
+    # --- Multi-round loop (bounded by MAX_RESEARCH_ROUNDS — see that constant's own
+    # docstring for the full latency/cost/MAX_LLM_TURNS_PER_HUMAN_TURN reasoning). Round 1
+    # always runs with the angles `_decide_research_angles` just chose above; every
+    # subsequent round (if any) runs with the NEW angles `_assess_research_coverage`
+    # proposed for a genuine identified gap. `all_findings`/`all_angles_covered` accumulate
+    # across every round so far, so the merge step (`_merge_research_kpi_batches`) and the
+    # confidence check both always see the FULL picture, not just the latest round.
+    all_findings: list[ResearchFinding] = []
+    all_angles_covered: list[dict[str, str]] = []
+    merged_kpis: list[dict[str, Any]] = []
     updated_draft_dict = draft.model_dump(mode="json")
-    if merged_kpis:
-        updated_draft_dict = {**updated_draft_dict, "kpis": merged_kpis}
-        try:
-            ScorecardDraft.model_validate(updated_draft_dict)  # sanity check before committing to state
-        except ValidationError:
-            logger.warning(
-                "research_kpis: merged KPI batch failed ScorecardDraft validation; discarding the merge.",
-                exc_info=True,
-            )
-            updated_draft_dict = draft.model_dump(mode="json")
-            merged_kpis = []
+    total_proposed_before_merge = 0
+    round_num = 1
 
-    logger.info(
-        "research_kpis: merged %d proposed KPI(s) from %d agent batch(es) into %d deduped/capped KPI(s): %s",
-        total_proposed_before_merge,
-        len(usable),
-        len(merged_kpis),
-        [k["name"] for k in merged_kpis],
-    )
-    await emit_turn_event(
-        session_id, turn_started_at, "master", "completed",
-        f"Research phase complete — consolidated {len(usable)}/{len(angles)} finding(s); merged "
-        f"{total_proposed_before_merge} proposed KPI(s) across all agents into "
-        f"{len(merged_kpis)} deduped KPI(s) for review.",
-    )
+    while True:
+        logger.info(
+            "research_kpis: round %d dispatching %d research agent(s) concurrently: %s",
+            round_num, len(angles), angles,
+        )
+        if round_num == 1:
+            await emit_turn_event(
+                session_id, turn_started_at, "master", "deciding_angles",
+                f"Decided on {len(angles)} research angle(s): "
+                + "; ".join(f'"{a["angle"]}"' for a in angles),
+                round=round_num,
+            )
+        else:
+            # Distinct wording (never identical to round 1's message) so the live trace
+            # UI/logs make clear this round exists BECAUSE round 1 wasn't judged
+            # sufficient — see `_assess_research_coverage`'s reasoning, echoed here too.
+            await emit_turn_event(
+                session_id, turn_started_at, "master", "deciding_angles",
+                f"Round {round_num}: investigating {len(angles)} new angle(s) to address a "
+                "gap round 1 didn't cover: " + "; ".join(f'"{a["angle"]}"' for a in angles),
+                round=round_num,
+            )
+
+        raw_findings = await asyncio.gather(
+            *(
+                _run_research_agent(
+                    a["angle"],
+                    a["query_focus"],
+                    bedrock,
+                    web_search_client,
+                    model_id,
+                    session_id=session_id,
+                    turn_started_at=turn_started_at,
+                    actor=f"research_agent_{i + 1}",
+                    round_num=round_num,
+                )
+                for i, a in enumerate(angles)
+            ),
+            return_exceptions=True,  # belt-and-suspenders — _run_research_agent already never raises
+        )
+
+        round_findings: list[ResearchFinding] = []
+        for item in raw_findings:
+            if isinstance(item, BaseException):
+                logger.warning("research_kpis: a research agent raised unexpectedly; excluding it.", exc_info=item)
+                continue
+            round_findings.append(item)
+
+        usable = [f for f in round_findings if f.has_content()]
+        logger.info(
+            "research_kpis: round %d — %d/%d agent(s) returned usable findings (%d degraded/empty excluded).",
+            round_num, len(usable), len(angles), len(round_findings) - len(usable),
+        )
+
+        all_findings.extend(usable)
+        all_angles_covered.extend(angles)
+        total_proposed_before_merge += sum(len(f.proposed_kpis) for f in usable)
+
+        # --- Merge point (Part 1 fix) — see _merge_research_kpi_batches's own docstring.
+        # Re-run over ALL findings accumulated so far (not just this round's), so a
+        # round-2 agent's near-duplicate of a round-1 KPI is caught by the same dedup pass
+        # and the whole pool is renormalized together — never two independently-normalized
+        # pools bolted together.
+        candidate_kpis = _merge_research_kpi_batches(all_findings)
+        if candidate_kpis:
+            candidate_draft_dict = {**draft.model_dump(mode="json"), "kpis": candidate_kpis}
+            try:
+                ScorecardDraft.model_validate(candidate_draft_dict)  # sanity check before committing to state
+                updated_draft_dict = candidate_draft_dict
+                merged_kpis = candidate_kpis
+            except ValidationError:
+                logger.warning(
+                    "research_kpis: round %d merged KPI batch failed ScorecardDraft validation; "
+                    "keeping the last known-good merge.",
+                    round_num, exc_info=True,
+                )
+
+        logger.info(
+            "research_kpis: round %d — merged %d proposed KPI(s) from %d agent batch(es) so far into "
+            "%d deduped/capped KPI(s): %s",
+            round_num, total_proposed_before_merge, len(all_findings), len(merged_kpis),
+            [k["name"] for k in merged_kpis],
+        )
+
+        reached_cap = round_num >= MAX_RESEARCH_ROUNDS
+        assessment: CoverageAssessment | None = None
+        if not reached_cap:
+            # Only spend the extra confidence-check Bedrock call when there's actually a
+            # possible further round to launch — skipping it entirely once the cap is hit
+            # is itself part of respecting the latency budget (see MAX_RESEARCH_ROUNDS).
+            await emit_turn_event(
+                session_id, turn_started_at, "master", "assessing_coverage",
+                f"Assessing whether round {round_num}'s research covers this domain well enough…",
+                round=round_num,
+            )
+            try:
+                assessment = await asyncio.to_thread(
+                    _assess_research_coverage,
+                    bedrock,
+                    model_id,
+                    ScorecardDraft.model_validate(updated_draft_dict),
+                    conversation_context,
+                    all_findings,
+                    all_angles_covered,
+                    round_num,
+                )
+            except Exception:  # noqa: BLE001 — a failed confidence check must never break the turn
+                logger.warning(
+                    "research_kpis: coverage assessment failed after round %d; proceeding with what we have.",
+                    round_num, exc_info=True,
+                )
+                await emit_turn_event(
+                    session_id, turn_started_at, "master", "error",
+                    "Could not assess research coverage — proceeding with what's been found so far.",
+                    round=round_num,
+                )
+
+        will_continue = (
+            not reached_cap
+            and assessment is not None
+            and not assessment.sufficient
+            and bool(assessment.next_angles)
+        )
+
+        if will_continue:
+            assert assessment is not None  # for mypy/readability — guarded by will_continue above
+            await emit_turn_event(
+                session_id, turn_started_at, "master", "completed",
+                f"Round {round_num} complete — {len(usable)}/{len(angles)} finding(s), "
+                f"{len(merged_kpis)} KPI(s) merged so far. Not yet sufficient: "
+                f"{assessment.reasoning or 'a real gap remains'} — starting round {round_num + 1}.",
+                round=round_num,
+            )
+            angles = assessment.next_angles
+            round_num += 1
+            continue
+
+        if reached_cap:
+            stop_reason = f"reached the {MAX_RESEARCH_ROUNDS}-round research cap"
+        elif assessment is not None and assessment.sufficient:
+            stop_reason = f"coverage assessed sufficient ({assessment.reasoning or 'no further gap identified'})"
+        else:
+            stop_reason = "proceeding with what's been found so far"
+        await emit_turn_event(
+            session_id, turn_started_at, "master", "completed",
+            f"Research phase complete after {round_num} round(s) ({stop_reason}) — consolidated "
+            f"{len(all_findings)} finding(s) across {len(all_angles_covered)} angle(s); merged "
+            f"{total_proposed_before_merge} proposed KPI(s) into {len(merged_kpis)} deduped KPI(s) for review.",
+            round=round_num,
+        )
+        break
 
     note = (
-        f"[research] investigated {len(angles)} angle(s) concurrently: "
-        + ", ".join(a["angle"] for a in angles)
+        f"[research] investigated {len(all_angles_covered)} angle(s) across {round_num} round(s): "
+        + ", ".join(a["angle"] for a in all_angles_covered)
         + (
             f"; merged {len(merged_kpis)} KPI(s) from per-agent batches: "
             + ", ".join(k["name"] for k in merged_kpis)
@@ -1062,7 +1396,7 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
     )
     return {
         "research_done": True,
-        "research_findings": [asdict(f) for f in usable] if usable else None,
+        "research_findings": [asdict(f) for f in all_findings] if all_findings else None,
         "draft": updated_draft_dict,
         "messages": [{"role": "assistant", "content": note}],
     }
@@ -1079,7 +1413,12 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
 # only counts propose_kpis node VISITS, and research_kpis (guarded by `research_done`) runs
 # at most once per session, before the first propose_kpis visit, not once per visit. So the
 # fan-out cannot itself push a human turn closer to this cutoff; MAX_LLM_TURNS_PER_HUMAN_TURN
-# is left at its pre-existing value, reasoned through rather than raised reflexively.
+# is left at its pre-existing value, reasoned through rather than raised reflexively. This
+# holds EXACTLY as true now that research_kpis can run up to MAX_RESEARCH_ROUNDS bounded
+# rounds internally (angle decisions, confidence checks, and every round's agent fan-out
+# all happen inside that one node invocation, still before propose_kpis's first visit) —
+# see MAX_RESEARCH_ROUNDS's own docstring for the full reasoning on why research rounds and
+# propose_kpis's reconciliation/confirmation turns are accounted completely separately.
 MAX_LLM_TURNS_PER_HUMAN_TURN = 4
 
 _SYSTEM_PROMPT_TEMPLATE = """You are the scorecard-design assistant for the Quality \
@@ -1748,6 +2087,13 @@ class GraphManager:
         await self._ensure_ready()
         return self._compiled
 
+    async def adelete_thread(self, thread_id: str) -> None:
+        """Deletes every checkpoint row for `thread_id` — see module-level
+        `delete_session_checkpoints`, the only caller."""
+        await self._ensure_ready()
+        assert self._saver is not None  # guaranteed by _ensure_ready
+        await self._saver.adelete_thread(thread_id)
+
     async def aclose(self) -> None:
         if self._stack is not None:
             await self._stack.aclose()
@@ -1954,3 +2300,17 @@ async def get_session_state(session_id: str) -> BuilderTurnResult | None:
     if snapshot.interrupts:
         state["__interrupt__"] = list(snapshot.interrupts)
     return _to_turn_result(state)
+
+
+async def delete_session_checkpoints(session_id: str) -> None:
+    """Deletes this session's LangGraph state (`DELETE /chat/sessions/{id}`) — every row
+    in the `checkpoints`/`checkpoint_writes`/`checkpoint_blobs` tables (see
+    `GraphManager`'s docstring) keyed by this `thread_id`. These tables are owned by
+    LangGraph, not the relational `chat_sessions`/`chat_messages` rows (deleted separately,
+    with an ordinary FK `ON DELETE CASCADE`, by the API layer) — `AsyncPostgresSaver`'s own
+    `adelete_thread` is the documented way to remove them, rather than hand-rolling `DELETE
+    ... WHERE thread_id = ...` against tables this module doesn't otherwise own the schema
+    of. Safe to call even for a session that never reached a LangGraph checkpoint (e.g. a
+    seeded "Refine with assistant" session with no messages sent yet) — deleting a
+    thread_id with no rows is a no-op, not an error."""
+    await get_graph_manager().adelete_thread(session_id)

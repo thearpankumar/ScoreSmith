@@ -36,6 +36,14 @@ class ChatSession(UUIDPKMixin, Base):
     status: Mapped[ChatSessionStatus] = mapped_column(
         chat_session_status_enum, nullable=False, default=ChatSessionStatus.ACTIVE
     )
+    # Real, AI-generated (or deterministically derived, for a "Refine with assistant"
+    # session — see app/api/v1/chat.py::_start_refine_session) short title, set ONCE at
+    # session-creation time and never regenerated afterward. NULL only very briefly (a
+    # brand-new session row exists for an instant before the title call resolves — see
+    # start_chat_session) or if title generation itself failed (best-effort; a session is
+    # still fully usable with no title — the frontend falls back to a placeholder). See
+    # migration 0006_chat_session_title.
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
     context_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     target_scorecard_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("scorecards.id", ondelete="SET NULL"), nullable=True

@@ -6,6 +6,8 @@ import { ChevronDown, FileText, Plus, Send, Sparkles, Trash2, Undo2 } from "luci
 import { GlassCard } from "@/components/design-system/GlassCard";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ScoringFormulaPanel } from "@/components/chart-detail/ScoringFormulaPanel";
+import { validateScoringFormulaDraft } from "@/lib/api-client";
 import { siblingWeightSum } from "@/lib/kpi-tree";
 import { cn } from "@/lib/utils";
 import type { DraftKpi, ScorecardDraft } from "@/lib/types";
@@ -46,6 +48,12 @@ export function LivePreviewPanel({
 }) {
   const [open, setOpen] = useState(true);
   const bodyId = useId();
+
+  // Leaf KPIs (the set a scoring formula may reference — see backend/app/ai/
+  // scoring_formula.py) mirror `leafKpiNodes`'s definition for a saved scorecard: any KPI
+  // that isn't itself a parent of another KPI in this draft.
+  const parentIds = new Set(draft.kpis.map((k) => k.parentId).filter((id): id is string => id !== null));
+  const leafKpiNames = draft.kpis.filter((k) => !parentIds.has(k.id)).map((k) => k.name);
 
   const topLevel = draft.kpis.filter((k) => k.parentId === null || !draft.kpis.some((p) => p.id === k.parentId));
   // Excluded (includedInScoring=false) KPIs don't count toward or constrain the 100%
@@ -296,6 +304,28 @@ export function LivePreviewPanel({
               Add KPI
             </Button>
           </div>
+
+          {/*
+           * Issue 2 (see task notes): the SAME formula-editing capability (including the
+           * center-modal builder — see ScoringFormulaBuilderDialog, nested inside
+           * ScoringFormulaPanel) that already existed on the saved chart's Overview tab,
+           * now also reachable DURING chat, before anything is saved. `onValidate` calls
+           * the generic, scorecard-less validator (no version exists yet); `onSave` is a
+           * purely local edit — like every other field in this panel, it becomes
+           * "unsent" (dirty) and is folded into the next message so the assistant applies
+           * it via its own `update_scoring_formula` tool, exactly like `update_draft`
+           * patches KPIs.
+           */}
+          <ScoringFormulaPanel
+            initialFormula={draft.scoringFormula}
+            leafKpiNames={leafKpiNames}
+            onValidate={(formula) => validateScoringFormulaDraft(formula, leafKpiNames)}
+            onSave={async (formula) => patch({ scoringFormula: formula })}
+            savedNotice={{
+              custom: "Applied to the draft — send your edits so the assistant saves it.",
+              cleared: "Cleared — send your edits so the assistant applies it.",
+            }}
+          />
 
           {dirty && (
             <div className="flex flex-wrap gap-2 border-t border-hairline pt-3">

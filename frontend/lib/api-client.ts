@@ -253,6 +253,11 @@ interface BeChatSession {
   id: string;
   user_id: string;
   status: string;
+  /** Real, AI-generated (or, for a "Refine with assistant" session, deterministically
+   * derived) title — see backend/app/models/chat_session.py::ChatSession.title. Null only
+   * very briefly (right after session creation, before the title call resolves) or if
+   * title generation itself failed — see mapChatSession's fallback. */
+  title: string | null;
   context_summary: string | null;
   target_scorecard_id: string | null;
   created_at: string;
@@ -275,6 +280,7 @@ interface BeChatTurnEvent {
   actor: string;
   event_type: string;
   message: string;
+  round: number;
   created_at: string;
 }
 
@@ -320,6 +326,10 @@ interface BeChatTurn {
    * backend/app/models/chat_session.py::ChatSession.turn_in_progress /
    * pending_turn_started_at) — the durable, refresh-surviving "still working" marker. */
   turn_in_progress?: boolean;
+  /** See BeChatSession.title — carried on every turn response (not just GET) so a
+   * brand-new session's own first, blocking POST already returns its real title, with no
+   * second round-trip needed. */
+  title?: string | null;
 }
 
 interface BeSuggestSimilarResult {
@@ -702,6 +712,12 @@ export async function updateScorecardStatus(scorecardId: string, status: Scoreca
   await apiFetch(`/api/v1/scorecards/${scorecardId}`, { method: "PATCH", auth: true, body: { status } });
 }
 
+/** Hover-delete on a scorecard card in the Charts library grid (`DELETE
+ * /api/v1/scorecards/{id}` — backend/app/api/v1/scorecards.py::delete_scorecard). */
+export async function deleteScorecard(scorecardId: string): Promise<void> {
+  await apiFetch(`/api/v1/scorecards/${scorecardId}`, { method: "DELETE", auth: true });
+}
+
 // ---------------------------------------------------------------------------
 // Custom scoring formula (Part 2b) — backend/app/ai/scoring_formula.py
 // ---------------------------------------------------------------------------
@@ -735,6 +751,28 @@ export async function validateScoringFormula(
     `/api/v1/scorecards/${scorecardId}/versions/${versionId}/validate-formula`,
     { method: "POST", body: { formula } },
   );
+  return { valid: res.valid, error: res.error, unusedKpis: res.unused_kpis };
+}
+
+/**
+ * Same live validation as `validateScoringFormula` above, but for a chat draft that has
+ * no `scorecard_id`/`version_id` yet (it isn't materialized until the user confirms — see
+ * `backend/app/ai/draft_materialize.py`). Calls the generic
+ * `POST /scorecards/validate-formula` endpoint, given the draft's current KPI names
+ * directly rather than looking them up from a saved version — same underlying
+ * `app/ai/scoring_formula.py::validate`, so this can never disagree with the chart-detail
+ * page's own validation of the same expression once the scorecard is saved. Used by
+ * `LivePreviewPanel`'s formula section (Issue 2 — see task notes) via `ScoringFormulaPanel`
+ * /`ScoringFormulaBuilderDialog`'s injected `onValidate` prop.
+ */
+export async function validateScoringFormulaDraft(
+  formula: string | null,
+  kpiNames: string[],
+): Promise<FormulaValidation> {
+  const res = await apiFetch<BeFormulaValidation>("/api/v1/scorecards/validate-formula", {
+    method: "POST",
+    body: { formula, kpi_names: kpiNames },
+  });
   return { valid: res.valid, error: res.error, unusedKpis: res.unused_kpis };
 }
 
@@ -917,6 +955,12 @@ export async function listEvaluations(filters?: { scorecardId?: string }): Promi
   }
   const ctx = await buildEnrichmentContext(rows);
   return rows.map((r) => mapEvaluation(r, ctx));
+}
+
+/** Hover-delete on an evaluation row in the Evaluations list (`DELETE
+ * /api/v1/evaluations/{id}` — backend/app/api/v1/evaluations.py::delete_evaluation). */
+export async function deleteEvaluation(id: string): Promise<void> {
+  await apiFetch(`/api/v1/evaluations/${id}`, { method: "DELETE", auth: true });
 }
 
 export async function getEvaluation(id: string): Promise<Evaluation | undefined> {
@@ -1102,25 +1146,24 @@ function mapChatSessionStatus(status: string): ChatSessionStatus {
   return status === "active" || status === "completed" || status === "abandoned" ? status : "active";
 }
 
-/** The backend has no `title` concept for a chat session (see `chat_sessions` model) —
- * derive one from `context_summary`, falling back to the first user message. */
-async function synthesizeTitle(be: BeChatSession): Promise<string> {
+/**
+ * Real, AI-generated title (see `backend/app/models/chat_session.py::ChatSession.title` /
+ * `backend/app/ai/session_title.py`) — replaces the old client-side synthesis hack that
+ * truncated the raw first message (kept here only as a graceful fallback for the brief
+ * window right after session creation, before the title call resolves, or if title
+ * generation itself failed; see that module's "never raise" contract).
+ */
+function titleOrFallback(be: BeChatSession): string {
+  if (be.title && be.title.trim()) return be.title;
   if (be.context_summary && be.context_summary.trim()) return truncate(be.context_summary, 60);
-  try {
-    const messages = await apiFetch<BeChatMessage[]>(`/api/v1/chat/sessions/${be.id}/messages`);
-    const firstUser = messages.find((m) => m.role === "user");
-    if (firstUser) return truncate(firstUser.content, 60);
-  } catch {
-    // best-effort only
-  }
-  return "Untitled chat";
+  return "New chat";
 }
 
-async function mapChatSession(be: BeChatSession): Promise<ChatSession> {
+function mapChatSession(be: BeChatSession): ChatSession {
   return {
     id: be.id,
     userId: be.user_id,
-    title: await synthesizeTitle(be),
+    title: titleOrFallback(be),
     status: mapChatSessionStatus(be.status),
     contextSummary: be.context_summary ?? "",
     targetScorecardId: be.target_scorecard_id,
@@ -1182,11 +1225,19 @@ function mapDraft(sessionId: string, be: BeScorecardDraft | null | undefined): S
     scope: be?.audience ?? null,
     targetScore: be?.target_score ?? null,
     kpis,
+    scoringFormula: be?.scoring_formula ?? null,
   };
 }
 
 function mapTurnEvent(be: BeChatTurnEvent): ChatTurnEvent {
-  return { id: be.id, actor: be.actor, eventType: be.event_type, message: be.message, createdAt: be.created_at };
+  return {
+    id: be.id,
+    actor: be.actor,
+    eventType: be.event_type,
+    message: be.message,
+    round: be.round ?? 1,
+    createdAt: be.created_at,
+  };
 }
 
 /**
@@ -1204,7 +1255,15 @@ export async function getChatTurnEvents(sessionId: string): Promise<ChatTurnEven
 
 export async function listChatSessions(): Promise<ChatSession[]> {
   const rows = await apiFetch<BeChatSession[]>("/api/v1/chat/sessions?limit=100");
-  return Promise.all(rows.map(mapChatSession));
+  return rows.map(mapChatSession);
+}
+
+/** Hover-delete on a session row in the sidebar `SessionList` (`DELETE
+ * /api/v1/chat/sessions/{id}` — backend/app/api/v1/chat.py::delete_chat_session). Removes
+ * the chat_sessions row (cascading to its messages/turn-events) and its LangGraph
+ * checkpoint state. */
+export async function deleteChatSession(sessionId: string): Promise<void> {
+  await apiFetch(`/api/v1/chat/sessions/${sessionId}`, { method: "DELETE", auth: true });
 }
 
 /**
@@ -1290,9 +1349,11 @@ export async function getChatSession(sessionId: string): Promise<
  * seconds. Once this flips false, callers should re-fetch via `getChatSession` to pick
  * up whatever the turn produced while the page was gone.
  */
-export async function getChatTurnStatus(sessionId: string): Promise<{ turnInProgress: boolean }> {
+export async function getChatTurnStatus(
+  sessionId: string,
+): Promise<{ turnInProgress: boolean; title: string | null }> {
   const turn = await apiFetch<BeChatTurn>(`/api/v1/chat/sessions/${sessionId}`);
-  return { turnInProgress: !!turn.turn_in_progress };
+  return { turnInProgress: !!turn.turn_in_progress, title: turn.title ?? null };
 }
 
 /** Drafts still in progress (active chat sessions). */
@@ -1312,6 +1373,11 @@ export interface SendChatMessageResult {
    * BeChatTurn.similar_suggestions) — present exactly when the graph paused with
    * status "awaiting_similar_choice", i.e. before any KPIs were generated. */
   similarSuggestions?: SimilarScorecardSuggestion[];
+  /** The session's real title (see BeChatSession.title) — on a brand-new session's first
+   * turn, this is generated fast, BEFORE the heavier graph work, and is already present
+   * on this very response (see app/api/v1/chat.py::_generate_and_persist_title). Null for
+   * a continuing turn's response too (the backend still echoes the unchanged title). */
+  title: string | null;
 }
 
 /**
@@ -1357,5 +1423,6 @@ export async function sendChatMessage(params: { sessionId: string; message: stri
       turn.similar_suggestions && turn.similar_suggestions.length > 0
         ? mapSimilarSuggestions(turn.similar_suggestions)
         : undefined,
+    title: turn.title ?? null,
   };
 }
