@@ -147,14 +147,12 @@ sequenceDiagram
 
     Evaluator->>UI: Choose AI-assisted or manual scoring
     alt AI ensemble judge
-        UI->>API: POST /evaluations/{id}/run  { input_text }
+        UI->>API: POST /evaluations/{id}/run with input_text
         API->>Judge: run_judge(evaluation, input_text)
         Judge->>Bedrock: one shared evidence-extraction call
-        par one branch per leaf KPI
-            Judge->>Bedrock: k=3 record_kpi_judgment calls, guideline order perturbed each time
-            Bedrock-->>Judge: matched_level, evidence_quotes, reasoning, score
-            Judge->>Judge: aggregate by median; needs_review if spread > 2 pts or levels disagree
-        end
+        Note over Judge,Bedrock: per leaf KPI, run concurrently -- k=3 record_kpi_judgment calls, guideline order perturbed each time
+        Bedrock-->>Judge: matched_level, evidence_quotes, reasoning, score (x3 per KPI)
+        Judge->>Judge: aggregate by median, flag needs_review when spread exceeds 2 pts or levels disagree
     else Manual scoring
         Evaluator->>UI: Score every leaf KPI by hand
         UI->>API: POST /evaluations/{id}/results  (one score per KPI)
