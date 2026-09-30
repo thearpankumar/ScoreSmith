@@ -24,7 +24,8 @@
 - **Reasoning-before-score judging** — the judge's tool schema forces `matched_level → evidence_quotes → reasoning → score`, so the model commits to a rubric level and cites verbatim evidence before it ever writes a number.
 - **Custom scoring-formula engine** — the default weighted average can be overridden with an arbitrary safe expression (`kpi["Name"] * 0.6 + min(kpi["A"], kpi["B"]) * 0.4`, `+ - * / **`, `min/max/avg/mean/sqrt/abs`), parsed via `simpleeval`'s AST whitelist (no `eval`), used identically by both the AI judge and manual scoring paths so they can never disagree about what a score means.
 - **Hierarchical KPI trees** — up to 4 levels deep, stored as Postgres `ltree` materialized paths, each leaf carrying a full 0–10 qualitative + quantitative guideline ladder.
-- **Live agent-execution trace** — every research agent and the orchestrator itself streams granular events (`started`, `searching`, `search_result`, `proposing_kpis`, `completed`, ...) to a dedicated table, rendered live in the chat UI instead of a generic spinner.
+- **Live agent-execution trace** — every research agent and the orchestrator itself streams granular events (`started`, `searching`, `search_result`, `proposing_kpis`, `completed`, `quality_gate`/`quality_gate_retry`, ...) to a dedicated table, rendered live in the chat UI instead of a generic spinner.
+- **Quality-gate self-critique layer** — three checkpoints in the chat pipeline (the master's research-angle plan, each research agent's finding, and `propose_kpis`'s final per-turn answer) are rated 0–1 by [TypeSafe AI's **Jev**](https://openrouter.ai/docs/guides/community/jev) — a "System One" non-autoregressive decision model reached via OpenRouter's alpha Decisions API, **not** AWS Bedrock — against a 0.75 threshold. Below threshold, the relevant step revises itself (bounded at 2 retries, then proceeds with its best attempt); an unreachable Jev degrades the gate to "passed" rather than blocking the pipeline on a third-party dependency.
 - **Manual and AI-driven evaluation**, converging on one shared scoring computation and 7-band RAG (Red/Amber/Green) result.
 - **Glassmorphism design system** (white + lemon yellow `#FFF700`), with an explicit glass-vs-solid rule: glass surfaces for chrome/cards/modals, solid panels for dense data (guideline matrices, KPI/weight tables).
 
@@ -60,6 +61,10 @@ graph TD
         Gateway["AWS AgentCore Gateway<br/>web_search MCP tool, hand SigV4-signed"]
     end
 
+    subgraph OpenRouterCloud["OpenRouter"]
+        Jev["TypeSafe AI Jev — alpha Decisions API<br/>typesafe/jev-1.13, quality-gate scorer"]
+    end
+
     Web(("Public web"))
 
     Browser -->|HTTPS| UI
@@ -77,6 +82,7 @@ graph TD
     Judge -->|boto3 Converse| Bedrock
     Graph -->|signed HTTPS POST, JSON-RPC/MCP| Gateway
     Gateway --> Web
+    Graph -->|HTTPS POST /api/alpha/decisions, quality gates only| Jev
 ```
 
 ### Chat-to-scorecard flow (the research fan-out in detail)
@@ -91,6 +97,7 @@ sequenceDiagram
     participant Research as research_kpis (master)
     participant Agents as Research agents (N, parallel)
     participant Search as AgentCore Gateway web_search
+    participant Jev as Jev (OpenRouter quality gate)
     participant Propose as propose_kpis (GLM-5)
     participant DB as Postgres
 
@@ -107,11 +114,20 @@ sequenceDiagram
     end
     Graph->>Research: research_kpis — runs once per session
     Research->>Research: decide_research_angles (GLM-5 picks 0-4 angles)
+    loop quality gate 1: plan vs. request, up to 2 revisions
+        Research->>Jev: rate_match(instruction=user request, answer=plan)
+        Jev-->>Research: 0-1 score
+        Research->>DB: emit_turn_event (quality_gate / quality_gate_retry)
+    end
     par one branch per research angle
         Research->>Agents: spawn a research agent via asyncio.gather
         Agents->>Search: web_search(query), up to 2 calls
         Search-->>Agents: real titles / URLs / snippets
         Agents->>Agents: record_research_finding
+        loop quality gate 2: finding vs. assigned angle, up to 2 revisions
+            Agents->>Jev: rate_match(instruction=angle+focus, answer=finding)
+            Jev-->>Agents: 0-1 score
+        end
         Agents->>Agents: propose_kpi_batch — 2-4 KPIs, each with full 11-level guidelines
         Agents-->>Research: ResearchFinding + this agent's proposed KPIs
     end
@@ -119,6 +135,11 @@ sequenceDiagram
     Research->>DB: emit_turn_event per actor (live trace UI)
     Research-->>Graph: merged KPI batch written into draft.kpis
     Graph->>Propose: propose_kpis — reconcile the researched draft (force_tool_use)
+    loop quality gate 3: final answer vs. request, up to 2 revisions
+        Propose->>Jev: rate_match(instruction=conversation, answer=decision)
+        Jev-->>Propose: 0-1 score
+        Propose->>DB: emit_turn_event (quality_gate / quality_gate_retry)
+    end
     alt clarification needed
         Propose-->>Graph: ask_clarification triggers interrupt()
         Graph-->>API: pending question + chip options
@@ -179,6 +200,7 @@ sequenceDiagram
 | Judge model | Z.ai GLM-4.7-Flash (`zai.glm-4.7-flash`) — cheap enough to justify a k=3 ensemble |
 | Embeddings | Amazon Titan Text Embeddings V2 (`amazon.titan-embed-text-v2:0`) |
 | Web search | AWS Bedrock AgentCore Gateway (MCP `tools/call`, hand-rolled SigV4 over `httpx`) |
+| Quality gate (self-critique) | TypeSafe AI **Jev** via OpenRouter's alpha Decisions API (`typesafe/jev-1.13`) — a separate provider from Bedrock, used only for the three 0–1 quality-rating checkpoints |
 | Safe formula evaluation | `simpleeval` (AST-whitelisted, no `eval`/`exec`) |
 | Database | PostgreSQL 17 (`pgvector/pgvector:pg17`), `pgvector` + `ltree` extensions |
 | Frontend framework | Next.js 15 (App Router), React 19, TypeScript 5.7 |
@@ -194,13 +216,13 @@ sequenceDiagram
 ScoreSmith/
 ├── backend/                  FastAPI + SQLAlchemy + LangGraph + boto3
 │   ├── app/
-│   │   ├── ai/                Bedrock client, scorecard-builder graph, judge, scoring-formula engine, web search
+│   │   ├── ai/                Bedrock client, Jev/OpenRouter quality-gate client, scorecard-builder graph, judge, scoring-formula engine, web search
 │   │   ├── api/v1/             REST routers: users, scorecards, kpi_nodes, evaluations, chat
 │   │   ├── models/             SQLAlchemy ORM models (scorecards, kpi_nodes, evaluations, chat_*, ...)
 │   │   ├── schemas/            Pydantic request/response schemas
 │   │   └── scripts/            seed.py (idempotent Cycle 1 scenario catalogue), generate_scenarios.py
 │   ├── alembic/                Database migrations
-│   └── tests/                  pytest suite — 84 tests, run against a real Postgres instance
+│   └── tests/                  pytest suite — 113 tests, run against a real Postgres instance
 ├── frontend/                  Next.js 15 App Router + TypeScript
 │   ├── app/                    /chat, /charts, /evaluations, /settings routes ("/" redirects to /chat)
 │   ├── components/             chat/, chart-detail/, charts-library/, evaluation-result/, design-system/, layout/
@@ -220,6 +242,8 @@ cp .env.example .env
 # Fill in at minimum: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (see the note below), AWS_REGION.
 # Optionally fill in AGENTCORE_GATEWAY_* to enable real web search in the research fan-out —
 # left blank, web_search.py just returns no results rather than failing the chat turn.
+# Optionally fill in OPENROUTER_JEV_API to enable the Jev quality-gate self-critique layer —
+# left blank, every gate check degrades to "passed" rather than blocking the chat turn.
 docker compose up --build
 ```
 
@@ -244,6 +268,7 @@ docker compose exec backend python -m app.scripts.seed
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Bedrock credentials. **Note**: if your credential is a Bedrock long-term "API key" (bearer token) rather than a real SigV4 IAM pair, plain `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` fails with `UnrecognizedClientException`; `docker-compose.yml` auto-derives `AWS_BEARER_TOKEN_BEDROCK` from `AWS_SECRET_ACCESS_KEY` (prefixed `A`) to work around this — see the comments in `infra/docker-compose.yml` and `infra/.env.example` for the full story |
 | `BEDROCK_CHAT_MODEL_ID` / `BEDROCK_JUDGE_MODEL_ID` / `BEDROCK_EMBEDDING_MODEL_ID` | Default to `zai.glm-5`, `zai.glm-4.7-flash`, `amazon.titan-embed-text-v2:0` |
 | `AGENTCORE_GATEWAY_WEB_SEARCH_URL` / `_TOOL_NAME` / `_AWS_ACCESS_KEY_ID` / `_AWS_SECRET_ACCESS_KEY` | AWS AgentCore Gateway web-search tool — a separate credential pair from the main Bedrock ones; the only web-search backend this project talks to |
+| `OPENROUTER_JEV_API` | OpenRouter API key for the Jev quality-gate layer (`app/ai/jev_client.py`) — a separate provider from Bedrock. Left blank, every gate check degrades to "passed" rather than blocking the chat turn |
 | `NEXT_PUBLIC_API_BASE_URL` | Backend URL as seen by the *browser* (client-side fetches) |
 | `INTERNAL_API_BASE_URL` | Backend URL as seen *inside* the frontend container (server components / route handlers), via the Compose service name |
 | `JWT_SECRET` | Present in `.env.example` for future real auth; not currently read anywhere in the backend — see [Current limitations](#current-limitations) |
@@ -259,7 +284,7 @@ cd backend
 uv venv --python 3.12 .venv && uv pip install --python .venv -e ".[dev]"   # or: python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 # one-time: create the test DB with the vector + ltree extensions (already done by
 # infra/db-init/02-create-test-db.sql on a fresh docker-compose volume)
-.venv/bin/python -m pytest        # 84 tests as of this writing
+.venv/bin/python -m pytest        # 113 tests as of this writing
 .venv/bin/python -m ruff check .  # lint
 ```
 
