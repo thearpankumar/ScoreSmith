@@ -2,6 +2,7 @@ import { Quote } from "lucide-react";
 
 import { RagBadge } from "@/components/design-system/RagBadge";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet";
+import { MarkdownContent } from "@/components/chat/MarkdownContent";
 import type { EvaluationKpiResult } from "@/lib/types";
 
 /**
@@ -34,7 +35,7 @@ export function ReasoningDrawer({
 
             <section>
               <h3 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-ink-muted">Reasoning</h3>
-              <p className="text-sm leading-relaxed text-ink">{result.reasoningText}</p>
+              <MarkdownContent content={result.reasoningText} className="text-ink" />
             </section>
 
             <section>

@@ -183,3 +183,76 @@ async def test_get_session_state_reflects_pending_question_without_advancing() -
     assert state is not None
     assert state.status == "awaiting_clarification"
     assert state.question["options"] == ["a", "b"]
+
+
+def _bare_state(draft: dict | None = None, *, pending_tool_input: dict) -> sb.BuilderState:
+    """Minimal `BuilderState` for exercising a single node function directly (white-box,
+    no graph/LLM loop involved) — only the keys `update_draft`/`update_scoring_formula`
+    actually read."""
+    return sb.BuilderState(
+        session_id=str(uuid.uuid4()),
+        messages=[],
+        draft=(draft if draft is not None else sb.ScorecardDraft().model_dump(mode="json")),
+        pending_tool={"name": "update_draft", "input": pending_tool_input},
+        pending_question=None,
+        last_patch_error=None,
+        status="gathering",
+        llm_turn_count=0,
+        similarity_checked=True,
+        similar_suggestions=None,
+        research_done=True,
+        research_findings=None,
+        web_search_calls_used=0,
+    )
+
+
+def test_update_draft_prefers_assistant_message_over_generic_note() -> None:
+    """Regression test, node level (see test_update_draft_assistant_message_is_shown_
+    verbatim_and_patch_is_applied in tests/test_chat_api.py for the full HTTP-level
+    proof): `update_draft`'s own internal "tool"-role note — which `_build_turn_result`
+    treats as the turn's visible message whenever it's the LAST one written (the common
+    case: any single-LLM-turn human turn, e.g. any confirming update_draft) — used to
+    ALWAYS be one of three hardcoded strings, silently overriding whatever descriptive
+    `assistant_message` the model actually sent, even though `propose_kpis` (the caller)
+    had already correctly extracted it. This is the fix for that: the real message wins
+    when present."""
+    patch = {"name": "Support Ticket Quality", "purpose": "Rate resolutions."}
+    message = "I've set the name and purpose based on what you described."
+
+    result = sb.update_draft(
+        _bare_state(pending_tool_input={"patch": patch, "confirmed": False, "assistant_message": message})
+    )
+    assert result["messages"] == [{"role": "tool", "content": message}]
+    assert result["draft"]["name"] == "Support Ticket Quality"
+
+    # Fallback: an omitted assistant_message still produces the original generic note,
+    # unchanged from before this field existed — never an empty/blank bubble.
+    result_no_message = sb.update_draft(
+        _bare_state(pending_tool_input={"patch": patch, "confirmed": False})
+    )
+    assert result_no_message["messages"] == [{"role": "tool", "content": "Draft updated."}]
+
+
+def test_update_scoring_formula_prefers_assistant_message_over_generic_note() -> None:
+    """Same regression/fix, node level, for `update_scoring_formula` — see
+    test_update_draft_prefers_assistant_message_over_generic_note above for the full
+    rationale (identical structural issue, same fix shape)."""
+    draft = sb.ScorecardDraft(
+        kpis=[sb.KpiDraft(name="Accuracy", weight=100)]
+    ).model_dump(mode="json")
+    message = "Switching to a straight pass-through of Accuracy's score."
+
+    result = sb.update_scoring_formula(
+        _bare_state(
+            draft=draft,
+            pending_tool_input={"formula": 'kpi["Accuracy"]', "assistant_message": message},
+        )
+    )
+    assert result["messages"] == [{"role": "tool", "content": message}]
+    assert result["draft"]["scoring_formula"] == 'kpi["Accuracy"]'
+
+    # Fallback: an omitted assistant_message still produces the original generic note.
+    result_no_message = sb.update_scoring_formula(
+        _bare_state(draft=draft, pending_tool_input={"formula": 'kpi["Accuracy"]'})
+    )
+    assert result_no_message["messages"] == [{"role": "tool", "content": "Scoring formula set: 'kpi[\"Accuracy\"]'"}]

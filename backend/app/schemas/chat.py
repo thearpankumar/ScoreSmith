@@ -22,6 +22,18 @@ class ChatSessionStart(BaseModel):
 
     message: str = ""
     target_scorecard_id: uuid.UUID | None = None
+    # Sidebar-live-update fix: the "start fresh" endpoint blocks synchronously for the
+    # whole LangGraph run (see start_chat_session's docstring), so the frontend has no
+    # real session id to adopt/poll with until this request finally returns — the one
+    # gap ChatWorkspace's own docstring used to call out as "can't be polled". Letting the
+    # client generate the id up front (a plain random UUID, no collision handling needed)
+    # and pass it here means the session row (+ its fast title-generation call, done
+    # before this long request even starts its graph work) is reachable via
+    # `GET /chat/sessions/{id}` moments after the client fires this POST, while it's still
+    # in flight — see ChatWorkspace.runAssistantTurn for the client side. Optional and
+    # ignored (a server-generated id is used instead) for any other caller that doesn't
+    # send one.
+    session_id: uuid.UUID | None = None
 
 
 class ChatMessageCreate(BaseModel):

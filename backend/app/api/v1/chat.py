@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -271,7 +272,13 @@ async def start_chat_session(
     # preserved by deleting that same row (cascading to any chat_turn_events it
     # accumulated) if the graph call raises, so a failed first message still leaves no
     # visible session for the client to find — only a turn that actually succeeds does.
-    session_id = uuid.uuid4()
+    #
+    # Sidebar-live-update fix: prefer the client-supplied `session_id` (see
+    # ChatSessionStart.session_id docstring) so the id the frontend already started
+    # polling with — and already put in the sidebar as a placeholder — is the SAME id
+    # this row gets, instead of a server-only id the client can't learn until this whole
+    # (long-running) request returns.
+    session_id = payload.session_id or uuid.uuid4()
     settings = get_settings()
     session = ChatSession(id=session_id, user_id=current_user.id)
     db.add(session)
@@ -305,19 +312,38 @@ async def start_chat_session(
         await db.commit()
         raise
 
-    await _persist_message(db, session.id, ChatMessageRole.USER, payload.message)
+    # The graph call above can legitimately run for minutes (research fan-out); it's
+    # possible for the session to have been deleted out from under it in the meantime —
+    # e.g. a concurrent `DELETE /chat/sessions/{id}` against this same session_id from
+    # another tab/client while this turn was still in flight. Every write below has a
+    # `chat_sessions.id` foreign key, so that shows up as an `IntegrityError` (previously
+    # an unhandled 500 with a raw SQL traceback — confirmed live: emit_turn_event's own
+    # best-effort writes already degrade gracefully in this situation (see its "never
+    # raise" contract), but nothing downstream of the graph call did). Surface it as a
+    # clean, expected 409 instead of leaking an internal DB error.
+    try:
+        await _persist_message(db, session.id, ChatMessageRole.USER, payload.message)
 
-    tool_calls = None
-    if turn.question:
-        tool_calls = {"question": turn.question}
-    elif turn.similar_suggestions:
-        tool_calls = {"similar_suggestions": turn.similar_suggestions}
-    await _persist_message(
-        db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls
-    )
-    scorecard_id, version_id = await _maybe_materialize(db, session, turn, bedrock)
-    await _clear_turn_in_progress(db, session.id)
-    await db.commit()
+        tool_calls = None
+        if turn.question:
+            tool_calls = {"question": turn.question}
+        elif turn.similar_suggestions:
+            tool_calls = {"similar_suggestions": turn.similar_suggestions}
+        await _persist_message(
+            db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls
+        )
+        scorecard_id, version_id = await _maybe_materialize(db, session, turn, bedrock)
+        await _clear_turn_in_progress(db, session.id)
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                "This chat session was deleted while your message was still being "
+                "processed, so the result could not be saved."
+            ),
+        ) from exc
 
     response = _turn_to_response(session.id, turn)
     response.materialized_scorecard_id = scorecard_id
@@ -406,13 +432,25 @@ async def _start_refine_session(
         except Exception:
             await _clear_turn_in_progress(db, session.id)
             raise
-        tool_calls = {"question": turn.question} if turn.question else None
-        await _persist_message(
-            db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls
-        )
-        scorecard_out, version_out = await _maybe_materialize(db, session, turn, bedrock)
-        await _clear_turn_in_progress(db, session.id)
-        await db.commit()
+        # See the identical try/except in start_chat_session for why this is needed: the
+        # session may have been deleted concurrently while the graph call above ran.
+        try:
+            tool_calls = {"question": turn.question} if turn.question else None
+            await _persist_message(
+                db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls
+            )
+            scorecard_out, version_out = await _maybe_materialize(db, session, turn, bedrock)
+            await _clear_turn_in_progress(db, session.id)
+            await db.commit()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=(
+                    "This chat session was deleted while your message was still being "
+                    "processed, so the result could not be saved."
+                ),
+            ) from exc
         response = _turn_to_response(session.id, turn)
         response.materialized_scorecard_id = scorecard_out
         response.materialized_scorecard_version_id = version_out
@@ -464,17 +502,30 @@ async def send_chat_message(
         await _clear_turn_in_progress(db, session.id)
         raise
 
-    tool_calls = None
-    if turn.question:
-        tool_calls = {"question": turn.question}
-    elif turn.similar_suggestions:
-        tool_calls = {"similar_suggestions": turn.similar_suggestions}
-    await _persist_message(
-        db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls
-    )
-    scorecard_id, version_id = await _maybe_materialize(db, session, turn, bedrock)
-    await _clear_turn_in_progress(db, session.id)
-    await db.commit()
+    # See the identical try/except in start_chat_session above for why this is needed: the
+    # graph call can run for minutes, and the session may have been deleted concurrently
+    # (e.g. a `DELETE /chat/sessions/{id}` from another tab) while it ran.
+    try:
+        tool_calls = None
+        if turn.question:
+            tool_calls = {"question": turn.question}
+        elif turn.similar_suggestions:
+            tool_calls = {"similar_suggestions": turn.similar_suggestions}
+        await _persist_message(
+            db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls
+        )
+        scorecard_id, version_id = await _maybe_materialize(db, session, turn, bedrock)
+        await _clear_turn_in_progress(db, session.id)
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                "This chat session was deleted while your message was still being "
+                "processed, so the result could not be saved."
+            ),
+        ) from exc
 
     response = _turn_to_response(session.id, turn)
     response.materialized_scorecard_id = scorecard_id

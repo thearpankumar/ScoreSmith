@@ -8,9 +8,9 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.deps import get_bedrock_client
+from app.deps import get_bedrock_client, get_jev_client, get_web_search_client
 from app.main import app
-from tests.fakes import FakeBedrockClient, text_result, tool_use_result
+from tests.fakes import FakeBedrockClient, FakeJevClient, text_result, tool_use_result
 
 _COMPLETE_DRAFT_PATCH = {
     "name": "Support Ticket Quality",
@@ -38,10 +38,28 @@ _COMPLETE_DRAFT_PATCH = {
 @pytest.fixture(autouse=True)
 def _reset_graph_singleton():
     # Each test gets its own fresh session_id (a new chat_sessions row -> new LangGraph
-    # thread_id), so the module-level GraphManager singleton is safe to share; this
-    # fixture just guarantees dependency_overrides never leaks between tests.
+    # thread_id), so the module-level GraphManager singleton is safe to share.
+    #
+    # Default `get_web_search_client`/`get_jev_client` to inert fakes for every test in
+    # this file (regression fix: these two were never overridden here before, so whether
+    # a script-based test's fixed-length `FakeBedrockClient` script was actually
+    # sufficient silently depended on whatever real client `app/deps.py` resolves those
+    # two dependencies to in the environment the suite happens to run in — None/
+    # unconfigured in CI, but REAL, live-API-key-backed clients in this project's dev
+    # container per infra/.env, which made `research_kpis`'s own angle-decision Bedrock
+    # call and/or a real Jev quality-gate score-triggered retry fire silently extra,
+    # unscripted `.converse()` calls that exhausted the script — a real, confirmed-live
+    # flakiness gap, not a hypothetical one). `FakeWebSearchClient`/`FakeJevClient`'s
+    # defaults (empty results / always-pass) make every test here hermetic regardless of
+    # which real external services happen to be configured wherever it runs; an
+    # individual test can still override either explicitly if it wants different
+    # behavior (e.g. an in-progress research fan-out).
+    app.dependency_overrides[get_web_search_client] = lambda: None
+    app.dependency_overrides[get_jev_client] = lambda: FakeJevClient()
     yield
     app.dependency_overrides.pop(get_bedrock_client, None)
+    app.dependency_overrides.pop(get_web_search_client, None)
+    app.dependency_overrides.pop(get_jev_client, None)
 
 
 def test_start_session_asks_clarification_then_confirms(client: TestClient, seed_user_id: str) -> None:
@@ -612,6 +630,264 @@ def test_update_scoring_formula_reachable_from_chat_and_materializes(
         f"/api/v1/scorecards/{body['materialized_scorecard_id']}/versions/{version_id}"
     ).json()
     assert version["scoring_formula"] == formula
+
+
+def test_update_draft_assistant_message_is_shown_verbatim_and_patch_is_applied(
+    client: TestClient, seed_user_id: str
+) -> None:
+    """Regression test for a real bug found live: the assistant would describe a drafted
+    scorecard/KPIs in rich prose via `respond_conversationally` INSTEAD of actually calling
+    `update_draft`, leaving the persisted draft's structured fields (name/purpose/kpis/...)
+    empty despite the chat transcript sounding like real work had happened — see
+    UPDATE_DRAFT_TOOL's `assistant_message` field and propose_kpis's `assistant_note`
+    derivation in app/ai/scorecard_builder.py.
+
+    The fix closes the structural incentive for that: `update_draft`'s hardcoded
+    "Updating the draft." chat-bubble text (the only message previously shown) gave the
+    model nowhere to put a genuine, descriptive explanation EXCEPT `respond_conversationally`
+    (whose reply never touches the draft). Now `update_draft` itself carries a real
+    user-facing `assistant_message`, so describing what was drafted and actually drafting
+    it happen in the very same tool call. This test proves both halves together: the
+    message shown to the user is the model's own real text (not the old generic label),
+    AND the patch it describes is genuinely reflected in the persisted draft — not just a
+    nice-sounding chat bubble with nothing behind it."""
+    user = client.post(
+        "/api/v1/users",
+        json={"email": "chat-assistant-message@example.com", "name": "Chat Assistant Message User"},
+        headers={"X-User-Id": seed_user_id},
+    ).json()
+
+    descriptive_message = (
+        "I've drafted a comprehensive support-quality scorecard with 2 KPIs covering "
+        "Accuracy and Tone. Let me know if you'd like to adjust the weights."
+    )
+    fake = FakeBedrockClient(
+        script=[
+            text_result("Support Ticket Quality Review"),  # title-generation call
+            # confirmed=True + a complete patch so this is the turn's ONLY LLM call (LLM
+            # first, human second — mirrors test_llm_first_propose_then_confirm_in_one_turn
+            # in tests/test_scorecard_builder.py). A non-confirming update_draft always
+            # loops back to propose_kpis for another LLM turn (see scorecard_builder.py's
+            # graph edges), which would make a second node's own message the final visible
+            # one instead of this one — not what this test is checking.
+            tool_use_result(
+                "update_draft",
+                {
+                    "patch": _COMPLETE_DRAFT_PATCH,
+                    "confirmed": True,
+                    "assistant_message": descriptive_message,
+                },
+            ),
+        ]
+    )
+    app.dependency_overrides[get_bedrock_client] = lambda: fake
+    # Two sources of UNSCRIPTED extra Bedrock calls this environment can trigger (both
+    # absent in CI, where neither external service is configured, but both real and
+    # reachable in this dev container via infra/.env's live API keys):
+    #  - research_kpis's own angle-decision call, if web_search_client is usable — None
+    #    makes it a clean, documented no-op (see its own docstring).
+    #  - A real Jev quality-gate score below threshold triggering propose_kpis's own
+    #    retry loop (see MAX_QUALITY_GATE_RETRIES) — FakeJevClient's default (no script)
+    #    always scores 1.0, so the gate always passes on the first attempt, matching what
+    #    this test's fixed-length script assumes.
+    app.dependency_overrides[get_web_search_client] = lambda: None
+    app.dependency_overrides[get_jev_client] = lambda: FakeJevClient()
+
+    r = client.post(
+        "/api/v1/chat/sessions",
+        json={"message": "I want a scorecard rating support ticket accuracy and tone."},
+        headers={"X-User-Id": user["id"]},
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["status"] == "confirmed"
+
+    # The real, descriptive message the model wrote is what's shown — not the old
+    # hardcoded generic placeholder update_draft's node used to always produce
+    # ("Draft updated and confirmed complete.") regardless of what the model actually said.
+    assert body["assistant_message"] == descriptive_message
+
+    # And the content it describes was genuinely persisted, not just narrated: the draft
+    # this session now holds actually has the name/KPIs the message claims were drafted.
+    assert body["draft"]["name"] == _COMPLETE_DRAFT_PATCH["name"]
+    assert [k["name"] for k in body["draft"]["kpis"]] == [k["name"] for k in _COMPLETE_DRAFT_PATCH["kpis"]]
+
+    # GET reflects the same persisted state (this is real chat_messages content, not just
+    # the in-memory graph response) — the transcript itself carries the real message too.
+    messages = client.get(f"/api/v1/chat/sessions/{body['session_id']}/messages").json()
+    assistant_messages = [m for m in messages if m["role"] == "assistant"]
+    assert assistant_messages[-1]["content"] == descriptive_message
+
+
+def test_update_draft_without_assistant_message_falls_back_to_generic_text(
+    client: TestClient, seed_user_id: str
+) -> None:
+    """Safety net for a model that ignores the (required-in-schema-only, not
+    server-enforced) `assistant_message` field: `update_draft`'s node falls back to its
+    original generic note (unchanged from before this field existed) rather than showing
+    an empty bubble."""
+    user = client.post(
+        "/api/v1/users",
+        json={"email": "chat-assistant-message-fallback@example.com", "name": "Fallback User"},
+        headers={"X-User-Id": seed_user_id},
+    ).json()
+
+    fake = FakeBedrockClient(
+        script=[
+            text_result("Fallback Scorecard"),
+            # confirmed=True (unlike the other tests here) so this resolves in a single
+            # propose_kpis visit — a non-confirming update_draft always loops back for
+            # another LLM turn (see scorecard_builder.py's graph edges), which isn't
+            # relevant to what this test checks and would need a second scripted response.
+            tool_use_result("update_draft", {"patch": _COMPLETE_DRAFT_PATCH, "confirmed": True}),
+        ]
+    )
+    app.dependency_overrides[get_bedrock_client] = lambda: fake
+    app.dependency_overrides[get_web_search_client] = lambda: None  # see comment above, same reason
+    app.dependency_overrides[get_jev_client] = lambda: FakeJevClient()  # see comment above, same reason
+
+    r = client.post(
+        "/api/v1/chat/sessions",
+        json={"message": "I want a scorecard rating support ticket accuracy and tone."},
+        headers={"X-User-Id": user["id"]},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["assistant_message"] == "Draft updated and confirmed complete."
+
+
+def test_update_scoring_formula_reachable_via_chat_applies_patch(
+    client: TestClient, seed_user_id: str
+) -> None:
+    """Mechanical (patch-application) half of the `update_scoring_formula`
+    `assistant_message` regression coverage — see
+    test_update_draft_assistant_message_is_shown_verbatim_and_patch_is_applied for the
+    `update_draft` half, and
+    tests/test_scorecard_builder.py::test_update_scoring_formula_prefers_assistant_message_over_generic_note
+    for the message-preference half, tested directly at the node level.
+
+    `update_scoring_formula` unconditionally loops back to `propose_kpis` for another LLM
+    turn within the same human turn (see scorecard_builder.py's graph edges — it "never
+    completes the draft by itself"), so whatever tool call comes right after it (here,
+    `ask_clarification`) is always what ends up as THIS turn's final, HTTP-visible
+    `assistant_message` — not `update_scoring_formula`'s own. That's why the node-level
+    unit test above is what actually proves the message-preference fix for this tool; this
+    test instead proves the real, end-to-end thing IT is responsible for: the formula
+    genuinely reaches the persisted draft via the real chat/HTTP path, not just in
+    isolation."""
+    user = client.post(
+        "/api/v1/users",
+        json={"email": "chat-formula-message@example.com", "name": "Chat Formula Message User"},
+        headers={"X-User-Id": seed_user_id},
+    ).json()
+
+    fake1 = FakeBedrockClient(
+        script=[
+            text_result("Formula Message Scorecard"),
+            tool_use_result("update_draft", {"patch": _COMPLETE_DRAFT_PATCH, "confirmed": False}),
+            tool_use_result(
+                "ask_clarification",
+                {"question": "Anything else before I save it?", "options": [], "missing_fields": []},
+            ),
+        ]
+    )
+    app.dependency_overrides[get_bedrock_client] = lambda: fake1
+    app.dependency_overrides[get_web_search_client] = lambda: None  # see comment above, same reason
+    app.dependency_overrides[get_jev_client] = lambda: FakeJevClient()  # see comment above, same reason
+    r = client.post(
+        "/api/v1/chat/sessions",
+        json={"message": "I want a scorecard rating accuracy and tone."},
+        headers={"X-User-Id": user["id"]},
+    )
+    assert r.status_code == 201, r.text
+    session_id = r.json()["session_id"]
+
+    formula_message = "Switching to the minimum of Accuracy and Tone instead of a plain average."
+    fake2 = FakeBedrockClient(
+        script=[
+            tool_use_result(
+                "update_scoring_formula",
+                {"formula": 'min(kpi["Accuracy"], kpi["Tone"])', "assistant_message": formula_message},
+            ),
+            tool_use_result(
+                "ask_clarification",
+                {"question": "Anything else to change?", "options": [], "missing_fields": []},
+            ),
+        ]
+    )
+    app.dependency_overrides[get_bedrock_client] = lambda: fake2
+    r = client.post(
+        f"/api/v1/chat/sessions/{session_id}/messages",
+        json={"message": "Use the minimum of Accuracy and Tone instead of averaging them."},
+        headers={"X-User-Id": user["id"]},
+    )
+    assert r.status_code == 200, r.text
+    # The turn's final visible message is the ask_clarification that followed (see
+    # docstring above) — update_scoring_formula's own assistant_message is proven at the
+    # node level instead.
+    assert r.json()["assistant_message"] == "Anything else to change?"
+    assert r.json()["draft"]["scoring_formula"] == 'min(kpi["Accuracy"], kpi["Tone"])'
+
+
+def test_session_deleted_mid_turn_returns_409_not_500(client: TestClient, seed_user_id: str) -> None:
+    """Regression test for a real race found live: `start_session`'s graph call can run
+    for minutes (the research fan-out), long enough for the session to be deleted out from
+    under it by a concurrent `DELETE /chat/sessions/{id}` (e.g. another tab, or another
+    client altogether) before the turn finishes. Every write after the graph call has a
+    `chat_sessions.id` foreign key, so this used to surface as an unhandled
+    `IntegrityError` — a raw 500 with a SQL traceback leaking to the client — confirmed
+    live via the exact scenario this test reproduces mechanically: the scripted Bedrock
+    response deletes the session (via a separate DB connection/transaction, exactly like a
+    real concurrent request would) before returning its decision, so persistence
+    afterward genuinely hits the now-missing foreign key. See the try/except
+    `IntegrityError` in app/api/v1/chat.py::start_chat_session."""
+    from app.db import SyncSessionLocal
+    from app.models.chat_session import ChatSession as ChatSessionModel
+
+    user = client.post(
+        "/api/v1/users",
+        json={"email": "chat-race@example.com", "name": "Chat Race User"},
+        headers={"X-User-Id": seed_user_id},
+    ).json()
+
+    session_id = "11111111-2222-4333-8444-555555555555"
+
+    def _delete_session_then_decide(**_kwargs):
+        with SyncSessionLocal() as db:
+            db.query(ChatSessionModel).filter(ChatSessionModel.id == session_id).delete()
+            db.commit()
+        return tool_use_result(
+            "ask_clarification",
+            {"question": "What's the purpose?", "options": [], "missing_fields": ["purpose"]},
+        )
+
+    # The title-generation call happens first and must succeed normally (it's what
+    # actually creates+commits the session row this test then deletes); only the graph's
+    # own decision call triggers the delete.
+    calls_seen = {"n": 0}
+
+    def _converse_fn(**kwargs):
+        calls_seen["n"] += 1
+        if calls_seen["n"] == 1:
+            return text_result("Race Condition Test Session")
+        return _delete_session_then_decide(**kwargs)
+
+    fake = FakeBedrockClient(converse_fn=_converse_fn)
+    app.dependency_overrides[get_bedrock_client] = lambda: fake
+
+    r = client.post(
+        "/api/v1/chat/sessions",
+        json={"session_id": session_id, "message": "I want a scorecard."},
+        headers={"X-User-Id": user["id"]},
+    )
+
+    assert r.status_code == 409, r.text
+    assert "deleted" in r.json()["detail"].lower()
+
+    # No orphaned chat_messages row was left behind for the now-nonexistent session either
+    # (the whole persistence block — including the user's own message — is inside the same
+    # try/except and rolled back together).
+    messages = client.get(f"/api/v1/chat/sessions/{session_id}/messages")
+    assert messages.status_code == 404
 
 
 def test_validate_formula_draft_endpoint_checks_against_given_kpi_names(client: TestClient) -> None:

@@ -31,9 +31,9 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from app.deps import get_bedrock_client
+from app.deps import get_bedrock_client, get_jev_client, get_web_search_client
 from app.main import app
-from tests.fakes import FakeBedrockClient, text_result, tool_use_result
+from tests.fakes import FakeBedrockClient, FakeJevClient, text_result, tool_use_result
 
 # --- Section 1: chat iteration genuinely updates the draft before it is saved ----------
 
@@ -150,6 +150,18 @@ def test_chat_iteration_edits_survive_to_saved_scorecard(client: TestClient, see
         ]
     )
     app.dependency_overrides[get_bedrock_client] = lambda: turn1_bedrock
+    # Regression fix: without these, whether this test's fixed-length scripts are
+    # actually sufficient silently depends on whether `app/deps.py`'s real
+    # `get_web_search_client`/`get_jev_client` happen to be configured in the environment
+    # the suite runs in — unconfigured/no-op in CI, but real and reachable in this
+    # project's dev container (infra/.env has live API keys), where research_kpis's own
+    # angle-decision Bedrock call and/or a real Jev quality-gate retry would otherwise
+    # silently consume extra, unscripted `.converse()` calls (confirmed live — this
+    # exhausted the script and failed with "FakeBedrockClient.converse called with no
+    # scripted response left" before this fix). None / FakeJevClient() make both a clean,
+    # documented no-op / always-pass, matching what every script below assumes.
+    app.dependency_overrides[get_web_search_client] = lambda: None
+    app.dependency_overrides[get_jev_client] = lambda: FakeJevClient()
     r = client.post(
         "/api/v1/chat/sessions",
         json={"message": "I need a scorecard to rate internal tooling uptime status reports."},
@@ -240,6 +252,8 @@ def test_chat_iteration_edits_survive_to_saved_scorecard(client: TestClient, see
     assert version_id is not None
 
     app.dependency_overrides.pop(get_bedrock_client, None)
+    app.dependency_overrides.pop(get_web_search_client, None)
+    app.dependency_overrides.pop(get_jev_client, None)
 
     # --- Real-DB proof: a scorecard now exists under EXACTLY the custom name, owned by
     # the right user, with the EDITED (not original) weights.

@@ -16,9 +16,12 @@ const STORAGE_KEY = "qs.navRailCollapsed";
  * Desktop/tablet left rail. Glass chrome per the plan's nav styling rule.
  *
  * Fixed-height (`h-[calc(100vh-2rem)]`). Vertical order: logo -> "+ New scorecard" ->
- * nav items, with the chat session list nested directly under the "Chat" item (only
- * populated/expanded while on a `/chat*` route — see the merged-sidebar note below) ->
- * remaining nav items -> collapse toggle pinned to the bottom via `mt-auto`. The
+ * the chat session list (only populated/expanded while on a `/chat*` route — see the
+ * merged-sidebar note below) -> all four nav tabs together (Chat, Charts, Evaluations,
+ * Settings) -> collapse toggle pinned to the bottom via `mt-auto`. The session list sits
+ * ABOVE the nav tabs rather than nested directly under the Chat tab so that Chat stays
+ * visually grouped with the other three tabs as one cohesive block, instead of an
+ * open-ended scrollable list wedging Chat apart from Charts/Evaluations/Settings. The
  * surrounding group used to be vertically centered (`justify-center`) back when it was a
  * handful of fixed-height rows with nothing else below — that no longer works now that an
  * open-ended, independently-scrollable session list can sit in the middle of it, so the
@@ -58,8 +61,6 @@ export function NavRail() {
   // passing "new" through here (no real session to highlight yet) is harmless.
   const activeSessionId = onChatRoute ? (pathname.match(/^\/chat\/([^/]+)/)?.[1] ?? "") : "";
 
-  const [chatItem, ...restItems] = NAV_ITEMS;
-
   return (
     <nav
       aria-label="Primary"
@@ -89,23 +90,35 @@ export function NavRail() {
           <span className={cn(collapsed && "sr-only")}>New scorecard</span>
         </Link>
 
-        <NavItemLink item={chatItem} pathname={pathname} collapsed={collapsed} sessionCount={sessions.length} onChatRoute={onChatRoute} />
+        {/* Spacer/chat-session-list slot: ALWAYS rendered (not just on a /chat* route) so
+            the nav-tabs group below is pinned to a consistent bottom-ish position on every
+            page — if this were only present on /chat, the nav group would sit right under
+            "New scorecard" on Charts/Evaluations/Settings and visibly jump position when
+            navigating back to a chat page with sessions. Sits ABOVE the nav tabs (not
+            nested under the Chat tab specifically) so Chat stays grouped with
+            Charts/Evaluations/Settings below rather than being wedged apart from them by
+            an open-ended scrollable list. The session list itself only renders as content
+            on a /chat* route; elsewhere this is just empty flexible space. When collapsed,
+            the rail can't show full session cards (no room, same as every other item
+            losing its label) — dropped entirely rather than squeezed, in keeping with the
+            collapsed rail's existing icon+tooltip-only pattern; the Chat item's tooltip
+            gains a session count instead, so that information isn't just lost. */}
+        <div className="mb-1 min-h-0 flex-1 overflow-y-auto thin-scrollbar">
+          {onChatRoute && !collapsed && <ChatSessionNavList activeSessionId={activeSessionId} />}
+        </div>
 
-        {/* Nested chat-session list: only meaningfully present on a /chat* route. When
-            collapsed, the rail can't show full session cards (no room, same as every
-            other item losing its label) — it's dropped entirely rather than squeezed, in
-            keeping with the collapsed rail's existing icon+tooltip-only pattern (no other
-            item shows extra content collapsed either); the Chat item's tooltip gains a
-            session count instead, so that information isn't just lost. */}
-        {onChatRoute && !collapsed && (
-          <div className="mb-1 min-h-0 flex-1 overflow-y-auto thin-scrollbar">
-            <ChatSessionNavList activeSessionId={activeSessionId} />
-          </div>
-        )}
-
-        {restItems.map((item) => (
-          <NavItemLink key={item.href} item={item} pathname={pathname} collapsed={collapsed} />
-        ))}
+        <div className="flex shrink-0 flex-col gap-1">
+          {NAV_ITEMS.map((item) => (
+            <NavItemLink
+              key={item.href}
+              item={item}
+              pathname={pathname}
+              collapsed={collapsed}
+              sessionCount={item.href === "/chat" ? sessions.length : undefined}
+              onChatRoute={item.href === "/chat" ? onChatRoute : undefined}
+            />
+          ))}
+        </div>
       </div>
 
       <div className="mt-auto flex shrink-0 justify-center pt-2">

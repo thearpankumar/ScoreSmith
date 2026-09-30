@@ -82,10 +82,18 @@ logger = logging.getLogger(__name__)
 ASK_CLARIFICATION_TOOL = ToolSpec(
     name="ask_clarification",
     description=(
-        "Ask the user exactly one clarifying question needed to complete the scorecard "
+        "Ask the user exactly ONE clarifying question needed to complete the scorecard "
         "draft. Prefer short chip-style options (2-5) over open prose per the product's "
         "chat UX; use an empty options array only for genuinely free-text answers "
-        "(e.g. a name)."
+        "(e.g. a name). If you have MORE THAN ONE thing you'd like to ask, do not combine "
+        "them here (`question` is a single string, not a list) and do NOT ask the rest as "
+        "a numbered list in `update_draft`'s `assistant_message` or in "
+        "`respond_conversationally` either — pick the single most important/blocking one "
+        "for THIS turn's `ask_clarification` call and hold the others for follow-up turns "
+        "once the user has answered this one. A numbered/bulleted list of questions in "
+        "plain text is exactly the broken UX (a wall of prose instead of clickable chips) "
+        "this tool exists to prevent — every question the user needs to answer must reach "
+        "them through this tool, one at a time, never through prose in any other tool."
     ),
     input_schema={
         "type": "object",
@@ -168,8 +176,31 @@ UPDATE_DRAFT_TOOL = ToolSpec(
                     "spend a turn re-sending the unchanged draft with confirmed left false."
                 ),
             },
+            "assistant_message": {
+                "type": "string",
+                "description": (
+                    "The natural-language message shown to the user in the chat transcript "
+                    "for THIS turn — write it exactly like you would a respond_conversationally "
+                    "reply (e.g. \"I've drafted a comprehensive milestone quality scorecard "
+                    "with 20 KPIs across Schedule, Budget, and Quality...\"), describing what "
+                    "you just set/changed and why, in full. REQUIRED: this is the ONLY way "
+                    "the user sees any explanation of a draft change — there is no separate "
+                    "follow-up message, so do not shortchange this expecting to 'explain more' "
+                    "in a later respond_conversationally call; say everything here. Never "
+                    "describe specific KPI names/content/structure here (or anywhere) that "
+                    "you have NOT actually included in `patch` this turn or in an earlier "
+                    "turn's patch — this field narrates the patch you are actually applying, "
+                    "it never substitutes for applying it. This field is for EXPLAINING the "
+                    "change, not for asking the user something — never end it with a "
+                    "numbered/bulleted list of follow-up questions (e.g. '1. ... 2. ... 3. "
+                    "...'); a single short prompt like 'Let me know if you'd like to adjust "
+                    "anything' is fine, but any question whose answer you actually need "
+                    "belongs in a SEPARATE `ask_clarification` call (one question, with "
+                    "chip options) on this or a later turn, never listed here as prose."
+                ),
+            },
         },
-        "required": ["patch"],
+        "required": ["patch", "assistant_message"],
     },
 )
 
@@ -222,8 +253,16 @@ UPDATE_SCORING_FORMULA_TOOL = ToolSpec(
                     "and revert to the default weighted average."
                 ),
             },
+            "assistant_message": {
+                "type": "string",
+                "description": (
+                    "The natural-language message shown to the user in the chat transcript "
+                    "for THIS turn, explaining what you set/changed and why — same "
+                    "requirement as update_draft's own `assistant_message` field."
+                ),
+            },
         },
-        "required": ["formula"],
+        "required": ["formula", "assistant_message"],
     },
 )
 
@@ -1762,21 +1801,56 @@ like the GDPR-based approach, add it", "rename it to X", "looks good, save it", 
 compliance weigh more") -> `update_draft` (or `update_scoring_formula` for HOW the score \
 is computed — see below). This is the ONLY way an actual change happens; describing a \
 change inside `respond_conversationally` does NOT apply it.
+- You are about to tell the user about specific KPIs, fields, or a draft you have decided \
+on — even as an initial proposal they haven't confirmed yet (this draft is never final \
+until the user confirms and you call `update_draft` with `confirmed: true` — proposing it \
+into `patch` now does not lock anything in) -> `update_draft` FIRST, with those \
+KPIs/fields actually included in `patch`, with your explanation written into its \
+`assistant_message` field (which IS shown to the user, verbatim, exactly like \
+`respond_conversationally`'s `response` — see UPDATE_DRAFT_TOOL). If you also need to ask \
+the user something about what you just proposed (e.g. "hierarchical ~60 KPIs, or a flat \
+~50" is a real decision only they can make) — call `update_draft` on this internal step, \
+then `ask_clarification` as your VERY NEXT tool call (same human turn — you get multiple \
+internal tool-call steps per human turn, see MAX_LLM_TURNS_PER_HUMAN_TURN, precisely so \
+you can chain "save, then ask" like this) with that question as real chip options. Do NOT \
+fold the question itself into `assistant_message` and stop there — `assistant_message` \
+explains what you did; it is never where you end up asking something you actually need an \
+answer to. NEVER narrate concrete, \
+specific drafted content ("I've drafted a scorecard with 20 KPIs across Schedule, Budget, \
+and Quality...") through `respond_conversationally` — if the content is real enough to \
+describe in detail, it is real enough to persist, and `respond_conversationally` does not \
+persist anything. Saying it without saving it is a bug, not a lighter-weight reply.
 - An exploratory/informational question, a request to explain or compare options, or a \
-reaction that doesn't itself decide anything ("what are common KPI frameworks for X?", \
-"what's a reasonable way to weight A vs B?", "can you explain why you picked that \
-threshold?") -> `respond_conversationally`. Use `web_search` first (see below — it is \
-available on THIS and every turn, not just your very first) if you need current, real \
-information you don't already have, then report it back conversationally.
+reaction that doesn't itself decide anything AND does not itself introduce new concrete \
+draft content ("what are common KPI frameworks for X?", "what's a reasonable way to weight \
+A vs B?", "can you explain why you picked that threshold?") -> `respond_conversationally`. \
+Use `web_search` first (see below — it is available on THIS and every turn, not just your \
+very first) if you need current, real information you don't already have, then report it \
+back conversationally.
 - The user explicitly asks you to look something up ("can you look that up", "search for \
 current X benchmarks") -> use `web_search`, then report what you found via \
 `respond_conversationally` UNLESS they also told you what to do with the result (in which \
 case fold it straight into `update_draft`).
 - You are missing information you genuinely need before you can proceed at all -> \
-`ask_clarification`.
+`ask_clarification`. If you find yourself wanting to ask MORE THAN ONE question this turn \
+(e.g. "do you want X or Y, and also are there any standards to follow, and also what kind \
+of deliverables..."), do NOT write them out as a numbered/bulleted list anywhere (not in \
+`ask_clarification`'s own `question`, which is a single string, and not in \
+`update_draft`'s `assistant_message` or a `respond_conversationally` reply either) — every \
+one of those is real UI the user can't click options on, just a text wall forcing a typed \
+reply. Ask ONLY the single most important/blocking one via `ask_clarification` (with real \
+chip options) this turn, and hold the rest for follow-up turns once this one is answered. \
+`ask_clarification` is the ONLY tool whose question reaches the user as clickable option \
+chips instead of prose — any question that matters enough for you to need the answer to \
+belongs there, one at a time, never bundled into another tool's text field. \
 Never let a genuine back-and-forth discussion get flattened into a rigid \
 ask_clarification chip-question or an unwanted draft mutation — `respond_conversationally` \
-exists precisely so a real conversation can happen in between.
+exists precisely so a real conversation can happen in between. But it is never a \
+substitute for `update_draft` when you are describing something you've actually decided —  \
+"I described it in words" does not count as "I saved it to the draft." Nor is it (or \
+`update_draft`'s `assistant_message`) ever a substitute for `ask_clarification` when you \
+actually need an answer — "I asked it in words" does not count as "I asked it as a \
+question the user can answer."
 
 If the draft already has KPIs (e.g. merged in from the multi-agent research fan-out that \
 ran before your first turn this session — each already has a name, weight, and full \
@@ -2244,13 +2318,21 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
                 )
             elif result.tool_name == "update_scoring_formula":
                 formula = tool_input.get("formula")
-                assistant_note = (
+                assistant_note = str(tool_input.get("assistant_message") or "").strip() or (
                     f'Setting a custom scoring formula: {formula!r}'
                     if formula
                     else "Clearing the custom scoring formula — reverting to the default weighted average."
                 )
             else:  # update_draft
-                assistant_note = (
+                # `assistant_message` (required on the tool schema — see UPDATE_DRAFT_TOOL)
+                # is the model's own real, descriptive explanation of what it just drafted/
+                # changed. This used to be a hardcoded "Updating the draft." label with no
+                # content — which gave the model a structural incentive to describe drafted
+                # KPIs/fields via `respond_conversationally` instead (the only tool whose
+                # output became a real chat message), leaving the actual draft unpopulated
+                # even when the assistant's prose clearly described concrete content. Falling
+                # back to the old generic text only if the model somehow omits it.
+                assistant_note = str(tool_input.get("assistant_message") or "").strip() or (
                     "Confirming and saving the draft."
                     if tool_input.get("confirmed")
                     else "Updating the draft."
@@ -2465,13 +2547,24 @@ def update_draft(state: BuilderState) -> dict[str, Any]:
 
     if confirmed_flag and new_draft.is_complete():
         new_status = "ready_to_confirm"
-        note = "Draft updated and confirmed complete."
+        generic_note = "Draft updated and confirmed complete."
     elif confirmed_flag:
         new_status = "gathering"
-        note = f"Cannot confirm — draft still missing: {new_draft.missing_fields()}"
+        generic_note = f"Cannot confirm — draft still missing: {new_draft.missing_fields()}"
     else:
         new_status = "gathering"
-        note = "Draft updated."
+        generic_note = "Draft updated."
+
+    # Prefer the model's own real, descriptive `assistant_message` (see UPDATE_DRAFT_TOOL)
+    # over the generic note above. This matters even though propose_kpis (the caller) ALSO
+    # computes its own assistant_note from the same field: `_build_turn_result` picks the
+    # LAST "assistant"/"tool"-role message in state["messages"] as the turn's visible text,
+    # and THIS node's message is always appended after propose_kpis's — so without this,
+    # the generic note below would silently win and hide the model's real explanation on
+    # every single-LLM-turn human turn (e.g. any confirming update_draft, or a
+    # non-confirming one not immediately followed by another node that also sets a real
+    # message) — exactly the "described it but the UI shows a robotic label instead" gap.
+    note = str(tool_input.get("assistant_message") or "").strip() or generic_note
 
     return {
         "draft": new_draft.model_dump(mode="json"),
@@ -2515,12 +2608,18 @@ def update_scoring_formula(state: BuilderState) -> dict[str, Any]:
             ],
         }
 
-    note = (
+    generic_note = (
         f"Scoring formula set: {formula!r}"
         + (f" (note: unused KPI(s) not referenced: {', '.join(result.unused_kpis)})" if result.unused_kpis else "")
         if formula
         else "Scoring formula cleared — reverted to the default weighted average."
     )
+    # Same reasoning as update_draft's own assistant_message preference above — this
+    # node's message is what `_build_turn_result` actually shows the user (it's appended
+    # after propose_kpis's own note), so without this, the model's real explanation would
+    # be silently replaced by the generic note whenever this happens to be the last
+    # message written in the turn.
+    note = str(tool_input.get("assistant_message") or "").strip() or generic_note
     new_draft = current.model_copy(update={"scoring_formula": formula})
     return {
         "draft": new_draft.model_dump(mode="json"),

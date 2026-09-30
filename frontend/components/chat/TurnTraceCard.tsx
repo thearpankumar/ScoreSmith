@@ -42,10 +42,12 @@ import type { ChatTurnEvent } from "@/lib/types";
  */
 export function TurnTraceCard({ events, active }: { events: ChatTurnEvent[]; active: boolean }) {
   if (events.length === 0) {
-    // No events have landed yet (e.g. the very first instant of a turn, before the
-    // orchestrator's first write reaches the DB, or a "new" session's very first message
-    // — see ChatWorkspace's docstring on why that one case can't be polled). Fall back to
-    // a minimal live indicator rather than rendering nothing.
+    // No events have landed yet — e.g. the very first instant of a turn, before the
+    // orchestrator's first write reaches the DB, or (for a brand-new chat's very first
+    // message) before the events poll's first tick has landed at all, or before the
+    // backend has even committed the session row the client optimistically adopted (see
+    // ChatWorkspace.runAssistantTurn). Fall back to a minimal live indicator rather than
+    // rendering nothing.
     return (
       <div className="ml-9 flex items-center gap-2 text-xs text-ink-muted" role="status" aria-live="polite">
         <Loader2 className="size-3.5 animate-spin text-lemon-ink" aria-hidden />

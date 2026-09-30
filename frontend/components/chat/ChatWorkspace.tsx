@@ -205,17 +205,30 @@ export function ChatWorkspace({
   // synchronous request/response model) — the browser can still fire concurrent
   // requests alongside that outstanding one, so this polls the same turn-events endpoint
   // to show live progress DURING that call, not just via the refresh-recovery path
-  // above. Guarded on `activeSessionId !== "new"`: a brand-new chat's very first message
-  // has no real session id to poll with until the blocked call itself returns (the
-  // backend only hands back the generated id in that same response) — see
-  // TurnTraceCard's fallback for that one narrow case.
+  // above. Guarded on `activeSessionId !== "new"` — which, for a brand-new chat's very
+  // first message, is now true almost immediately: `runAssistantTurn` generates the real
+  // session id client-side and adopts it (`setActiveSessionId`) before it even starts the
+  // blocking `sendChatMessage` call, rather than waiting for that call to return one (see
+  // its own comment). The very first tick or two of this poll can still 404 (the backend
+  // hasn't committed the session row yet) — swallowed below like any other transient
+  // hiccup, self-healing on the next 1.5s tick once it has.
+  //
+  // Also carries the session's title into the sidebar live (same mechanism as the
+  // turnInProgress poll above) — the ONLY poll running during a same-tab active send, so
+  // this is what makes a brand-new chat's real title (and the session itself) appear in
+  // the sidebar while its first turn is still in flight, not just once it finishes.
   useEffect(() => {
     if (!pending || activeSessionId === "new") return;
     let cancelled = false;
     const poll = async () => {
       try {
-        const events = await getChatTurnEvents(activeSessionId);
-        if (!cancelled) setTurnEvents(events);
+        const [events, statusResult] = await Promise.all([
+          getChatTurnEvents(activeSessionId).catch(() => null),
+          getChatTurnStatus(activeSessionId).catch(() => null),
+        ]);
+        if (cancelled) return;
+        if (events) setTurnEvents(events);
+        if (statusResult) upsertSessionTitle(activeSessionId, statusResult.title);
       } catch {
         // Transient hiccup — next tick (or the final fetch in runAssistantTurn's own
         // success path) will catch it up.
@@ -232,6 +245,7 @@ export function ChatWorkspace({
       clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pending, activeSessionId]);
 
   useEffect(() => {
@@ -297,11 +311,37 @@ export function ChatWorkspace({
     // Fold any unsent inline preview edits into this turn so the assistant applies them
     // to the server-side draft via its own update_draft tool (see LivePreviewPanel).
     const outgoing = editSummary ? `${text}\n\n${editSummary}` : text;
+
+    // Sidebar-live-update fix: a brand-new chat's first turn used to have NO real session
+    // id to adopt/poll with until this whole (20-200+s) blocking call returned — so the
+    // sidebar never learned about it, and the turn-events poll above stayed off, until
+    // then. Generating the id ourselves (a plain random UUID — the backend accepts and
+    // uses it verbatim, see ChatSessionStart.session_id) and adopting it right now, before
+    // the request is even sent, means: the URL, the turn-events/title poll above (its
+    // `activeSessionId !== "new"` guard), and an optimistic sidebar placeholder are all
+    // live immediately, not just once the graph run finishes.
+    const isFirstTurnOfNewSession = activeSessionId === "new";
+    const clientSessionId = isFirstTurnOfNewSession ? crypto.randomUUID() : undefined;
+    if (isFirstTurnOfNewSession && clientSessionId) {
+      setActiveSessionId(clientSessionId);
+      router.replace(`/chat/${clientSessionId}`, { scroll: false });
+      // Real title lands within a second or two (see the poll above /
+      // _generate_and_persist_title) and upgrades this placeholder — upsertSessionTitle
+      // no-ops on a null/empty title, so this placeholder is never blanked out by a
+      // slow/failed title-generation call racing it.
+      upsertSessionTitle(clientSessionId, "New chat");
+    }
+
     try {
-      const result = await sendChatMessage({ sessionId: activeSessionId, message: outgoing });
-      if (result.sessionId !== activeSessionId) {
-        // The backend just created the real session (first turn of a "new" chat) —
-        // adopt its id and swap the URL to it without losing in-memory state.
+      const result = await sendChatMessage({
+        sessionId: isFirstTurnOfNewSession ? "new" : activeSessionId,
+        clientSessionId,
+        message: outgoing,
+      });
+      if (result.sessionId !== activeSessionId && !isFirstTurnOfNewSession) {
+        // Defensive fallback only — the "new" case above already adopted the real id
+        // before this call started, so this branch is a no-op on that path (result.
+        // sessionId === clientSessionId === the already-adopted activeSessionId).
         setActiveSessionId(result.sessionId);
         router.replace(`/chat/${result.sessionId}`, { scroll: false });
       }

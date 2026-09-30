@@ -1393,11 +1393,25 @@ export interface SendChatMessageResult {
  * (`POST /chat/sessions/{id}/messages`). Both require the dev-auth header — see
  * `backend/app/deps.py::get_current_user`, applied uniformly to every mutating route.
  */
-export async function sendChatMessage(params: { sessionId: string; message: string }): Promise<SendChatMessageResult> {
-  const { sessionId, message } = params;
+export async function sendChatMessage(params: {
+  sessionId: string;
+  message: string;
+  /** Sidebar-live-update fix: for `sessionId === "new"` only — a client-generated UUID
+   * the caller has already optimistically adopted (URL, sidebar placeholder, turn-events
+   * poll — see ChatWorkspace.runAssistantTurn) before this request was even sent. Passed
+   * through as `session_id` so the backend uses it as the real row's id (see
+   * ChatSessionStart.session_id) instead of minting its own that the caller would have no
+   * way to learn about until this call returns. */
+  clientSessionId?: string;
+}): Promise<SendChatMessageResult> {
+  const { sessionId, message, clientSessionId } = params;
   const turn =
     sessionId === "new"
-      ? await apiFetch<BeChatTurn>("/api/v1/chat/sessions", { method: "POST", auth: true, body: { message } })
+      ? await apiFetch<BeChatTurn>("/api/v1/chat/sessions", {
+          method: "POST",
+          auth: true,
+          body: { message, session_id: clientSessionId },
+        })
       : await apiFetch<BeChatTurn>(`/api/v1/chat/sessions/${sessionId}/messages`, {
           method: "POST",
           auth: true, // dev auth stub is now applied uniformly to every mutating route — see app/deps.py
