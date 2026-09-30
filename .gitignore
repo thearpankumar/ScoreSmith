@@ -31,3 +31,9 @@ npm-debug.log*
 
 # DB
 *.sqlite3
+
+# Office lock files
+~$*.xlsx
+~$*.xls
+~$*.docx
+~$*.pptx
