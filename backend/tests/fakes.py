@@ -18,10 +18,12 @@ from collections.abc import Callable
 from typing import Any
 
 from app.ai.bedrock_client import ConverseResult
+from app.ai.jev_client import JevRatingResult
 from app.ai.web_search import SearchResult
 
 ConverseFn = Callable[..., ConverseResult]
 SearchFn = Callable[[str], "list[SearchResult]"]
+RateFn = Callable[..., float]
 
 
 class FakeBedrockClient:
@@ -142,3 +144,36 @@ class FakeWebSearchClient:
 
 def search_result(title: str, url: str, snippet: str, published_date: str | None = None) -> SearchResult:
     return SearchResult(title=title, url=url, snippet=snippet, published_date=published_date)
+
+
+class FakeJevClient:
+    """Implements `app.ai.jev_client.JevClientProtocol` structurally (duck-typed) — same
+    spirit/scripting shape as `FakeBedrockClient`/`FakeWebSearchClient` above.
+
+    Two scripting modes, combinable:
+    - `script`: a plain FIFO queue of 0-1 floats, popped in call order.
+    - `rate_fn`: a callable `(*, instruction: str, answer: str) -> float` invoked instead
+      of the queue when given — lets a test vary the score by WHICH checkpoint/content is
+      being rated (e.g. always score a specific angle's finding low), or raise to simulate
+      a genuine Jev/OpenRouter failure (the real client's contract is that `rate_match`
+      raises `JevUnavailableError` on failure — `quality_gate()` is what catches that and
+      degrades to "passed"; a `rate_fn` that raises here exercises that exact path).
+
+    `calls` records every `(instruction, answer)` pair passed to `.rate_match()`, in call
+    order, so tests can assert on exactly what was rated at each checkpoint.
+    """
+
+    def __init__(self, script: list[float] | None = None, rate_fn: RateFn | None = None) -> None:
+        self._script = list(script or [])
+        self._rate_fn = rate_fn
+        self.calls: list[dict[str, str]] = []
+
+    async def rate_match(self, *, instruction: str, answer: str) -> JevRatingResult:
+        self.calls.append({"instruction": instruction, "answer": answer})
+        if self._rate_fn is not None:
+            score = self._rate_fn(instruction=instruction, answer=answer)
+        elif self._script:
+            score = self._script.pop(0)
+        else:
+            score = 1.0
+        return JevRatingResult(score=score)

@@ -24,6 +24,7 @@ from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
 from app.ai.draft_materialize import draft_from_scorecard, materialize_draft
 from app.ai.draft_schema import ScorecardDraft
 from app.ai.embeddings import upsert_scorecard_embedding
+from app.ai.jev_client import JevClientProtocol
 from app.ai.scorecard_builder import (
     BuilderTurnResult,
     delete_session_checkpoints,
@@ -36,7 +37,7 @@ from app.ai.session_title import generate_session_title
 from app.ai.web_search import WebSearchClientProtocol
 from app.config import get_settings
 from app.db import get_db
-from app.deps import get_bedrock_client, get_current_user, get_web_search_client
+from app.deps import get_bedrock_client, get_current_user, get_jev_client, get_web_search_client
 from app.models.chat_message import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.chat_turn_event import ChatTurnEvent
@@ -242,6 +243,7 @@ async def start_chat_session(
     current_user: User = Depends(get_current_user),
     bedrock: BedrockClientProtocol = Depends(get_bedrock_client),
     web_search: WebSearchClientProtocol = Depends(get_web_search_client),
+    jev: JevClientProtocol = Depends(get_jev_client),
 ) -> ChatTurnRead:
     message = payload.message.strip()
     if payload.target_scorecard_id is None and not message:
@@ -252,7 +254,7 @@ async def start_chat_session(
 
     if payload.target_scorecard_id is not None:
         return await _start_refine_session(
-            db, current_user, bedrock, web_search, payload.target_scorecard_id, message
+            db, current_user, bedrock, web_search, jev, payload.target_scorecard_id, message
         )
 
     # Originally (see prior bug writeup): a brand-new "start fresh" session used to be
@@ -292,6 +294,7 @@ async def start_chat_session(
             db=db,
             web_search_client=web_search,
             turn_started_at=turn_started_at,
+            jev_client=jev,
         )
     except BedrockUnavailableError as exc:
         await db.execute(delete(ChatSession).where(ChatSession.id == session_id))
@@ -328,6 +331,7 @@ async def _start_refine_session(
     current_user: User,
     bedrock: BedrockClientProtocol,
     web_search: WebSearchClientProtocol,
+    jev: JevClientProtocol,
     scorecard_id: uuid.UUID,
     message: str,
 ) -> ChatTurnRead:
@@ -394,6 +398,7 @@ async def _start_refine_session(
                 db=db,
                 web_search_client=web_search,
                 turn_started_at=turn_started_at,
+                jev_client=jev,
             )
         except BedrockUnavailableError as exc:
             await _clear_turn_in_progress(db, session.id)
@@ -426,6 +431,7 @@ async def send_chat_message(
     db: AsyncSession = Depends(get_db),
     bedrock: BedrockClientProtocol = Depends(get_bedrock_client),
     web_search: WebSearchClientProtocol = Depends(get_web_search_client),
+    jev: JevClientProtocol = Depends(get_jev_client),
     current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
 ) -> ChatTurnRead:
     session = await db.get(ChatSession, session_id)
@@ -446,6 +452,7 @@ async def send_chat_message(
             db=db,
             web_search_client=web_search,
             turn_started_at=turn_started_at,
+            jev_client=jev,
         )
     except BedrockUnavailableError as exc:
         await _clear_turn_in_progress(db, session.id)

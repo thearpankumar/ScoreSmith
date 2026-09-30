@@ -60,6 +60,7 @@ from pydantic import ValidationError
 
 from app.ai.bedrock_client import BedrockClientProtocol, ToolSpec
 from app.ai.draft_schema import KpiDraft, ScorecardDraft
+from app.ai.jev_client import QUALITY_GATE_THRESHOLD, JevClientProtocol, quality_gate
 from app.ai.scoring_formula import validate as validate_scoring_formula
 from app.ai.similarity import find_similar_scorecards
 from app.ai.turn_events import emit_turn_event
@@ -392,6 +393,27 @@ MAX_TOTAL_MERGED_KPIS = 24
 # entirely separately, by simply never sharing a counter, rather than needing any new
 # bookkeeping to keep them apart.
 MAX_RESEARCH_ROUNDS = 2
+
+# --- Quality gate (self-critique layer via Jev/OpenRouter — see app/ai/jev_client.py) ---
+#
+# Three checkpoints, each wrapping an existing decision point with a bounded
+# instruction/answer "does this genuinely serve the request?" rating from Jev:
+#   1. _decide_research_angles's plan (research_kpis) — see _decide_research_angles_with_gate.
+#   2. Each research agent's synthesized finding (_run_research_agent), right after
+#      record_research_finding.
+#   3. propose_kpis's final per-visit decision (ask_clarification/update_draft/
+#      update_scoring_formula/respond_conversationally).
+#
+# MAX_QUALITY_GATE_RETRIES=2 (the same "original attempt + up to 2 revisions" shape used
+# throughout this module already — see MAX_RESEARCH_ROUNDS/MAX_WEB_SEARCH_CALLS_PER_
+# PROPOSE for the same "small, explicit, bounded" pattern): a checkpoint that never clears
+# QUALITY_GATE_THRESHOLD (0.75, from jev_client.py) after 2 revision attempts proceeds
+# with its BEST-SCORING attempt seen so far rather than hanging the turn or silently
+# dropping the result — "never silently hang or crash a turn over this" is the task's own
+# explicit requirement. `quality_gate()` itself never raises (see jev_client.py), so an
+# unreachable Jev degrades every checkpoint to "passed, no retry" transparently — these
+# retry loops only ever engage on a REAL, successfully-obtained low score.
+MAX_QUALITY_GATE_RETRIES = 2
 
 DECIDE_RESEARCH_ANGLES_TOOL = ToolSpec(
     name="decide_research_angles",
@@ -734,6 +756,7 @@ def _decide_research_angles(
     model_id: str | None,
     draft: ScorecardDraft,
     conversation_context: str,
+    revision_feedback: str | None = None,
 ) -> list[dict[str, str]]:
     """One synchronous Bedrock call (run via `asyncio.to_thread` by the caller) deciding
     how many/which research angles this domain warrants. Never raises past this function's
@@ -743,11 +766,17 @@ def _decide_research_angles(
     `conversation_context` (the user's own messages so far — see `research_kpis`) is the
     critical signal on a session's very first turn, when `draft` is still entirely empty:
     research_kpis runs BEFORE propose_kpis has ever had a chance to populate the structured
-    draft fields, so the draft alone would tell this call nothing about the domain yet."""
+    draft fields, so the draft alone would tell this call nothing about the domain yet.
+
+    `revision_feedback` (set only on a retry — see `_decide_research_angles_with_gate`,
+    quality-gate checkpoint 1) appends Jev's below-threshold verdict to the system prompt
+    so a revised plan is a genuine reconsideration, not a blind re-roll of the same call."""
     system_prompt = _DECIDE_ANGLES_SYSTEM_PROMPT.format(
         draft_json=json.dumps(draft.model_dump(mode="json")),
         conversation_context=conversation_context or "(nothing yet)",
     )
+    if revision_feedback:
+        system_prompt += f"\n\n{revision_feedback}"
     result = bedrock.converse(
         messages=[{"role": "user", "content": [{"text": "Decide the research angles for this scorecard."}]}],
         system=system_prompt,
@@ -767,6 +796,88 @@ def _decide_research_angles(
         if angle and query_focus:
             cleaned.append({"angle": angle, "query_focus": query_focus})
     return cleaned
+
+
+def _angles_to_gate_text(angles: list[dict[str, str]]) -> str:
+    """Renders a decided research-angle plan as plain text for the quality gate's `answer`
+    (see `_decide_research_angles_with_gate`) — an empty plan is itself a valid, ratable
+    answer ("the model judged no dedicated research was needed"), not a special case."""
+    if not angles:
+        return (
+            "(No dedicated research angles were planned — the domain was judged "
+            "narrow/simple enough that no research fan-out is needed.)"
+        )
+    return "Planned research angles:\n" + "\n".join(
+        f'- "{a["angle"]}" — focus: {a["query_focus"]}' for a in angles
+    )
+
+
+async def _decide_research_angles_with_gate(
+    bedrock: BedrockClientProtocol,
+    model_id: str | None,
+    draft: ScorecardDraft,
+    conversation_context: str,
+    jev_client: JevClientProtocol | None,
+    session_id: str,
+    turn_started_at: datetime | None,
+) -> list[dict[str, str]]:
+    """Quality-gate checkpoint 1 (see the module comment above `MAX_QUALITY_GATE_RETRIES`):
+    wraps `_decide_research_angles` with a Jev rating of how well the decided plan serves
+    the user's actual request (instruction=`conversation_context`, answer=the plan
+    itself). Below `QUALITY_GATE_THRESHOLD`, the master revises its plan — bounded at
+    `MAX_QUALITY_GATE_RETRIES` revisions — then proceeds with the best-scoring attempt
+    seen (never hangs, never silently drops a low-scoring plan)."""
+    instruction = conversation_context or "(nothing yet)"
+    best_angles: list[dict[str, str]] = []
+    best_score = -1.0
+    revision_feedback: str | None = None
+
+    for attempt in range(MAX_QUALITY_GATE_RETRIES + 1):
+        angles = await asyncio.to_thread(
+            _decide_research_angles, bedrock, model_id, draft, conversation_context, revision_feedback
+        )
+        gate = await quality_gate(jev_client, instruction=instruction, answer=_angles_to_gate_text(angles))
+
+        if gate.degraded:
+            await emit_turn_event(
+                session_id, turn_started_at, "master", "quality_gate",
+                "Research plan quality check: Jev was unreachable — gate treated as passed "
+                "(graceful degradation).",
+            )
+            return angles  # Jev unreachable — gate passed by policy; no point retrying.
+        assert gate.score is not None  # guaranteed whenever degraded=False
+        if gate.score > best_score:
+            best_angles, best_score = angles, gate.score
+
+        if gate.passed:
+            await emit_turn_event(
+                session_id, turn_started_at, "master", "quality_gate",
+                f"Research plan quality check scored {gate.score:.2f} (>= {QUALITY_GATE_THRESHOLD}) — "
+                + ("passed after revision." if attempt > 0 else "passed."),
+            )
+            return angles
+
+        if attempt < MAX_QUALITY_GATE_RETRIES:
+            await emit_turn_event(
+                session_id, turn_started_at, "master", "quality_gate_retry",
+                f"Quality check scored {gate.score:.2f} (below {QUALITY_GATE_THRESHOLD}) — "
+                "revising the research plan…",
+            )
+            revision_feedback = (
+                f"An automated quality check scored your previous research-angle plan "
+                f"{gate.score:.2f}/1.0 (threshold {QUALITY_GATE_THRESHOLD}) for how well it "
+                "serves the user's actual request. Reconsider whether your chosen angles "
+                "genuinely target what the user asked for, and revise the angles and/or "
+                "query_focus wording to better match their request before deciding again."
+            )
+
+    await emit_turn_event(
+        session_id, turn_started_at, "master", "quality_gate",
+        f"Research plan quality check still below {QUALITY_GATE_THRESHOLD} after "
+        f"{MAX_QUALITY_GATE_RETRIES} revision(s) (best score {best_score:.2f}) — "
+        "proceeding with the best attempt.",
+    )
+    return best_angles
 
 
 def _clean_angle_items(raw_angles: list[Any]) -> list[dict[str, str]]:
@@ -842,6 +953,21 @@ def _assess_research_coverage(
     )
 
 
+def _finding_to_gate_text(finding: ResearchFinding) -> str:
+    """Renders one research agent's recorded finding as plain text for quality-gate
+    checkpoint 2's `answer` (see `_run_research_agent`) — everything the finding actually
+    contributes (summary, suggested KPIs/thresholds/sources), not just the bare
+    `summary` field, since that's what genuinely represents "what this agent produced"."""
+    lines = [finding.summary or "(no summary)"]
+    for kpi in finding.suggested_kpis:
+        lines.append(f"- Suggested KPI: {kpi.get('name', '')} — {kpi.get('rationale', '')}")
+    for threshold in finding.suggested_thresholds:
+        lines.append(f"- Suggested threshold: {threshold.get('metric', '')} = {threshold.get('value_or_range', '')}")
+    for source in finding.sources:
+        lines.append(f"- Source: {source.get('title', '')} ({source.get('url', '')})")
+    return "\n".join(lines)
+
+
 async def _run_research_agent(
     angle: str,
     query_focus: str,
@@ -853,6 +979,8 @@ async def _run_research_agent(
     turn_started_at: datetime | None,
     actor: str,
     round_num: int = 1,
+    jev_client: JevClientProtocol | None = None,
+    conversation_context: str = "",
 ) -> ResearchFinding:
     """THE single research-agent definition (instantiated/invoked N times concurrently by
     `research_kpis` via `asyncio.gather`, never duplicated in code) — a bounded ReAct-style
@@ -876,7 +1004,16 @@ async def _run_research_agent(
     Bedrock call, a malformed response, an unexpected web_search exception) is caught here
     and turned into a thin `degraded=True` finding, so one failing angle can never crash
     the whole turn or the other concurrently-running agents (which are independent asyncio
-    tasks and are completely unaffected by this one's exception either way)."""
+    tasks and are completely unaffected by this one's exception either way).
+
+    `jev_client`/`conversation_context` power quality-gate checkpoint 2 (see the module
+    comment above `MAX_QUALITY_GATE_RETRIES`): once `record_research_finding` produces a
+    finding, Jev rates how well it matches this agent's assigned angle/focus
+    (instruction=`conversation_context` + angle/focus, answer=the finding). Below
+    threshold, the agent researches further and re-synthesizes — bounded at
+    `MAX_QUALITY_GATE_RETRIES` attempts, sharing the SAME `MAX_SEARCH_CALLS_PER_RESEARCH_
+    AGENT` web_search budget across every attempt (not reset per retry) — then returns its
+    best-scoring finding rather than hanging or dropping the angle."""
     try:
         await emit_turn_event(
             session_id, turn_started_at, actor, "started", f'Researching "{angle}": {query_focus}', round=round_num
@@ -888,84 +1025,109 @@ async def _run_research_agent(
             }
         ]
         search_calls_made = 0
-        result = None
-        while True:
-            budget_left = search_calls_made < MAX_SEARCH_CALLS_PER_RESEARCH_AGENT
-            tools = [WEB_SEARCH_TOOL, RECORD_RESEARCH_FINDING_TOOL] if budget_left else [RECORD_RESEARCH_FINDING_TOOL]
-            system_prompt = _RESEARCH_WORKER_SYSTEM_PROMPT_TEMPLATE.format(
-                angle=angle, query_focus=query_focus, max_calls=MAX_SEARCH_CALLS_PER_RESEARCH_AGENT
-            )
-            if not budget_left:
-                system_prompt += (
-                    "\n\nYour search budget is used up — call record_research_finding now "
-                    "with whatever you have (even if you never searched)."
-                )
-                # This call's tools=[RECORD_RESEARCH_FINDING_TOOL] with force_tool_use=True
-                # means it is guaranteed to resolve to record_research_finding — safe to
-                # report "synthesizing" as a real live signal *before* the (possibly
-                # several-second) Bedrock call returns, not just after the fact.
-                await emit_turn_event(
-                    session_id, turn_started_at, actor, "synthesizing",
-                    f'Synthesizing findings for "{angle}"…',
-                    round=round_num,
-                )
+        finding: ResearchFinding | None = None
+        last_result = None
+        best_finding: ResearchFinding | None = None
+        best_score = -1.0
+        revision_feedback: str | None = None
 
-            result = await asyncio.to_thread(
-                bedrock.converse,
-                messages=local_messages,
-                system=system_prompt,
-                tools=tools,
-                force_tool_use=True,
-                model_id=model_id,
-            )
-
-            if result.is_tool_use and result.tool_name == "web_search" and budget_left:
-                query = str((result.tool_input or {}).get("query") or "").strip()
-                search_calls_made += 1
-                await emit_turn_event(
-                    session_id, turn_started_at, actor, "searching", f'Searching: "{query}"', round=round_num
+        # Outer loop = quality-gate checkpoint 2's bounded retry (see the module comment
+        # above MAX_QUALITY_GATE_RETRIES); inner `while True` = the UNCHANGED bounded
+        # search-then-record loop, reused as-is on every gate attempt (search budget is
+        # shared/not reset across attempts — see this function's own docstring).
+        for gate_attempt in range(MAX_QUALITY_GATE_RETRIES + 1):
+            result = None
+            while True:
+                budget_left = search_calls_made < MAX_SEARCH_CALLS_PER_RESEARCH_AGENT
+                tools = (
+                    [WEB_SEARCH_TOOL, RECORD_RESEARCH_FINDING_TOOL]
+                    if budget_left
+                    else [RECORD_RESEARCH_FINDING_TOOL]
                 )
-                logger.info(
-                    "research agent angle=%r: web_search (%d/%d) query=%r",
-                    angle,
-                    search_calls_made,
-                    MAX_SEARCH_CALLS_PER_RESEARCH_AGENT,
-                    query,
+                system_prompt = _RESEARCH_WORKER_SYSTEM_PROMPT_TEMPLATE.format(
+                    angle=angle, query_focus=query_focus, max_calls=MAX_SEARCH_CALLS_PER_RESEARCH_AGENT
                 )
-                try:
-                    results = await web_search_client.search(query) if query else []
-                except Exception:  # noqa: BLE001 — see web_search.py's own "never raise" contract
-                    logger.warning(
-                        "research agent angle=%r: web_search raised unexpectedly; treating as no results.",
-                        angle,
-                        exc_info=True,
+                if not budget_left:
+                    system_prompt += (
+                        "\n\nYour search budget is used up — call record_research_finding now "
+                        "with whatever you have (even if you never searched)."
                     )
-                    results = []
-                await emit_turn_event(
-                    session_id, turn_started_at, actor, "search_result",
-                    f'Found {len(results)} result(s) for "{query}"',
-                    round=round_num,
-                )
-                logger.info(
-                    "research agent angle=%r: web_search query=%r -> %d result(s)%s",
-                    angle,
-                    query,
-                    len(results),
-                    f"; first={results[0].title!r} ({results[0].url})" if results else "",
-                )
-                local_messages.append(
-                    {"role": "assistant", "content": [{"text": f"[called web_search] query={query!r}"}]}
-                )
-                local_messages.append(
-                    {"role": "user", "content": [{"text": _format_search_results(query, results)}]}
-                )
-                continue
+                    # This call's tools=[RECORD_RESEARCH_FINDING_TOOL] with force_tool_use=True
+                    # means it is guaranteed to resolve to record_research_finding — safe to
+                    # report "synthesizing" as a real live signal *before* the (possibly
+                    # several-second) Bedrock call returns, not just after the fact.
+                    await emit_turn_event(
+                        session_id, turn_started_at, actor, "synthesizing",
+                        f'Synthesizing findings for "{angle}"…',
+                        round=round_num,
+                    )
+                if revision_feedback:
+                    # Only set on a quality-gate retry (gate_attempt > 0) — see below.
+                    system_prompt += f"\n\n{revision_feedback}"
 
-            break
+                result = await asyncio.to_thread(
+                    bedrock.converse,
+                    messages=local_messages,
+                    system=system_prompt,
+                    tools=tools,
+                    force_tool_use=True,
+                    model_id=model_id,
+                )
 
-        if result is not None and result.is_tool_use and result.tool_name == "record_research_finding":
+                if result.is_tool_use and result.tool_name == "web_search" and budget_left:
+                    query = str((result.tool_input or {}).get("query") or "").strip()
+                    search_calls_made += 1
+                    await emit_turn_event(
+                        session_id, turn_started_at, actor, "searching", f'Searching: "{query}"', round=round_num
+                    )
+                    logger.info(
+                        "research agent angle=%r: web_search (%d/%d) query=%r",
+                        angle,
+                        search_calls_made,
+                        MAX_SEARCH_CALLS_PER_RESEARCH_AGENT,
+                        query,
+                    )
+                    try:
+                        results = await web_search_client.search(query) if query else []
+                    except Exception:  # noqa: BLE001 — see web_search.py's own "never raise" contract
+                        logger.warning(
+                            "research agent angle=%r: web_search raised unexpectedly; treating as no results.",
+                            angle,
+                            exc_info=True,
+                        )
+                        results = []
+                    await emit_turn_event(
+                        session_id, turn_started_at, actor, "search_result",
+                        f'Found {len(results)} result(s) for "{query}"',
+                        round=round_num,
+                    )
+                    logger.info(
+                        "research agent angle=%r: web_search query=%r -> %d result(s)%s",
+                        angle,
+                        query,
+                        len(results),
+                        f"; first={results[0].title!r} ({results[0].url})" if results else "",
+                    )
+                    local_messages.append(
+                        {"role": "assistant", "content": [{"text": f"[called web_search] query={query!r}"}]}
+                    )
+                    local_messages.append(
+                        {"role": "user", "content": [{"text": _format_search_results(query, results)}]}
+                    )
+                    continue
+
+                break
+
+            last_result = result
+
+            if not (result is not None and result.is_tool_use and result.tool_name == "record_research_finding"):
+                # Model never produced a usable finding this attempt — nothing to quality-
+                # gate; fall through to the degraded-return path below exactly as before
+                # this feature existed (this failure mode is not retried by the gate).
+                break
+
             data = result.tool_input or {}
-            finding = ResearchFinding(
+            candidate = ResearchFinding(
                 angle=angle,
                 summary=str(data.get("summary") or ""),
                 suggested_kpis=[k for k in (data.get("suggested_kpis") or []) if isinstance(k, dict)],
@@ -975,12 +1137,82 @@ async def _run_research_agent(
                 sources=[s for s in (data.get("sources") or []) if isinstance(s, dict)],
             )
 
+            # --- Quality-gate checkpoint 2 (see the module comment above
+            # MAX_QUALITY_GATE_RETRIES): rate how well this finding matches what this
+            # agent was actually assigned to research.
+            gate_instruction = (
+                f"User's original request: {conversation_context or '(nothing yet)'}\n"
+                f'This research agent\'s assigned angle: "{angle}"\n'
+                f'Specific research focus: "{query_focus}"'
+            )
+            gate = await quality_gate(
+                jev_client, instruction=gate_instruction, answer=_finding_to_gate_text(candidate)
+            )
+
+            if gate.degraded:
+                await emit_turn_event(
+                    session_id, turn_started_at, actor, "quality_gate",
+                    f'"{angle}": finding quality check — Jev was unreachable — gate treated as '
+                    "passed (graceful degradation).",
+                    round=round_num,
+                )
+                finding = candidate  # Jev unreachable — gate passed by policy; finding is final.
+                break
+
+            assert gate.score is not None  # guaranteed whenever degraded=False
+            if gate.score > best_score:
+                best_finding, best_score = candidate, gate.score
+
+            if gate.passed:
+                finding = candidate
+                await emit_turn_event(
+                    session_id, turn_started_at, actor, "quality_gate",
+                    f'"{angle}": finding quality check scored {gate.score:.2f} '
+                    f"(>= {QUALITY_GATE_THRESHOLD}) — "
+                    + ("passed after revision." if gate_attempt > 0 else "passed."),
+                    round=round_num,
+                )
+                break
+
+            if gate_attempt < MAX_QUALITY_GATE_RETRIES:
+                await emit_turn_event(
+                    session_id, turn_started_at, actor, "quality_gate_retry",
+                    f'"{angle}": finding quality check scored {gate.score:.2f} '
+                    f"(below {QUALITY_GATE_THRESHOLD}) — researching further…",
+                    round=round_num,
+                )
+                local_messages.append(
+                    {"role": "assistant", "content": [{"text": f"[recorded finding] {json.dumps(data)}"}]}
+                )
+                revision_feedback = (
+                    f"An automated quality check scored your recorded finding {gate.score:.2f}/1.0 "
+                    f"(threshold {QUALITY_GATE_THRESHOLD}) for how well it matches your assigned angle "
+                    f'"{angle}" (focus: "{query_focus}"). Research further (use any remaining '
+                    "web_search budget) and call record_research_finding again with an improved, "
+                    "more relevant finding."
+                )
+                local_messages.append({"role": "user", "content": [{"text": revision_feedback}]})
+                continue
+
+            # Bounded cap reached and still below threshold — proceed with the best-scoring
+            # attempt seen across every gate_attempt (never hang, never silently drop it).
+            finding = best_finding if best_finding is not None else candidate
+            await emit_turn_event(
+                session_id, turn_started_at, actor, "quality_gate",
+                f'"{angle}": finding quality check still below {QUALITY_GATE_THRESHOLD} after '
+                f"{MAX_QUALITY_GATE_RETRIES} revision(s) (best score {best_score:.2f}) — "
+                "using the best attempt.",
+                round=round_num,
+            )
+            break
+
+        if finding is not None:
             # --- KPI batch proposal (Part 1 fix — see the module comment above
             # MAX_RESEARCH_ANGLES): ONE additional bounded tool call, grounded in the
-            # finding this same agent/call just recorded, proposing this agent's own
-            # small batch of fully-specified KPIs. Never lets a failure here lose the
-            # finding itself (finding.proposed_kpis simply stays [] — the finding above
-            # is already fully formed and returned regardless).
+            # finding this same agent just recorded (post-quality-gate), proposing this
+            # agent's own small batch of fully-specified KPIs. Never lets a failure here
+            # lose the finding itself (finding.proposed_kpis simply stays [] — the finding
+            # above is already fully formed and returned regardless).
             await emit_turn_event(
                 session_id, turn_started_at, actor, "proposing_kpis", f'Proposing KPIs for "{angle}"…',
                 round=round_num,
@@ -1041,14 +1273,14 @@ async def _run_research_agent(
             "research agent angle=%r: model did not call record_research_finding "
             "(stop_reason=%r); returning a degraded finding.",
             angle,
-            getattr(result, "stop_reason", None),
+            getattr(last_result, "stop_reason", None),
         )
         await emit_turn_event(
             session_id, turn_started_at, actor, "error",
             f'"{angle}": model did not produce a usable finding — skipping this angle.',
             round=round_num,
         )
-        return ResearchFinding(angle=angle, summary=(result.text if result else "") or "", degraded=True)
+        return ResearchFinding(angle=angle, summary=(last_result.text if last_result else "") or "", degraded=True)
     except Exception:  # noqa: BLE001 — this worker's whole-agent "never raise" contract; see docstring
         logger.warning("research agent angle=%r failed entirely; returning a degraded finding.", angle, exc_info=True)
         await emit_turn_event(
@@ -1082,6 +1314,35 @@ def _format_research_findings_for_prompt(findings: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _normalize_guideline_value(raw: Any) -> Any:
+    """Defensive repair for a real, observed GLM-5 tool-call adherence gap: despite
+    `PROPOSE_KPI_BATCH_TOOL`'s (and `UPDATE_DRAFT_TOOL`'s) schema explicitly requiring each
+    guideline rung's value to be `{qualitative_text (str), quantitative_criteria (object |
+    null)}`, the model sometimes instead returns the rung's value as a BARE STRING (just
+    the qualitative description, unnested) — confirmed live on 2026-09-30, where a real
+    `propose_kpi_batch` call returned exactly this shape for 3 whole KPI candidates in one
+    batch. `KpiDraft.model_validate` correctly rejects that shape (`GuidelineDraft` needs a
+    dict), but the ORIGINAL handling of that rejection (`_validate_kpi_batch_items`, below)
+    just logged-and-dropped the whole KPI candidate, silently losing real, usable content
+    over a nesting mistake alone. A bare string IS valid qualitative text — wrap it as
+    `{"qualitative_text": <string>, "quantitative_criteria": None}` instead of discarding
+    it, recovering the candidate rather than losing it to a shape technicality."""
+    if isinstance(raw, str):
+        return {"qualitative_text": raw, "quantitative_criteria": None}
+    return raw
+
+
+def _normalize_kpi_guidelines(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Applies `_normalize_guideline_value` to every rung of one KPI candidate's
+    `guidelines` dict, if present and shaped as a dict — a no-op for anything else (already
+    correctly-shaped guidelines, a missing/malformed `guidelines` key, etc.), so this never
+    masks a genuinely different validation problem."""
+    guidelines = candidate.get("guidelines")
+    if not isinstance(guidelines, dict):
+        return candidate
+    return {**candidate, "guidelines": {k: _normalize_guideline_value(v) for k, v in guidelines.items()}}
+
+
 def _validate_kpi_batch_items(raw_items: list[Any]) -> list[dict[str, Any]]:
     """Validates each raw `propose_kpi_batch` item against `KpiDraft` (weight bounds,
     guideline score-level keys, etc — the same schema `update_draft` patches are validated
@@ -1090,12 +1351,18 @@ def _validate_kpi_batch_items(raw_items: list[Any]) -> list[dict[str, Any]]:
     research agent only ever proposes independent, non-hierarchical KPI candidates (it has
     no visibility into what the OTHER concurrently-running agents are proposing, so it
     cannot meaningfully nest under a sibling it doesn't know exists) — restructuring into a
-    hierarchy, if the user wants one, is left to propose_kpis's reconciliation pass."""
+    hierarchy, if the user wants one, is left to propose_kpis's reconciliation pass.
+
+    Guideline values are repaired via `_normalize_kpi_guidelines` BEFORE validation (see
+    that function's own docstring for the real, observed failure mode it recovers from) —
+    a candidate is only ever dropped now for a GENUINE validation failure (a real missing
+    field, an out-of-range weight, an invalid score-level key, ...), not merely because the
+    model nested a qualitative description one level too shallow."""
     validated: list[dict[str, Any]] = []
     for raw in raw_items[:MAX_KPIS_PER_RESEARCH_BATCH]:
         if not isinstance(raw, dict):
             continue
-        candidate = {**raw, "level": 1, "parent_name": None}
+        candidate = _normalize_kpi_guidelines({**raw, "level": 1, "parent_name": None})
         try:
             kpi = KpiDraft.model_validate(candidate)
         except ValidationError:
@@ -1239,6 +1506,7 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
     bedrock: BedrockClientProtocol | None = configurable.get("bedrock_client")
     model_id: str | None = configurable.get("chat_model_id")
     web_search_client: WebSearchClientProtocol | None = configurable.get("web_search_client")
+    jev_client: JevClientProtocol | None = configurable.get("jev_client")
     session_id: str = state["session_id"]
     turn_started_at: datetime | None = configurable.get("turn_started_at")
 
@@ -1254,7 +1522,9 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
     )
 
     try:
-        angles = await asyncio.to_thread(_decide_research_angles, bedrock, model_id, draft, conversation_context)
+        angles = await _decide_research_angles_with_gate(
+            bedrock, model_id, draft, conversation_context, jev_client, session_id, turn_started_at
+        )
     except Exception:  # noqa: BLE001 — angle decision failing must not break the turn either
         logger.warning("research_kpis: failed to decide research angles; skipping fan-out.", exc_info=True)
         await emit_turn_event(
@@ -1320,6 +1590,8 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
                     turn_started_at=turn_started_at,
                     actor=f"research_agent_{i + 1}",
                     round_num=round_num,
+                    jev_client=jev_client,
+                    conversation_context=conversation_context,
                 )
                 for i, a in enumerate(angles)
             ),
@@ -1745,6 +2017,25 @@ def _format_search_results(query: str, results: list[SearchResult]) -> str:
     return "\n".join(lines)
 
 
+def _final_answer_gate_text(tool_name: str | None, tool_input: dict[str, Any], assistant_note: str) -> str:
+    """Renders propose_kpis's decision for quality-gate checkpoint 3's `answer` (see that
+    function). For `ask_clarification`/`respond_conversationally`, `assistant_note` IS
+    already the full user-facing text — nothing more to add. For `update_draft`/
+    `update_scoring_formula`, `assistant_note` alone ("Updating the draft.") says nothing
+    about WHAT changed, so the actual patch/formula content is included too — that's what
+    genuinely represents "the answer" being rated. Patch JSON is capped so an unusually
+    large KPI patch doesn't blow up the Jev request."""
+    if tool_name == "update_draft":
+        patch_json = json.dumps(tool_input.get("patch") or {})[:4000]
+        confirmed = bool(tool_input.get("confirmed"))
+        return f"[update_draft] confirmed={confirmed}\nMessage shown to the user: {assistant_note}\nPatch: {patch_json}"
+    if tool_name == "update_scoring_formula":
+        return f"[update_scoring_formula] {assistant_note}\nFormula: {tool_input.get('formula')!r}"
+    # ask_clarification / respond_conversationally: assistant_note already is the complete
+    # user-facing text (the question, or the conversational reply) — nothing to add.
+    return assistant_note
+
+
 async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str, Any]:
     draft = ScorecardDraft.model_validate(state["draft"])
     turn_count = state.get("llm_turn_count", 0)
@@ -1782,6 +2073,7 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
     bedrock: BedrockClientProtocol = configurable["bedrock_client"]
     model_id: str | None = configurable.get("chat_model_id")
     web_search_client: WebSearchClientProtocol | None = configurable.get("web_search_client")
+    jev_client: JevClientProtocol | None = configurable.get("jev_client")
 
     # Local working copy of the turn's conversation, extended in-place across any
     # web_search iterations below (the model's own tool call + the results fed back to
@@ -1811,162 +2103,241 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
         + "…",
     )
 
-    while True:
-        session_budget_available = (
-            web_search_calls_used_before + search_calls_made < MAX_WEB_SEARCH_CALLS_PER_SESSION
-        )
-        search_budget_available = (
-            web_search_client is not None
-            and search_calls_made < MAX_WEB_SEARCH_CALLS_PER_PROPOSE
-            and session_budget_available
-        )
-        tools = _TOOLS_WITH_SEARCH if search_budget_available else _TOOLS
+    # Quality-gate checkpoint 3 (see the module comment above MAX_QUALITY_GATE_RETRIES)
+    # wraps the WHOLE decision loop below in a bounded outer retry: after the model
+    # produces its pending_tool/assistant_note for this node visit, Jev rates how well it
+    # serves the user's actual request; below threshold, feedback is appended to
+    # local_messages (mirroring update_draft's own "tool"-role rejection-note pattern) and
+    # the decision loop runs again. best_* track the best-scoring attempt across retries
+    # so a never-passing gate still proceeds with its best attempt rather than hanging.
+    pending_tool: dict[str, Any] = {}
+    assistant_note = ""
+    best_pending_tool: dict[str, Any] | None = None
+    best_assistant_note: str | None = None
+    best_gate_score = -1.0
 
-        scoring_formula_context = (
-            f'\nCurrent custom scoring_formula: {draft.scoring_formula!r} '
-            "(non-null means the default weighted average is currently OVERRIDDEN).\n"
-            if draft.scoring_formula
-            else "\nCurrent custom scoring_formula: none set (using the default weighted average).\n"
-        )
-        system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
-            draft_json=json.dumps(draft.model_dump(mode="json")),
-            missing_fields=draft.missing_fields() or "(none — draft looks complete)",
-            research_context=f"\n{research_context}\n" if research_context else "",
-            scoring_formula_context=scoring_formula_context,
-        )
-        if web_search_client is not None and not search_budget_available:
-            # Forced-closure step (see MAX_WEB_SEARCH_CALLS_PER_PROPOSE /
-            # MAX_WEB_SEARCH_CALLS_PER_SESSION): web_search is no longer offered in `tools`
-            # at all, so the model literally cannot call it again — force_tool_use means it
-            # must pick one of the remaining tools. This instruction just makes the "why"
-            # explicit to the model too.
-            budget_reason = (
-                "you've used this session's whole web research budget"
-                if not session_budget_available
-                else "you have used your web research budget for this turn"
+    for gate_attempt in range(MAX_QUALITY_GATE_RETRIES + 1):
+        result = None
+        while True:
+            session_budget_available = (
+                web_search_calls_used_before + search_calls_made < MAX_WEB_SEARCH_CALLS_PER_SESSION
             )
-            system_prompt += (
-                f"\n\nweb_search is no longer available ({budget_reason}). You now have "
-                "enough information to proceed — respond with update_draft, "
-                "ask_clarification, or respond_conversationally now."
+            search_budget_available = (
+                web_search_client is not None
+                and search_calls_made < MAX_WEB_SEARCH_CALLS_PER_PROPOSE
+                and session_budget_available
             )
-        if draft.is_complete():
-            # Convergence fix (found via a real live run: a fully-grounded, already-
-            # complete draft caused the model to burn its remaining MAX_LLM_TURNS_PER_
-            # HUMAN_TURN budget calling update_draft again and again with an empty or
-            # byte-for-byte-unchanged patch — never actually asking the user whether to
-            # save, and never reaching confirmed=True within budget. `missing_fields`
-            # already told the model the draft looks complete, but that alone wasn't a
-            # strong enough signal to stop it re-sending no-op patches — this makes the
-            # "what to do about it" explicit instead of just the state.
-            system_prompt += (
-                "\n\nThe draft is currently COMPLETE (see 'Fields still missing/incomplete' "
-                "above). Do NOT call update_draft again with an empty patch or a patch that "
-                "doesn't actually change anything — that wastes a turn. Exactly one of the "
-                "following now: (a) the user's most recent message already told you to save "
-                "it — call update_draft with confirmed=true right now (patch may be `{}` if "
-                "nothing is changing); (b) you have a genuine, real change to make — make it "
-                "via update_draft; (c) neither of those — call ask_clarification to ask "
-                "whether they'd like to save it as-is or change something, instead of "
-                "calling update_draft again."
+            tools = _TOOLS_WITH_SEARCH if search_budget_available else _TOOLS
+
+            scoring_formula_context = (
+                f'\nCurrent custom scoring_formula: {draft.scoring_formula!r} '
+                "(non-null means the default weighted average is currently OVERRIDDEN).\n"
+                if draft.scoring_formula
+                else "\nCurrent custom scoring_formula: none set (using the default weighted average).\n"
+            )
+            system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+                draft_json=json.dumps(draft.model_dump(mode="json")),
+                missing_fields=draft.missing_fields() or "(none — draft looks complete)",
+                research_context=f"\n{research_context}\n" if research_context else "",
+                scoring_formula_context=scoring_formula_context,
+            )
+            if web_search_client is not None and not search_budget_available:
+                # Forced-closure step (see MAX_WEB_SEARCH_CALLS_PER_PROPOSE /
+                # MAX_WEB_SEARCH_CALLS_PER_SESSION): web_search is no longer offered in `tools`
+                # at all, so the model literally cannot call it again — force_tool_use means it
+                # must pick one of the remaining tools. This instruction just makes the "why"
+                # explicit to the model too.
+                budget_reason = (
+                    "you've used this session's whole web research budget"
+                    if not session_budget_available
+                    else "you have used your web research budget for this turn"
+                )
+                system_prompt += (
+                    f"\n\nweb_search is no longer available ({budget_reason}). You now have "
+                    "enough information to proceed — respond with update_draft, "
+                    "ask_clarification, or respond_conversationally now."
+                )
+            if draft.is_complete():
+                # Convergence fix (found via a real live run: a fully-grounded, already-
+                # complete draft caused the model to burn its remaining MAX_LLM_TURNS_PER_
+                # HUMAN_TURN budget calling update_draft again and again with an empty or
+                # byte-for-byte-unchanged patch — never actually asking the user whether to
+                # save, and never reaching confirmed=True within budget. `missing_fields`
+                # already told the model the draft looks complete, but that alone wasn't a
+                # strong enough signal to stop it re-sending no-op patches — this makes the
+                # "what to do about it" explicit instead of just the state.
+                system_prompt += (
+                    "\n\nThe draft is currently COMPLETE (see 'Fields still missing/incomplete' "
+                    "above). Do NOT call update_draft again with an empty patch or a patch that "
+                    "doesn't actually change anything — that wastes a turn. Exactly one of the "
+                    "following now: (a) the user's most recent message already told you to save "
+                    "it — call update_draft with confirmed=true right now (patch may be `{}` if "
+                    "nothing is changing); (b) you have a genuine, real change to make — make it "
+                    "via update_draft; (c) neither of those — call ask_clarification to ask "
+                    "whether they'd like to save it as-is or change something, instead of "
+                    "calling update_draft again."
+                )
+
+            result = await asyncio.to_thread(
+                bedrock.converse,
+                messages=_messages_to_converse(local_messages),
+                system=system_prompt,
+                tools=tools,
+                force_tool_use=True,
+                model_id=model_id,
             )
 
-        result = await asyncio.to_thread(
-            bedrock.converse,
-            messages=_messages_to_converse(local_messages),
-            system=system_prompt,
-            tools=tools,
-            force_tool_use=True,
-            model_id=model_id,
-        )
+            if result.is_tool_use and result.tool_name == "web_search" and search_budget_available:
+                query = str((result.tool_input or {}).get("query") or "").strip()
+                search_calls_made += 1
+                await emit_turn_event(session_id, turn_started_at, "master", "searching", f'Searching: "{query}"')
+                logger.info(
+                    "propose_kpis: model called web_search (%d/%d this turn) query=%r",
+                    search_calls_made,
+                    MAX_WEB_SEARCH_CALLS_PER_PROPOSE,
+                    query,
+                )
+                try:
+                    results = await web_search_client.search(query) if query else []
+                except Exception:  # noqa: BLE001 — belt-and-suspenders; see web_search.py's
+                    # own contract that .search() never raises. A failed search must never
+                    # kill the chat turn, so even a surprise exception here is swallowed.
+                    logger.warning("web_search call raised unexpectedly; treating as no results.", exc_info=True)
+                    results = []
+                await emit_turn_event(
+                    session_id, turn_started_at, "master", "search_result",
+                    f'Found {len(results)} result(s) for "{query}"',
+                )
+                logger.info(
+                    "propose_kpis: web_search query=%r returned %d result(s)%s",
+                    query,
+                    len(results),
+                    f"; first={results[0].title!r} ({results[0].url})" if results else "",
+                )
+                local_messages.append(
+                    {"role": "assistant", "content": f"[called web_search] query={query!r}"}
+                )
+                local_messages.append({"role": "tool", "content": _format_search_results(query, results)})
+                continue
 
-        if result.is_tool_use and result.tool_name == "web_search" and search_budget_available:
-            query = str((result.tool_input or {}).get("query") or "").strip()
-            search_calls_made += 1
-            await emit_turn_event(session_id, turn_started_at, "master", "searching", f'Searching: "{query}"')
-            logger.info(
-                "propose_kpis: model called web_search (%d/%d this turn) query=%r",
-                search_calls_made,
-                MAX_WEB_SEARCH_CALLS_PER_PROPOSE,
-                query,
-            )
-            try:
-                results = await web_search_client.search(query) if query else []
-            except Exception:  # noqa: BLE001 — belt-and-suspenders; see web_search.py's
-                # own contract that .search() never raises. A failed search must never
-                # kill the chat turn, so even a surprise exception here is swallowed.
-                logger.warning("web_search call raised unexpectedly; treating as no results.", exc_info=True)
-                results = []
+            break
+
+        if result.is_tool_use:
+            pending_tool = {"name": result.tool_name, "input": result.tool_input or {}}
+            # The persisted/returned message content is what the frontend renders directly as
+            # the assistant's chat bubble (see _to_turn_result -> ChatTurnRead.assistant_message
+            # -> MessageBubble) — it must be real, user-facing text, never an internal
+            # "[called tool_name] {raw json}" debug label. `ask_clarification`'s structured
+            # question/options/missing_fields still flow separately via the interrupt payload
+            # itself (see ask_clarification node) for ClarifyingQuestionCard to render; this is
+            # just the plain-text echo of the same question shown in the transcript bubble
+            # above that card. `respond_conversationally` is the tool this whole mechanism
+            # exists for — its `response` field IS the user-facing message, verbatim.
+            tool_input = result.tool_input or {}
+            if result.tool_name == "ask_clarification":
+                assistant_note = str(tool_input.get("question") or "").strip() or (
+                    "Could you tell me more about what this scorecard should measure?"
+                )
+            elif result.tool_name == "respond_conversationally":
+                assistant_note = str(tool_input.get("response") or "").strip() or (
+                    "(The assistant didn't include a response — please try rephrasing.)"
+                )
+            elif result.tool_name == "update_scoring_formula":
+                formula = tool_input.get("formula")
+                assistant_note = (
+                    f'Setting a custom scoring formula: {formula!r}'
+                    if formula
+                    else "Clearing the custom scoring formula — reverting to the default weighted average."
+                )
+            else:  # update_draft
+                assistant_note = (
+                    "Confirming and saving the draft."
+                    if tool_input.get("confirmed")
+                    else "Updating the draft."
+                )
+
+            # --- Quality-gate checkpoint 3 (see the module comment above
+            # MAX_QUALITY_GATE_RETRIES): rate how well THIS decision serves the user's
+            # actual request — instruction=the recent conversation, answer=a text
+            # rendering of whatever this decision actually is (not just assistant_note
+            # alone for update_draft/update_scoring_formula, since "Updating the draft."
+            # says nothing about WHAT changed — see _final_answer_gate_text).
+            gate_instruction = _conversation_context_text(local_messages) or "(nothing yet)"
+            gate_answer = _final_answer_gate_text(result.tool_name, tool_input, assistant_note)
+            gate = await quality_gate(jev_client, instruction=gate_instruction, answer=gate_answer)
+
+            if gate.degraded:
+                await emit_turn_event(
+                    session_id, turn_started_at, "master", "quality_gate",
+                    "Response quality check: Jev was unreachable — gate treated as passed "
+                    "(graceful degradation).",
+                )
+                break  # Jev unreachable — gate passed by policy; this decision is final.
+
+            assert gate.score is not None  # guaranteed whenever degraded=False
+            if gate.score > best_gate_score:
+                best_pending_tool, best_assistant_note, best_gate_score = pending_tool, assistant_note, gate.score
+
+            if gate.passed:
+                await emit_turn_event(
+                    session_id, turn_started_at, "master", "quality_gate",
+                    f"Response quality check scored {gate.score:.2f} (>= {QUALITY_GATE_THRESHOLD}) — "
+                    + ("passed after revision." if gate_attempt > 0 else "passed."),
+                )
+                break
+
+            if gate_attempt < MAX_QUALITY_GATE_RETRIES:
+                await emit_turn_event(
+                    session_id, turn_started_at, "master", "quality_gate_retry",
+                    f"Quality check scored {gate.score:.2f} (below {QUALITY_GATE_THRESHOLD}) — "
+                    "revising the response…",
+                )
+                local_messages.append(
+                    {
+                        "role": "tool",
+                        "content": (
+                            f"[quality gate] Your last {result.tool_name} response scored "
+                            f"{gate.score:.2f}/1.0 (threshold {QUALITY_GATE_THRESHOLD}) on an "
+                            "automated check of how well it serves the user's actual request. "
+                            "Reconsider and provide a genuinely improved response now."
+                        ),
+                    }
+                )
+                continue
+
+            # Bounded cap reached and still below threshold — proceed with the best-scoring
+            # attempt seen across every gate_attempt (never hang, never silently drop it).
+            pending_tool = best_pending_tool if best_pending_tool is not None else pending_tool
+            assistant_note = best_assistant_note if best_assistant_note is not None else assistant_note
             await emit_turn_event(
-                session_id, turn_started_at, "master", "search_result",
-                f'Found {len(results)} result(s) for "{query}"',
+                session_id, turn_started_at, "master", "quality_gate",
+                f"Response quality check still below {QUALITY_GATE_THRESHOLD} after "
+                f"{MAX_QUALITY_GATE_RETRIES} revision(s) (best score {best_gate_score:.2f}) — "
+                "proceeding with the best attempt.",
             )
-            logger.info(
-                "propose_kpis: web_search query=%r returned %d result(s)%s",
-                query,
-                len(results),
-                f"; first={results[0].title!r} ({results[0].url})" if results else "",
+            break
+        else:
+            # Defensive fallback: force_tool_use was requested but the model still replied
+            # in plain text (e.g. a provider that silently ignores toolChoice). Convert it
+            # into a well-formed ask_clarification so the graph's invariant — every turn
+            # resolves to exactly one of the two tool branches — always holds. NOT quality-
+            # gated: this is already a synthesized fallback, not a genuine model answer to
+            # critique, and retrying it would just call the same broken-toolChoice path again.
+            fallback_question = result.text or "Could you tell me more about what this scorecard should measure?"
+            pending_tool = {
+                "name": "ask_clarification",
+                "input": {
+                    "question": fallback_question,
+                    "options": [],
+                    "missing_fields": draft.missing_fields(),
+                },
+            }
+            assistant_note = fallback_question
+            logger.warning(
+                "Model replied without a tool call despite force_tool_use; "
+                "synthesized a fallback ask_clarification."
             )
-            local_messages.append(
-                {"role": "assistant", "content": f"[called web_search] query={query!r}"}
-            )
-            local_messages.append({"role": "tool", "content": _format_search_results(query, results)})
-            continue
-
-        break
-
-    if result.is_tool_use:
-        pending_tool = {"name": result.tool_name, "input": result.tool_input or {}}
-        # The persisted/returned message content is what the frontend renders directly as
-        # the assistant's chat bubble (see _to_turn_result -> ChatTurnRead.assistant_message
-        # -> MessageBubble) — it must be real, user-facing text, never an internal
-        # "[called tool_name] {raw json}" debug label. `ask_clarification`'s structured
-        # question/options/missing_fields still flow separately via the interrupt payload
-        # itself (see ask_clarification node) for ClarifyingQuestionCard to render; this is
-        # just the plain-text echo of the same question shown in the transcript bubble
-        # above that card. `respond_conversationally` is the tool this whole mechanism
-        # exists for — its `response` field IS the user-facing message, verbatim.
-        tool_input = result.tool_input or {}
-        if result.tool_name == "ask_clarification":
-            assistant_note = str(tool_input.get("question") or "").strip() or (
-                "Could you tell me more about what this scorecard should measure?"
-            )
-        elif result.tool_name == "respond_conversationally":
-            assistant_note = str(tool_input.get("response") or "").strip() or (
-                "(The assistant didn't include a response — please try rephrasing.)"
-            )
-        elif result.tool_name == "update_scoring_formula":
-            formula = tool_input.get("formula")
-            assistant_note = (
-                f'Setting a custom scoring formula: {formula!r}'
-                if formula
-                else "Clearing the custom scoring formula — reverting to the default weighted average."
-            )
-        else:  # update_draft
-            assistant_note = (
-                "Confirming and saving the draft."
-                if tool_input.get("confirmed")
-                else "Updating the draft."
-            )
-    else:
-        # Defensive fallback: force_tool_use was requested but the model still replied
-        # in plain text (e.g. a provider that silently ignores toolChoice). Convert it
-        # into a well-formed ask_clarification so the graph's invariant — every turn
-        # resolves to exactly one of the two tool branches — always holds.
-        fallback_question = result.text or "Could you tell me more about what this scorecard should measure?"
-        pending_tool = {
-            "name": "ask_clarification",
-            "input": {
-                "question": fallback_question,
-                "options": [],
-                "missing_fields": draft.missing_fields(),
-            },
-        }
-        assistant_note = fallback_question
-        logger.warning(
-            "Model replied without a tool call despite force_tool_use; "
-            "synthesized a fallback ask_clarification."
-        )
+            break
 
     new_messages: list[ChatTurn] = local_messages[len(state["messages"]) :]
     new_messages.append({"role": "assistant", "content": assistant_note})
@@ -2056,6 +2427,17 @@ def update_draft(state: BuilderState) -> dict[str, Any]:
     # model smuggles it into an update_draft patch anyway, so an unvalidated formula can
     # never reach draft state through the wrong door.
     patch = {k: v for k, v in patch.items() if k != "scoring_formula"}
+    if isinstance(patch.get("kpis"), list):
+        # Same GLM-5 shape gap `_normalize_kpi_guidelines` repairs for propose_kpi_batch
+        # (see that function's docstring) can occur here too — repair it BEFORE
+        # validation so a real, otherwise-good patch isn't REJECTED (wasting a turn) over
+        # a guideline rung nested one level too shallow.
+        patch = {
+            **patch,
+            "kpis": [
+                _normalize_kpi_guidelines(kpi) if isinstance(kpi, dict) else kpi for kpi in patch["kpis"]
+            ],
+        }
     confirmed_flag = bool(tool_input.get("confirmed", False)) if isinstance(tool_input, dict) else False
 
     current = ScorecardDraft.model_validate(state["draft"])
@@ -2351,6 +2733,7 @@ def _config_for(
     db: Any | None = None,
     web_search_client: WebSearchClientProtocol | None = None,
     turn_started_at: datetime | None = None,
+    jev_client: JevClientProtocol | None = None,
 ) -> dict[str, Any]:
     return {
         "configurable": {
@@ -2369,6 +2752,11 @@ def _config_for(
             # duration of this call. None is a valid, silently-skipped configuration (e.g.
             # seed_session, or this module's own unit tests) — see emit_turn_event.
             "turn_started_at": turn_started_at,
+            # Wired in so the three quality-gate checkpoints (see the module comment above
+            # MAX_QUALITY_GATE_RETRIES / app/ai/jev_client.py) can rate decisions via Jev.
+            # None is a valid, silently-skipped configuration — quality_gate() degrades to
+            # "passed" with no client wired in, exactly like an unreachable Jev.
+            "jev_client": jev_client,
         }
     }
 
@@ -2381,19 +2769,22 @@ async def start_session(
     db: Any | None = None,
     web_search_client: WebSearchClientProtocol | None = None,
     turn_started_at: datetime | None = None,
+    jev_client: JevClientProtocol | None = None,
 ) -> BuilderTurnResult:
     """Kick off a brand-new scorecard-builder session (`POST /chat/sessions`). Pass `db`
     (an `AsyncSession`) to enable the reuse-suggestion similarity check on the initial
     prompt — see `check_similarity`. Pass `web_search_client` to let `propose_kpis`
     research real KPIs/benchmarks for the user's domain — see `app/ai/web_search.py`. Pass
-    `turn_started_at` (see `_config_for`) so this turn's nodes can write live-trace events
-    correlated to it — this is in fact the ONLY call site where the multi-agent research
-    fan-out ever actually runs (see `research_kpis`'s docstring: `research_done` is set
-    True on every other path into the graph), so it's the one that matters most for that
-    feature."""
+    `jev_client` to enable the three quality-gate checkpoints (see the module comment
+    above `MAX_QUALITY_GATE_RETRIES`) — omitted/`None` simply skips gating (treated as
+    passed, same as an unreachable Jev; see `app/ai/jev_client.py`). Pass `turn_started_at`
+    (see `_config_for`) so this turn's nodes can write live-trace events correlated to it
+    — this is in fact the ONLY call site where the multi-agent research fan-out ever
+    actually runs (see `research_kpis`'s docstring: `research_done` is set True on every
+    other path into the graph), so it's the one that matters most for that feature."""
     manager = get_graph_manager()
     compiled = await manager.get_compiled_graph()
-    config = _config_for(session_id, bedrock, chat_model_id, db, web_search_client, turn_started_at)
+    config = _config_for(session_id, bedrock, chat_model_id, db, web_search_client, turn_started_at, jev_client)
     result_state = await compiled.ainvoke(initial_state(session_id, first_message), config=config)
     return _to_turn_result(result_state)
 
@@ -2445,6 +2836,7 @@ async def send_message(
     db: Any | None = None,
     web_search_client: WebSearchClientProtocol | None = None,
     turn_started_at: datetime | None = None,
+    jev_client: JevClientProtocol | None = None,
 ) -> BuilderTurnResult:
     """Resume an existing session with a new user message
     (`POST /chat/sessions/{id}/messages`). If the graph is currently paused at
@@ -2454,10 +2846,11 @@ async def send_message(
     this turn's nodes can write live-trace events correlated to it — a no-op for the
     research fan-out specifically (already `research_done` by this point in every real
     session — see `research_kpis`), but `propose_kpis`'s own master-actor events still
-    fire on every turn regardless."""
+    fire on every turn regardless. Pass `jev_client` to enable the quality-gate
+    checkpoints (see `start_session`'s own docstring)."""
     manager = get_graph_manager()
     compiled = await manager.get_compiled_graph()
-    config = _config_for(session_id, bedrock, chat_model_id, db, web_search_client, turn_started_at)
+    config = _config_for(session_id, bedrock, chat_model_id, db, web_search_client, turn_started_at, jev_client)
 
     snapshot = await compiled.aget_state(config)
     if not snapshot.values:

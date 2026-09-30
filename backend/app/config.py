@@ -58,6 +58,23 @@ class Settings(BaseSettings):
     agentcore_gateway_aws_access_key_id: str = ""
     agentcore_gateway_aws_secret_access_key: str = ""
 
+    # --- OpenRouter Jev quality gate (see app/ai/jev_client.py) ---
+    # A SEPARATE provider/model from every other setting on this class: TypeSafe AI's
+    # "Jev" ("System One" decision model), reached via OpenRouter's alpha Decisions API
+    # (https://openrouter.ai/api/alpha/decisions — NOT the standard chat/completions
+    # shape; see jev_client.py's module docstring for the live-confirmed request/response
+    # contract). Used ONLY for the three quality-gate checkpoints added to
+    # scorecard_builder.py (research-angle planning, each research agent's finding, and
+    # the final per-turn answer) — every normal chat/judge LLM call stays on Bedrock
+    # GLM-5/GLM-4.7-Flash above. Left unset (empty string) by default; jev_client.py
+    # treats that as "not configured" and the quality-gate degrades to "passed" rather
+    # than failing the chat turn — same graceful-degradation shape as the AgentCore
+    # Gateway web-search settings above.
+    openrouter_jev_api: str = ""
+    # Pinned version (not the "~typesafe/jev-latest" rolling alias) — confirmed live
+    # against this account's OpenRouter access on 2026-09-30 (see jev_client.py).
+    openrouter_jev_model_id: str = "typesafe/jev-1.13"
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

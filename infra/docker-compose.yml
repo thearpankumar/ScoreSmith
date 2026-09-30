@@ -40,6 +40,12 @@ services:
       # are left in place too (via env_file above) since they're harmless when unused and
       # some other AWS SDK call in this app (none currently) might still want them.
       AWS_BEARER_TOKEN_BEDROCK: A${AWS_SECRET_ACCESS_KEY}
+      # OpenRouter Jev quality-gate key (see app/ai/jev_client.py / app/config.py's
+      # openrouter_jev_api field) — already present via env_file above (infra/.env), but
+      # listed explicitly here too, alongside the other AI-layer credentials, so a new
+      # container is guaranteed to pick it up on `docker compose up` without relying
+      # solely on env_file ordering/caching.
+      OPENROUTER_JEV_API: ${OPENROUTER_JEV_API:-}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     depends_on:

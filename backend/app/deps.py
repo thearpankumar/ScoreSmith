@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.bedrock_client import BedrockClient, BedrockClientProtocol
+from app.ai.jev_client import JevClient, JevClientProtocol
 from app.ai.web_search import AgentCoreWebSearchClient, WebSearchClientProtocol
 from app.db import get_db
 from app.models.user import User
@@ -32,6 +33,13 @@ _bedrock_client: BedrockClientProtocol = BedrockClient()
 # then just returns [] rather than failing the chat turn.
 _web_search_client: WebSearchClientProtocol = AgentCoreWebSearchClient()
 
+# Single process-lifetime JevClient (OpenRouter-backed quality gate — see
+# app/ai/jev_client.py), mirroring _bedrock_client/_web_search_client above. Cheap/lazy
+# too — nothing is created until the first real `.rate_match()` call, and it's safe to
+# construct even when OPENROUTER_JEV_API is unset: `quality_gate()` then just degrades
+# every checkpoint to "passed" rather than failing a chat turn.
+_jev_client: JevClientProtocol = JevClient()
+
 
 def get_bedrock_client() -> BedrockClientProtocol:
     """FastAPI dependency for the AI routers (app/api/v1/chat.py, scorecards.py's
@@ -45,6 +53,14 @@ def get_web_search_client() -> WebSearchClientProtocol:
     `propose_kpis` offer the model a real web_search tool. Overridden in tests with a
     `FakeWebSearchClient` via `app.dependency_overrides` — see tests/conftest.py."""
     return _web_search_client
+
+
+def get_jev_client() -> JevClientProtocol:
+    """FastAPI dependency for app/api/v1/chat.py's chat-builder endpoints, letting the
+    three quality-gate checkpoints in scorecard_builder.py rate decisions via Jev.
+    Overridden in tests with a `FakeJevClient` via `app.dependency_overrides` — see
+    tests/conftest.py."""
+    return _jev_client
 
 
 async def get_current_user(
