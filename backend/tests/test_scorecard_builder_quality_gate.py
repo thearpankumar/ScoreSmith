@@ -31,7 +31,7 @@ import uuid
 import pytest
 
 from app.ai import scorecard_builder as sb
-from tests.fakes import FakeBedrockClient, FakeJevClient, FakeWebSearchClient, tool_use_result
+from tests.fakes import FakeBedrockClient, FakeJevClient, FakeWebSearchClient, text_result, tool_use_result
 
 pytestmark = pytest.mark.usefixtures("_migrated_db")
 
@@ -78,9 +78,19 @@ async def test_checkpoint1_low_score_triggers_bounded_retry_then_proceeds() -> N
     best attempt, and the retry system prompts must genuinely carry Jev's feedback."""
     session_id = str(uuid.uuid4())
     decide_system_prompts: list[str] = []
+    critique_system_prompts: list[str] = []
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
         names = _tools_offered(tools)
+        if "critique_response" in names:
+            critique_system_prompts.append(system or "")
+            return tool_use_result(
+                "critique_response",
+                {
+                    "specific_problems": ["CRITIQUE_MARKER: the category names are too abstract."],
+                    "concrete_fix": "Use business-recognizable category names instead.",
+                },
+            )
         if "decide_categories" in names:
             decide_system_prompts.append(system or "")
             return tool_use_result("decide_categories", {"categories": _SINGLE_CATEGORY})
@@ -115,11 +125,20 @@ async def test_checkpoint1_low_score_triggers_bounded_retry_then_proceeds() -> N
     assert turn.status == "confirmed"
     # Bounded: 1 original attempt + MAX_QUALITY_GATE_RETRIES revisions.
     assert len(decide_system_prompts) == sb.MAX_QUALITY_GATE_RETRIES + 1
-    # Every retry's system prompt genuinely carries Jev's below-threshold feedback (not a
-    # blind re-roll of the identical call).
+    # Every retry's system prompt genuinely carries the ADVISOR'S concrete critique (not a
+    # blind re-roll of the identical call, and not the old generic "try harder" note).
     for revised_prompt in decide_system_prompts[1:]:
         assert "automated quality check" in revised_prompt
         assert "0.3" in revised_prompt
+    # The advisor node itself: exactly one critique call per failed attempt with a retry
+    # left (never JEV/OpenRouter — see jev_client.py; it's a plain Bedrock converse call
+    # like everything else in this module), and the SECOND one carries the first critique
+    # plus the prior output so it can refine rather than repeat the same advice.
+    assert len(critique_system_prompts) == sb.MAX_QUALITY_GATE_RETRIES
+    assert "Planned KPI categories:" in critique_system_prompts[0]
+    assert "0.30" in critique_system_prompts[0]
+    assert "SECOND FAILURE" in critique_system_prompts[1]
+    assert "CRITIQUE_MARKER" in critique_system_prompts[1]
 
 
 async def test_checkpoint1_high_score_passes_with_no_retry() -> None:
@@ -169,9 +188,19 @@ async def test_checkpoint2_low_score_triggers_bounded_retry_then_proceeds() -> N
     best attempt to the master for merging, rather than hanging or dropping the category."""
     session_id = str(uuid.uuid4())
     record_calls: list[int] = []
+    critique_system_prompts: list[str] = []
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
         names = _tools_offered(tools)
+        if "critique_response" in names:
+            critique_system_prompts.append(system or "")
+            return tool_use_result(
+                "critique_response",
+                {
+                    "specific_problems": ["CRITIQUE_MARKER: the finding has no concrete thresholds."],
+                    "concrete_fix": "Search for a real published benchmark and cite it.",
+                },
+            )
         if "decide_categories" in names:
             return tool_use_result("decide_categories", {"categories": _SINGLE_CATEGORY})
         if "assess_research_coverage" in names:
@@ -210,6 +239,14 @@ async def test_checkpoint2_low_score_triggers_bounded_retry_then_proceeds() -> N
 
     assert turn.status == "confirmed"
     assert len(record_calls) == sb.MAX_QUALITY_GATE_RETRIES + 1
+    # The advisor/critique node: exactly one call per failed attempt with a retry left, and
+    # the SECOND carries the first critique + prior output (see module comment above
+    # MAX_QUALITY_GATE_RETRIES in scorecard_builder.py).
+    assert len(critique_system_prompts) == sb.MAX_QUALITY_GATE_RETRIES
+    assert "FINDING_MARKER" in critique_system_prompts[0]
+    assert "0.40" in critique_system_prompts[0]
+    assert "SECOND FAILURE" in critique_system_prompts[1]
+    assert "CRITIQUE_MARKER" in critique_system_prompts[1]
     # The category's finding was still consolidated (not silently dropped) despite never
     # clearing the threshold — see research_findings in the checkpointed state.
     compiled = await sb.get_graph_manager().get_compiled_graph()
@@ -260,11 +297,26 @@ async def test_checkpoint2_high_score_passes_with_no_retry() -> None:
 async def test_checkpoint3_low_score_triggers_bounded_retry_then_proceeds() -> None:
     """Jev always scores propose_kpis's decision low. The node must revise up to
     `MAX_QUALITY_GATE_RETRIES` times (bounded) before returning its best attempt to the
-    user — never hanging or crashing the turn."""
+    user — never hanging or crashing the turn. Also covers the new advisor/critique step
+    (see the module comment above MAX_QUALITY_GATE_RETRIES in scorecard_builder.py): each
+    failed gate attempt must trigger exactly one `critique_response` advisor call (same
+    Bedrock client, never Jev) BEFORE the next retry, and the advisor's own system prompt
+    must carry the previous critique + prior output on the SECOND failure."""
     session_id = str(uuid.uuid4())
     propose_calls: list[int] = []
+    critique_system_prompts: list[str] = []
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
+        names = _tools_offered(tools)
+        if "critique_response" in names:
+            critique_system_prompts.append(system or "")
+            return tool_use_result(
+                "critique_response",
+                {
+                    "specific_problems": ["CRITIQUE_MARKER: the question ignored the user's actual request."],
+                    "concrete_fix": "Ask about the scorecard's purpose instead.",
+                },
+            )
         propose_calls.append(1)
         return tool_use_result(
             "ask_clarification",
@@ -293,6 +345,19 @@ async def test_checkpoint3_low_score_triggers_bounded_retry_then_proceeds() -> N
     assert turn.question is not None
     assert "ANSWER_MARKER" in turn.question["question"]
     assert len(propose_calls) == sb.MAX_QUALITY_GATE_RETRIES + 1
+    # Exactly one advisor/critique call per failed attempt that still has a retry left
+    # (never after the FINAL attempt — that's the bounded-cap path, no point critiquing an
+    # attempt nothing will ever read).
+    assert len(critique_system_prompts) == sb.MAX_QUALITY_GATE_RETRIES
+    # The advisor's own call carries the real task + the real failing output + the real
+    # score — not a generic prompt.
+    assert "ANSWER_MARKER" in critique_system_prompts[0]
+    assert "0.20" in critique_system_prompts[0]
+    # On the SECOND failure, the advisor also sees what the first critique suggested and
+    # what the response looked like before that critique was applied (so it can refine
+    # rather than repeat the same advice) — see _generate_quality_gate_critique.
+    assert "SECOND FAILURE" in critique_system_prompts[1]
+    assert "CRITIQUE_MARKER" in critique_system_prompts[1]
 
 
 async def test_checkpoint3_high_score_passes_with_no_retry() -> None:
@@ -359,3 +424,88 @@ async def test_no_jev_client_wired_in_is_also_graceful() -> None:
 
     assert turn.status == "confirmed"
     assert len(fake_bedrock.calls) == 1
+
+
+# --- The advisor/critique node itself (_generate_quality_gate_critique) --------------------
+
+
+async def test_critique_call_uses_same_bedrock_client_never_jev() -> None:
+    """The advisor/critique step must be a plain `bedrock.converse(force_tool_use=True)`
+    call on the SAME GLM-5 client as the rest of the pipeline — never Jev/OpenRouter, which
+    stays a pure scorer (see jev_client.py's own module docstring). A `FakeJevClient` whose
+    `rate_fn` only ever returns a float proves Jev itself is never asked to produce text."""
+    fake_jev = FakeJevClient(rate_fn=lambda **kwargs: 0.1)
+    fake_bedrock = FakeBedrockClient(
+        converse_fn=lambda **kwargs: tool_use_result(
+            "critique_response",
+            {"specific_problems": ["too vague"], "concrete_fix": "be specific about X"},
+        )
+    )
+
+    critique = await sb._generate_quality_gate_critique(
+        fake_bedrock,
+        None,
+        task_context="Do the task.",
+        produced_output="A vague answer.",
+        gate_score=0.1,
+    )
+
+    assert len(fake_bedrock.calls) == 1
+    assert fake_bedrock.calls[0]["tools"][0].name == "critique_response"
+    assert len(fake_jev.calls) == 0
+    assert "too vague" in critique
+    assert "be specific about X" in critique
+    assert "0.10" in critique
+
+
+async def test_critique_falls_back_gracefully_on_malformed_or_failed_call() -> None:
+    """A critique call that fails outright, or returns no usable `critique_response` tool
+    call, must fall back to a generic (but still real) revision note rather than raising —
+    an advisor-call failure must never block a bounded retry (mirrors every other "never
+    raise past this layer" contract in scorecard_builder.py)."""
+    fake_bedrock_raises = FakeBedrockClient(
+        converse_fn=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("simulated Bedrock outage"))
+    )
+    critique = await sb._generate_quality_gate_critique(
+        fake_bedrock_raises, None, task_context="Do the task.", produced_output="An answer.", gate_score=0.2
+    )
+    assert "0.20" in critique
+    assert "improved" in critique.lower()
+
+    fake_bedrock_malformed = FakeBedrockClient(converse_fn=lambda **kwargs: text_result("not a tool call"))
+    critique2 = await sb._generate_quality_gate_critique(
+        fake_bedrock_malformed, None, task_context="Do the task.", produced_output="An answer.", gate_score=0.3
+    )
+    assert "0.30" in critique2
+
+
+async def test_critique_second_failure_includes_previous_critique_and_prior_output() -> None:
+    """On the SECOND failure of the same task, the critique prompt must carry what the
+    first critique suggested and what the response looked like BEFORE that critique was
+    applied, so the advisor can see what changed and refine instead of repeating itself."""
+    captured_system: list[str] = []
+
+    def converse_fn(*, messages, system, tools, force_tool_use, model_id):
+        captured_system.append(system or "")
+        return tool_use_result(
+            "critique_response",
+            {"specific_problems": ["still missing Y"], "concrete_fix": "add Y explicitly"},
+        )
+
+    fake_bedrock = FakeBedrockClient(converse_fn=converse_fn)
+    await sb._generate_quality_gate_critique(
+        fake_bedrock,
+        None,
+        task_context="Do the task.",
+        produced_output="Second attempt — still no Y.",
+        gate_score=0.4,
+        previous_critique="FIRST_CRITIQUE_MARKER: add X.",
+        previous_output="First attempt — no X, no Y.",
+    )
+
+    assert len(captured_system) == 1
+    prompt = captured_system[0]
+    assert "SECOND FAILURE" in prompt
+    assert "FIRST_CRITIQUE_MARKER" in prompt
+    assert "First attempt — no X, no Y." in prompt
+    assert "Second attempt — still no Y." in prompt

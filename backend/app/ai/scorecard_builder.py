@@ -164,13 +164,14 @@ UPDATE_DRAFT_TOOL = ToolSpec(
                     "is required) when confirming an already-complete draft with nothing "
                     "left to change. CATEGORIES: when it's useful for the domain, organize "
                     "`kpis` into named categories (e.g. 'Schedule', 'Budget', 'Quality') — "
-                    "a category is a `level=1` KPI with `parent_name=null` and its OWN "
-                    "weight (no guidelines needed on the category itself), and each KPI "
-                    "belonging to it is a `level=2` KPI with `parent_name` set to that "
-                    "category's exact name. Category weights must sum to 100 across "
-                    "categories, and each category's own children must separately sum to "
-                    "100 within that category — the same sibling-weight-sum-to-100 rule "
-                    "applied at both levels."
+                    "a category is a `level=1` KPI with `parent_name=null` and NO weight of "
+                    "its own (omit/null `weight` — categories are purely organizational, no "
+                    "guidelines either), and each KPI belonging to it is a `level=2` KPI "
+                    "with `parent_name` set to that category's exact name AND its own "
+                    "weight. Only LEAF KPIs (ones nothing else is nested under) ever carry "
+                    "a weight — every leaf's weight must sum to 100 across the WHOLE "
+                    "scorecard (not per category) — the sibling-weight-sum-to-100 rule now "
+                    "applies globally to every leaf, never to a category."
                 ),
             },
             "confirmed": {
@@ -362,10 +363,13 @@ MAX_WEB_SEARCH_CALLS_PER_SESSION = 15
 # mechanism completely unchanged — a "category" is simply a `KpiDraft(level=1,
 # parent_name=None)`, and each KPI researched under it is a `KpiDraft(level=2,
 # parent_name=<category name>)`. No schema change of any kind; this is purely how THIS
-# generation pipeline now shapes what it proposes. Categories carry their own `weight` too
-# (summing to 100 across categories, mirroring the DB's per-parent-group sibling-weight-sum-
-# to-100 rule, which already operates generically/identically at every level of the
-# hierarchy) — see `_merge_research_kpi_batches` for exactly how that weight is derived.
+# generation pipeline now shapes what it proposes. Categories carry NO weight of their own
+# (see migration 0008_category_nodes_no_weight / draft_schema.py's "only leaf KPIs are
+# weighted" rule) — purely organizational. Each category's relative IMPORTANCE is instead
+# folded directly into its children's weights as a scaling factor (see
+# `_merge_research_kpi_batches`), so every LEAF's weight already represents its final
+# GLOBAL share of the whole scorecard, and the DB's weight-sum-to-100 rule is enforced
+# across every leaf in the scorecard version at once, not per category.
 #
 # **KPI batching** (the mechanism, carried over unchanged in spirit from before this
 # category restructure, that lets the TOTAL KPI count grow with research breadth instead of
@@ -377,8 +381,9 @@ MAX_WEB_SEARCH_CALLS_PER_SESSION = 15
 # `level=2, parent_name=<its category>` server-side (see `_validate_kpi_batch_items`) — a
 # research agent never has to (and cannot) decide its own place in the hierarchy, since it
 # IS that category's dedicated research assignment by construction. `research_kpis` merges
-# every agent's batch (cross-category dedup + per-category weight-renormalize + category-
-# level weight-renormalize + a total safety cap — see `_merge_research_kpi_batches`) directly
+# every agent's batch (cross-category dedup + per-category weight-renormalize + folding
+# each category's relative importance into its children's weights as a global scaling
+# factor + a total safety cap— see `_merge_research_kpi_batches`) directly
 # into `draft.kpis` BEFORE `propose_kpis` ever runs, so `propose_kpis`'s job shifts from
 # "generate KPIs from scratch" to "review this already-comprehensive, already-categorized,
 # already-grounded set and reconcile/confirm it with the user" (see `propose_kpis`'s own
@@ -475,6 +480,190 @@ MAX_RESEARCH_ROUNDS = 2
 # retry loops only ever engage on a REAL, successfully-obtained low score.
 MAX_QUALITY_GATE_RETRIES = 2
 
+# --- Quality-gate ADVISOR/critique step (actor-critic / Reflexion-style self-refinement) --
+#
+# Replaces the old "the score was low, improve it" generic revision note each of the 3
+# checkpoints used to feed into its retry with a concrete, specific critique produced by a
+# real LLM call — the pattern (an actor produces an attempt; a critic — here, re-using the
+# SAME actor model rather than a separate verifier model — inspects the attempt plus the
+# scorer's verdict and produces pointed feedback; the actor's NEXT attempt is conditioned on
+# that feedback) mirrors "Reflexion"-style self-refinement loops with an external judge
+# (Jev plays the role of the scorer/judge here, exactly as it already did; this step is the
+# missing "verbal reinforcement"/critique layer between a low score and the next attempt).
+#
+# Deliberately NOT a separate LangGraph node: all three checkpoints below are themselves
+# plain bounded Python retry loops living INSIDE existing node functions (research_kpis's
+# category-planning call, each concurrent research agent spawned via asyncio.gather outside
+# the graph entirely, and propose_kpis's own decision loop) rather than graph nodes/edges of
+# their own — see this module's own docstring ("propose_kpis is the one node that calls the
+# LLM..."). `_generate_quality_gate_critique` below is this same kind of unit: a shared,
+# bounded helper called from inside each of those existing retry loops, never introducing a
+# new loop or raising past itself (mirrors every other "never raise past this layer"
+# contract in this module) — so MAX_QUALITY_GATE_RETRIES stays the one hard cap on how many
+# times any checkpoint ever re-attempts anything.
+#
+# Uses the SAME Bedrock client/model (GLM-5, zai.glm-5) and the SAME force_tool_use=True
+# structured-tool-call pattern as every other call in this module — Jev/OpenRouter is a
+# pure scorer and is NEVER used to generate text (see jev_client.py's own module docstring).
+
+CRITIQUE_QUALITY_GATE_TOOL = ToolSpec(
+    name="critique_response",
+    description=(
+        "Give concrete, specific feedback on why the response below scored poorly on an "
+        "automated quality check, and exactly what to change to fix it next attempt. Cite "
+        "actual content from the response being critiqued — never a generic 'be better' or "
+        "'try harder' note that could apply to any response."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "specific_problems": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"},
+                "description": (
+                    "1-4 SPECIFIC problems with the response above, each naming something "
+                    "concrete in it (a missing element the task needed, an unsupported or "
+                    "wrong claim, something that doesn't match what was actually asked, an "
+                    "irrelevant tangent, etc.) — never a vague restatement of the score."
+                ),
+            },
+            "concrete_fix": {
+                "type": "string",
+                "description": (
+                    "A specific, actionable instruction for exactly what to do differently "
+                    "on the next attempt — concrete enough that a genuinely different "
+                    "attempt would visibly follow it, not generic advice to 'improve'."
+                ),
+            },
+        },
+        "required": ["specific_problems", "concrete_fix"],
+    },
+)
+
+_CRITIQUE_RETRY_CONTEXT_TEMPLATE = """
+
+THIS IS THE SECOND FAILURE for this task — a first critique was already given and acted on:
+
+Critique given after the FIRST failure:
+{previous_critique}
+
+What the response looked like BEFORE that first critique was applied:
+{previous_output}
+
+Despite that critique, the revised response above STILL scored below threshold. Compare \
+what actually changed (or didn't) between the before-version above and the response being \
+critiqued now, work out specifically why the earlier fix fell short or missed the point, \
+and give a REFINED critique that addresses that — do not just repeat the same advice \
+verbatim."""
+
+_CRITIQUE_SYSTEM_PROMPT_TEMPLATE = """You are the quality-gate ADVISOR for the Quality \
+Scorecard System's scorecard-design assistant. An automated quality check (Jev) just \
+scored one of the assistant's own responses {gate_score:.2f}/1.0 — below the required \
+{threshold} threshold — meaning it did not genuinely/fully satisfy the task below. Your job \
+is NOT to redo the task yourself; it is to give the assistant a concrete, specific critique \
+of exactly what is wrong with its response and exactly what to fix, so its next attempt is \
+a genuine, targeted improvement rather than a blind re-roll.
+
+TASK / instruction the response below was supposed to satisfy:
+{task_context}
+
+THE RESPONSE THAT WAS PRODUCED (scored {gate_score:.2f}/1.0, below {threshold}):
+{produced_output}
+{retry_context}
+
+Call `critique_response` exactly once with specific_problems (concrete, citing real content \
+above — never vague) and a concrete_fix (specific enough that a genuinely different next \
+attempt would follow from it)."""
+
+
+async def _generate_quality_gate_critique(
+    bedrock: BedrockClientProtocol,
+    model_id: str | None,
+    *,
+    task_context: str,
+    produced_output: str,
+    gate_score: float,
+    threshold: float = QUALITY_GATE_THRESHOLD,
+    previous_critique: str | None = None,
+    previous_output: str | None = None,
+) -> str:
+    """Actor-critic/Reflexion-style self-refinement step — see the module comment above.
+    Turns a below-threshold Jev score into a concrete, specific critique the NEXT retry
+    attempt can act on, in place of the old generic "the score was low, improve it" note.
+    Runs on the SAME GLM-5 Bedrock client/model as the rest of the chat pipeline (never
+    Jev/OpenRouter — see jev_client.py's own module docstring: Jev stays a pure scorer, never
+    a generator), via the identical `force_tool_use=True` structured-tool-call pattern used
+    everywhere else in this module.
+
+    Called only from inside an ALREADY-bounded `MAX_QUALITY_GATE_RETRIES` retry loop (the
+    three checkpoints below) — introduces no loop of its own, and never raises past itself: a
+    failed/malformed critique call just falls back to the old generic revision note so an
+    advisor-call failure can never block a turn (mirrors every other "never raise past this
+    layer" contract in this module, e.g. `_run_research_agent`'s own whole-agent try/except).
+
+    `previous_critique`/`previous_output` are set only on the SECOND failure of the same
+    task (i.e. the retry attempt that had already applied the FIRST critique also failed its
+    gate) — `previous_output` is what the response looked like BEFORE that first critique,
+    so the advisor can see what the model actually changed in response to it and refine the
+    critique instead of repeating the same advice (exactly what the task asked for: "point
+    out specifically why the fix still fell short and refine the critique further")."""
+    retry_context = ""
+    if previous_critique and previous_output is not None:
+        retry_context = _CRITIQUE_RETRY_CONTEXT_TEMPLATE.format(
+            previous_critique=previous_critique, previous_output=previous_output
+        )
+    system_prompt = _CRITIQUE_SYSTEM_PROMPT_TEMPLATE.format(
+        gate_score=gate_score,
+        threshold=threshold,
+        task_context=task_context or "(nothing yet)",
+        produced_output=produced_output or "(empty)",
+        retry_context=retry_context,
+    )
+    fallback = (
+        f"An automated quality check scored your previous response {gate_score:.2f}/1.0 "
+        f"(threshold {threshold}). Reconsider it carefully and provide a genuinely improved "
+        "response that more fully and correctly addresses the task above."
+    )
+    try:
+        result = await asyncio.to_thread(
+            bedrock.converse,
+            messages=[{"role": "user", "content": [{"text": "Critique the response above."}]}],
+            system=system_prompt,
+            tools=[CRITIQUE_QUALITY_GATE_TOOL],
+            force_tool_use=True,
+            model_id=model_id,
+        )
+    except Exception:  # noqa: BLE001 — an advisor-call failure must never block a retry
+        logger.warning(
+            "quality-gate critique call failed; falling back to a generic revision note.", exc_info=True
+        )
+        return fallback
+
+    if not (result.is_tool_use and result.tool_name == "critique_response"):
+        logger.warning(
+            "quality-gate critique call returned no usable critique_response tool call "
+            "(stop_reason=%r); falling back to a generic revision note.",
+            getattr(result, "stop_reason", None),
+        )
+        return fallback
+
+    data = result.tool_input or {}
+    problems = [str(p).strip() for p in (data.get("specific_problems") or []) if str(p).strip()]
+    fix = str(data.get("concrete_fix") or "").strip()
+    if not (problems or fix):
+        return fallback
+
+    lines = [
+        f"An automated quality check scored your previous response {gate_score:.2f}/1.0 "
+        f"(threshold {threshold}). Here is specifically what fell short and what to fix:"
+    ]
+    lines.extend(f"- {p}" for p in problems)
+    if fix:
+        lines.append(f"What to do differently now: {fix}")
+    return "\n".join(lines)
+
+
 DECIDE_CATEGORIES_TOOL = ToolSpec(
     name="decide_categories",
     description=(
@@ -518,13 +707,14 @@ DECIDE_CATEGORIES_TOOL = ToolSpec(
                         "initial_weight": {
                             "type": ["number", "null"],
                             "description": (
-                                "OPTIONAL relative weight (0-100) for this category among "
+                                "OPTIONAL relative IMPORTANCE (0-100) of this category among "
                                 "the OTHERS you're deciding now (e.g. Quality might "
-                                "reasonably outweigh Schedule for a milestone scorecard). "
-                                "Every category's weight is renormalized to sum to 100 "
-                                "once research is in, so this only needs to be your best "
-                                "relative judgment now — omit/null for an equal default "
-                                "share instead."
+                                "reasonably outweigh Schedule for a milestone scorecard) — "
+                                "NOT a weight stored on the category itself (categories have "
+                                "no weight of their own); it is only a scaling factor folded "
+                                "into this category's own KPIs' weights once research is in, "
+                                "so this only needs to be your best relative judgment now — "
+                                "omit/null for an equal default share instead."
                             ),
                         },
                     },
@@ -934,12 +1124,17 @@ async def _decide_categories_with_gate(
     best_categories: list[dict[str, Any]] = []
     best_score = -1.0
     revision_feedback: str | None = None
+    # Tracks the PREVIOUS attempt's rendered plan text, so a second-failure critique can see
+    # what actually changed in response to the first critique (see
+    # `_generate_quality_gate_critique`'s own docstring).
+    previous_categories_text: str | None = None
 
     for attempt in range(MAX_QUALITY_GATE_RETRIES + 1):
         categories = await asyncio.to_thread(
             _decide_categories, bedrock, model_id, draft, conversation_context, revision_feedback
         )
-        gate = await quality_gate(jev_client, instruction=instruction, answer=_categories_to_gate_text(categories))
+        categories_text = _categories_to_gate_text(categories)
+        gate = await quality_gate(jev_client, instruction=instruction, answer=categories_text)
 
         if gate.degraded:
             await emit_turn_event(
@@ -966,14 +1161,19 @@ async def _decide_categories_with_gate(
                 f"Quality check scored {gate.score:.2f} (below {QUALITY_GATE_THRESHOLD}) — "
                 "revising the category plan…",
             )
-            revision_feedback = (
-                f"An automated quality check scored your previous KPI-category plan "
-                f"{gate.score:.2f}/1.0 (threshold {QUALITY_GATE_THRESHOLD}) for how well it "
-                "serves the user's actual request. Reconsider whether your chosen categories "
-                "genuinely match what the user asked for (business-recognizable groupings, "
-                "not abstract research topics), and revise the categories and/or their "
-                "focus wording before deciding again."
+            # Advisor/critique step (see the module comment above MAX_QUALITY_GATE_RETRIES):
+            # a concrete, specific critique of THIS plan in place of a generic "try harder"
+            # note — on the second failure, also carries what the first critique suggested
+            # and what actually changed, so the critique is refined rather than repeated.
+            revision_feedback = await _generate_quality_gate_critique(
+                bedrock, model_id,
+                task_context=instruction,
+                produced_output=categories_text,
+                gate_score=gate.score,
+                previous_critique=revision_feedback,
+                previous_output=previous_categories_text,
             )
+            previous_categories_text = categories_text
 
     await emit_turn_event(
         session_id, turn_started_at, "master", "quality_gate",
@@ -1145,6 +1345,10 @@ async def _run_research_agent(
         best_finding: ResearchFinding | None = None
         best_score = -1.0
         revision_feedback: str | None = None
+        # Tracks the PREVIOUS attempt's rendered finding text, so a second-failure critique
+        # can see what actually changed in response to the first critique (see
+        # `_generate_quality_gate_critique`'s own docstring).
+        previous_finding_text: str | None = None
 
         # Outer loop = quality-gate checkpoint 2's bounded retry (see the module comment
         # above MAX_QUALITY_GATE_RETRIES); inner `while True` = the UNCHANGED bounded
@@ -1260,9 +1464,8 @@ async def _run_research_agent(
                 f'This research agent\'s assigned category: "{category}"\n'
                 f'Specific research focus: "{focus}"'
             )
-            gate = await quality_gate(
-                jev_client, instruction=gate_instruction, answer=_finding_to_gate_text(candidate)
-            )
+            finding_text = _finding_to_gate_text(candidate)
+            gate = await quality_gate(jev_client, instruction=gate_instruction, answer=finding_text)
 
             if gate.degraded:
                 await emit_turn_event(
@@ -1299,13 +1502,19 @@ async def _run_research_agent(
                 local_messages.append(
                     {"role": "assistant", "content": [{"text": f"[recorded finding] {json.dumps(data)}"}]}
                 )
-                revision_feedback = (
-                    f"An automated quality check scored your recorded finding {gate.score:.2f}/1.0 "
-                    f"(threshold {QUALITY_GATE_THRESHOLD}) for how well it matches your assigned category "
-                    f'"{category}" (focus: "{focus}"). Research further (use any remaining '
-                    "web_search budget) and call record_research_finding again with an improved, "
-                    "more relevant finding."
+                # Advisor/critique step (see the module comment above
+                # MAX_QUALITY_GATE_RETRIES): a concrete, specific critique of THIS finding
+                # in place of a generic "research further" note — on the second failure,
+                # also carries what the first critique suggested and what actually changed.
+                revision_feedback = await _generate_quality_gate_critique(
+                    bedrock, model_id,
+                    task_context=gate_instruction,
+                    produced_output=finding_text,
+                    gate_score=gate.score,
+                    previous_critique=revision_feedback,
+                    previous_output=previous_finding_text,
                 )
+                previous_finding_text = finding_text
                 local_messages.append({"role": "user", "content": [{"text": revision_feedback}]})
                 continue
 
@@ -1543,14 +1752,16 @@ def _dedupe_kpi_batch_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]
 def _normalize_weights_to_100(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Proportionally rescales every `included_in_scoring` item's `weight` so the set sums
     to 100 — a mechanical starting point, not a qualitative judgment. Generic over WHICH
-    sibling group it's applied to: `_merge_research_kpi_batches` below calls this once per
-    category (to renormalize that category's children) and once more across the surviving
-    categories themselves (to renormalize their own top-level weights) — exactly the DB's
-    own per-parent-group sibling-weight-sum-to-100 rule, applied at whichever level is
-    relevant, the same helper either way. Mirrors `redistributeWeight`'s "remainder on the
-    largest" rounding-drift fix in `frontend/lib/kpi-tree.ts`. Items with
-    `included_in_scoring=False` are left untouched (not part of the sum-to-100 group at
-    all — see migration 0005_scoring_formula_and_kpi_flags)."""
+    group of LEAF items it's applied to: `_merge_research_kpi_batches` below calls this
+    once per category (to renormalize that category's own children relative to each
+    other) and once more across ALL surviving leaves together, across every category, to
+    land the WHOLE scorecard's leaf weights on exactly 100 (categories themselves are
+    never passed to this function — they carry no weight at all; see migration
+    0008_category_nodes_no_weight) — the same helper either way. Mirrors
+    `redistributeWeight`'s "remainder on the largest" rounding-drift fix in
+    `frontend/lib/kpi-tree.ts`. Items with `included_in_scoring=False` are left untouched
+    (not part of the sum-to-100 group at all — see migration
+    0005_scoring_formula_and_kpi_flags)."""
     included = [it for it in items if it.get("included_in_scoring", True)]
     total = sum(float(it.get("weight") or 0) for it in included)
     if total <= 0:
@@ -1585,19 +1796,26 @@ def _merge_research_kpi_batches(
        decides which category a cross-category duplicate survives under.
     3. Caps the total at MAX_TOTAL_MERGED_KPIS (a safety ceiling, NOT a fixed target).
     4. Groups the survivors by their (surviving) category and renormalizes each category's
-       children to sum to 100 WITHIN that category — mirrors the DB's own per-parent-group
-       weight-sum rule. A category that ends up with ZERO surviving children (e.g. every
-       one of its proposed KPIs lost a cross-category dedup to another category) is dropped
-       entirely — this function never emits an empty, childless "category" parent node,
-       since that would itself become a leaf with no guidelines and nothing to score.
-    5. Builds the Level-1 category `KpiDraft` dict for every category that still has at
-       least one surviving child: `weight` is that category's `initial_weight` guess (see
-       `category_meta`, sourced from `decide_categories`/`assess_research_coverage`'s
-       optional `initial_weight` field) if one was given, else an equal default share —
-       either way, every surviving category's weight is then renormalized together to sum
-       to 100 (same `_normalize_weights_to_100` helper, applied once more at the category
-       level), so an explicit guess and the default both end up rescaled consistently
-       rather than one winning outright over the other.
+       children to sum to 100 WITHIN that category — a relative-emphasis judgment among a
+       category's own KPIs, grounded in that category's research. A category that ends up
+       with ZERO surviving children (e.g. every one of its proposed KPIs lost a
+       cross-category dedup to another category) is dropped entirely — this function never
+       emits an empty, childless "category" parent node, since that would itself become a
+       leaf with no guidelines and nothing to score.
+    5. Categories themselves get NO weight at all (see migration
+       0008_category_nodes_no_weight / draft_schema.py's "only leaf KPIs are weighted"
+       rule) — purely organizational. To still honor each category's relative IMPORTANCE
+       (e.g. Quality should usually outweigh Schedule for a milestone scorecard) without
+       storing a weight on the category node itself, each category's `initial_weight`
+       guess (see `category_meta`, sourced from `decide_categories`/
+       `assess_research_coverage`'s optional `initial_weight` field — an equal default
+       share if none was given) is used purely as a SCALING FACTOR: every child's
+       in-category-normalized weight is scaled down by that category's renormalized share
+       of the whole scorecard, so the LEAVES end up carrying their final GLOBAL weight
+       directly. Every leaf across every surviving category is then renormalized together
+       ONE MORE time so the full leaf set lands exactly on 100 (the DB's weight-sum rule is
+       now global across every leaf in a scorecard version, not per category — see that
+       migration), fixing any rounding drift from the two prior normalization passes.
 
     `category_meta` accumulates across every research round in `research_kpis` (keyed by
     category name — see that function), so a round-2 "deepen an existing category" finding
@@ -1628,16 +1846,30 @@ def _merge_research_kpi_batches(
     if not surviving_names:
         return []
 
-    default_weight = 100.0 / len(surviving_names)
+    default_share = 100.0 / len(surviving_names)
+    raw_shares: dict[str, float] = {}
+    for name in surviving_names:
+        initial_weight = (category_meta.get(name) or {}).get("initial_weight")
+        raw_shares[name] = float(initial_weight) if initial_weight is not None else default_share
+    share_total = sum(raw_shares.values()) or 1.0
+    # Each category's renormalized share (0-100) of the WHOLE scorecard — a scaling
+    # factor only, never stored as any node's own weight.
+    shares = {name: (raw_shares[name] / share_total) * 100.0 for name in surviving_names}
+
     children: list[dict[str, Any]] = []
     category_nodes: list[dict[str, Any]] = []
     for name in surviving_names:
-        children.extend(_normalize_weights_to_100(by_category[name]))
-        initial_weight = (category_meta.get(name) or {}).get("initial_weight")
+        category_children = _normalize_weights_to_100(by_category[name])
+        scale = shares[name] / 100.0
+        for child in category_children:
+            if child.get("included_in_scoring", True):
+                child = dict(child)
+                child["weight"] = round(float(child.get("weight") or 0) * scale, 2)
+            children.append(child)
         category_nodes.append(
             {
                 "name": name,
-                "weight": float(initial_weight) if initial_weight is not None else default_weight,
+                "weight": None,
                 "level": 1,
                 "parent_name": None,
                 "included_in_scoring": True,
@@ -1645,7 +1877,7 @@ def _merge_research_kpi_batches(
             }
         )
 
-    return [*_normalize_weights_to_100(category_nodes), *children]
+    return [*category_nodes, *_normalize_weights_to_100(children)]
 
 
 def _web_search_usable(client: WebSearchClientProtocol | None) -> bool:
@@ -2027,21 +2259,22 @@ question the user can answer."
 
 If the draft already has KPIs (e.g. merged in from the multi-agent research fan-out that \
 ran before your first turn this session — organized into named CATEGORIES, each a Level-1 \
-KPI with its own weight, grouping its Level-2 children, each child already has a name, \
-weight, and full 11-level guidelines, grounded in real research), your job THIS TURN is \
-RECONCILIATION, not fresh generation: review the set for genuine quality/coverage gaps or \
-true near-duplicates (within a category AND across categories), do a final sanity pass on \
-the weights (every sibling group — the categories themselves, AND each category's own \
-children — must separately sum to 100, see "Fields still missing/incomplete" below), and \
-present it to the user for confirmation/adjustment via ask_clarification rather than \
-inventing an entirely new KPI list from scratch. PRESERVE the existing category structure \
-(each KPI's `level`/`parent_name`) exactly as merged unless the user explicitly asks you to \
-regroup something — never flatten an already-categorized KPI back to a bare top-level item. \
-Only propose ADDITIONAL new KPIs via update_draft if there is a real, identified coverage \
-gap the research didn't touch, and when you do, nest each new KPI under the MOST FITTING \
-existing category (`parent_name` = that category's exact name, `level=2`) rather than \
-appending it flat — only introduce a genuinely new category (a new `level=1` KPI of its \
-own, with a weight, and the merged category set's weights re-summed to 100) if the gap \
+KPI with NO weight of its own, grouping its Level-2 children, each child already has a \
+name, weight, and full 11-level guidelines, grounded in real research), your job THIS TURN \
+is RECONCILIATION, not fresh generation: review the set for genuine quality/coverage gaps \
+or true near-duplicates (within a category AND across categories), do a final sanity pass \
+on the weights (every LEAF KPI across the WHOLE draft — regardless of which category it's \
+nested under — must together sum to 100; categories themselves never have a weight, see \
+"Fields still missing/incomplete" below), and present it to the user for confirmation/ \
+adjustment via ask_clarification rather than inventing an entirely new KPI list from \
+scratch. PRESERVE the existing category structure (each KPI's `level`/`parent_name`) \
+exactly as merged unless the user explicitly asks you to regroup something — never flatten \
+an already-categorized KPI back to a bare top-level item. Only propose ADDITIONAL new KPIs \
+via update_draft if there is a real, identified coverage gap the research didn't touch, and \
+when you do, nest each new KPI under the MOST FITTING existing category (`parent_name` = \
+that category's exact name, `level=2`) rather than appending it flat — only introduce a \
+genuinely new category (a new `level=1` KPI of its own, with NO weight, whose children's \
+weights you then fold into the full leaf set so it still re-sums to 100 overall) if the gap \
 truly doesn't belong under any category already present. Do not discard or rewrite an \
 already-researched KPI's guidelines just to "improve" them unless the user specifically \
 asked you to change that KPI. If the ONLY thing missing is a scalar field (name/purpose/\
@@ -2057,9 +2290,9 @@ was skipped), prefer `update_draft` with your own best-guess proposal before you
 `ask_clarification` (LLM first, human second — propose candidate KPIs from what the user \
 already told you, then ask about what's genuinely ambiguous or missing). Where it's \
 genuinely useful for the domain, organize your proposal into named categories the same way \
-(a Level-1 KPI per category with its own weight, Level-2 KPIs nested under it via \
-`parent_name`) rather than one flat list — a flat list is still fine for a domain simple \
-enough that categorization wouldn't add real clarity.
+(a Level-1 KPI per category with NO weight of its own, Level-2 KPIs nested under it via \
+`parent_name` each carrying its own weight) rather than one flat list — a flat list is \
+still fine for a domain simple enough that categorization wouldn't add real clarity.
 
 When a `web_search` tool is available to you, use it to research real industry KPIs, \
 published standards, and benchmark thresholds for the user's stated domain BEFORE \
@@ -2376,6 +2609,11 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
     best_pending_tool: dict[str, Any] | None = None
     best_assistant_note: str | None = None
     best_gate_score = -1.0
+    revision_critique: str | None = None
+    # Tracks the PREVIOUS attempt's rendered decision text, so a second-failure critique can
+    # see what actually changed in response to the first critique (see
+    # `_generate_quality_gate_critique`'s own docstring).
+    previous_gate_answer: str | None = None
 
     for gate_attempt in range(MAX_QUALITY_GATE_RETRIES + 1):
         result = None
@@ -2561,16 +2799,22 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
                     f"Quality check scored {gate.score:.2f} (below {QUALITY_GATE_THRESHOLD}) — "
                     "revising the response…",
                 )
+                # Advisor/critique step (see the module comment above
+                # MAX_QUALITY_GATE_RETRIES): a concrete, specific critique of THIS decision
+                # in place of the old generic "reconsider and improve" note — on the second
+                # failure, also carries what the first critique suggested and what actually
+                # changed, so the critique is refined rather than repeated.
+                revision_critique = await _generate_quality_gate_critique(
+                    bedrock, model_id,
+                    task_context=gate_instruction,
+                    produced_output=gate_answer,
+                    gate_score=gate.score,
+                    previous_critique=revision_critique,
+                    previous_output=previous_gate_answer,
+                )
+                previous_gate_answer = gate_answer
                 local_messages.append(
-                    {
-                        "role": "tool",
-                        "content": (
-                            f"[quality gate] Your last {result.tool_name} response scored "
-                            f"{gate.score:.2f}/1.0 (threshold {QUALITY_GATE_THRESHOLD}) on an "
-                            "automated check of how well it serves the user's actual request. "
-                            "Reconsider and provide a genuinely improved response now."
-                        ),
-                    }
+                    {"role": "tool", "content": f"[quality gate] {revision_critique}"}
                 )
                 continue
 
