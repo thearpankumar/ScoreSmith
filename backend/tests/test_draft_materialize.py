@@ -22,10 +22,11 @@ _VALID_DRAFT = {
     "target_score": 8,
     "kpis": [
         {
+            # "Accuracy" is referenced as "Grammar"'s parent below, so it's a
+            # category/grouping node — NO weight and no guidelines of its own (see
+            # migration 0008_category_nodes_no_weight / draft_schema.py).
             "name": "Accuracy",
-            "weight": 60,
             "level": 1,
-            "guidelines": {"10": {"qualitative_text": "Fully accurate."}, "0": {"qualitative_text": "Wrong."}},
         },
         {
             "name": "Tone",
@@ -34,8 +35,10 @@ _VALID_DRAFT = {
             "guidelines": {"10": {"qualitative_text": "Perfectly polite."}, "0": {"qualitative_text": "Rude."}},
         },
         {
+            # Leaf KPIs are weighted GLOBALLY across the whole draft (not per category) —
+            # Tone (40) + Grammar (60) = 100.
             "name": "Grammar",
-            "weight": 100,
+            "weight": 60,
             "level": 2,
             "parent_name": "Accuracy",
             "guidelines": {"10": {"qualitative_text": "No errors."}},
@@ -67,9 +70,16 @@ async def test_materialize_confirmed_draft_creates_full_hierarchy(async_db_sessi
     assert len(nodes) == 3
     grammar = next(n for n in nodes if n.name == "Grammar")
     accuracy = next(n for n in nodes if n.name == "Accuracy")
+    tone = next(n for n in nodes if n.name == "Tone")
     assert grammar.parent_id == accuracy.id
     assert grammar.level == 2
     assert str(grammar.path).startswith(str(accuracy.path))
+    # "Accuracy" is a category/grouping node (Grammar's parent) — stored with NO weight at
+    # all (see migration 0008_category_nodes_no_weight); only the LEAF KPIs (Tone, Grammar)
+    # carry a real weight, and together they sum to 100 across the whole scorecard.
+    assert accuracy.weight is None
+    assert float(grammar.weight) == 60
+    assert float(tone.weight) == 40
 
 
 async def test_materialize_rejects_incomplete_draft_before_touching_db(async_db_session) -> None:

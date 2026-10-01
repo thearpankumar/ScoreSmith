@@ -156,7 +156,26 @@ def evaluate(formula: str, kpi_scores: dict[str, float]) -> float:
                 "which doesn't apply to KPI scores). Use ** for exponentiation instead."
             ) from exc
         raise FormulaError(f"Formula evaluation error: {exc}") from exc
-    except (FunctionNotDefined, NameNotDefined, InvalidExpression, KeyError, ZeroDivisionError, ValueError) as exc:
+    except (
+        FunctionNotDefined,
+        NameNotDefined,
+        InvalidExpression,
+        KeyError,
+        ZeroDivisionError,
+        # `simpleeval`'s own `safe_power` guard (MAX_POWER) only rejects a huge BASE or
+        # EXPONENT (preventing e.g. `9**9**9` computational-DoS); it does NOT protect
+        # against a perfectly reasonable-looking exponent (well under that threshold)
+        # whose RESULT simply exceeds a float's range — Python's own `**`/`*` then raises
+        # a plain OverflowError, which is an ArithmeticError/ValueError SIBLING, not a
+        # ValueError subclass, so it must be listed explicitly here or it escapes
+        # uncaught (confirmed live: `kpi["Accuracy"] ** 400` with a real score around 8-10
+        # raised an unhandled OverflowError here before this fix — importantly, `validate()`
+        # dry-runs against dummy mid-scale scores (5.0), which does NOT overflow, so this
+        # bug let an overflowing formula be saved as "valid" and only crash later, during a
+        # REAL evaluation with an actual high KPI score).
+        OverflowError,
+        ValueError,
+    ) as exc:
         raise FormulaError(f"Formula evaluation error: {exc}") from exc
 
     try:

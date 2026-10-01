@@ -64,7 +64,14 @@ export interface KpiNode {
   level: 1 | 2 | 3 | 4;
   name: string;
   description?: string;
-  weight: number; // percentage points, siblings should sum to 100
+  /**
+   * Percentage points. `null` for a category/grouping node (one or more OTHER KpiNodes
+   * reference it as their `parentId`) — categories are purely organizational and carry no
+   * weight of their own. Only LEAF nodes (no children) have a real weight, and every leaf
+   * in the same scorecard version sums to 100 TOGETHER (not per immediate parent group —
+   * see backend migration 0008_category_nodes_no_weight / `lib/kpi-tree.ts`).
+   */
+  weight: number | null;
   displayOrder: number;
   guidelines?: Guideline[]; // only present on leaf (scored) KPIs
   /** When false, this KPI is tracked/scored but excluded from the sibling
@@ -237,7 +244,8 @@ export type DraftKpiStatus = "proposed" | "confirmed";
 export interface DraftKpi {
   id: string;
   name: string;
-  weight: number;
+  /** `null` for a category/grouping node — see `KpiNode.weight`'s own docstring. */
+  weight: number | null;
   level: 1 | 2 | 3 | 4;
   parentId: string | null;
   status: DraftKpiStatus;

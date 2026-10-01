@@ -59,7 +59,10 @@ def draft_from_scorecard(
         kpis.append(
             {
                 "name": name_by_id[node.id],
-                "weight": float(node.weight),
+                # A category/grouping node (see migration 0008_category_nodes_no_weight)
+                # stores weight=NULL in the DB — pass it through as None rather than
+                # crashing on float(None); only leaf KPIs ever have a real weight here.
+                "weight": float(node.weight) if node.weight is not None else None,
                 "level": node.level,
                 "parent_name": name_by_id.get(node.parent_id) if node.parent_id else None,
                 "included_in_scoring": bool(node.included_in_scoring),
@@ -170,6 +173,10 @@ async def materialize_draft(
     node_ids: dict[str, uuid.UUID] = {kpi.name: uuid.uuid4() for kpi in draft.kpis}
     path_by_name: dict[str, str] = {}
     level_by_name: dict[str, int] = {}
+    # A KPI referenced as some OTHER KPI's `parent_name` is a category/grouping node — it
+    # gets no weight at all (see migration 0008_category_nodes_no_weight /
+    # draft_schema.py's own "only leaf KPIs are weighted" rule), never a made-up value.
+    category_names = {kpi.parent_name for kpi in draft.kpis if kpi.parent_name}
 
     for kpi in sorted(draft.kpis, key=lambda k: k.level):
         node_id = node_ids[kpi.name]
@@ -187,6 +194,18 @@ async def materialize_draft(
         path_by_name[kpi.name] = path
         level_by_name[kpi.name] = level
 
+        is_category = kpi.name in category_names
+        if is_category:
+            # Purely organizational grouping node — no weight at all, regardless of
+            # whatever (if anything) the draft happened to carry for it.
+            node_weight = None
+        else:
+            # Leaf KPI: `is_complete()`/materialize_draft's own precondition already
+            # guarantees a real weight was set before this point (see
+            # ScorecardDraft.missing_fields()) — the `0` fallback is only a defensive
+            # safety net for a caller that bypasses that check.
+            node_weight = kpi.weight if kpi.weight is not None else 0
+
         node = KpiNode(
             id=node_id,
             scorecard_version_id=version.id,
@@ -194,7 +213,7 @@ async def materialize_draft(
             path=Ltree(path),
             level=level,
             name=kpi.name,
-            weight=kpi.weight if kpi.weight is not None else 0,
+            weight=node_weight,
             display_order=0,
             included_in_scoring=kpi.included_in_scoring,
         )

@@ -9,15 +9,18 @@ the rating" the product asks for). Every KPI's ensemble runs concurrently with e
 KPI's, and within an ensemble the 3 calls also run concurrently — all via `asyncio.gather`.
 
 Only **leaf** KPI nodes are judged directly (an internal Level1-3 node exists purely to
-group its children — it has no guidelines of its own to score against). The weighted
+group its children — it has no guidelines, and no WEIGHT, of its own to score against —
+see migration 0008_category_nodes_no_weight / `app/ai/draft_schema.py`). The weighted
 final score is the sum, over every leaf, of `leaf.score * leaf.effective_weight`, where
-`effective_weight` is the product of `weight/100` along the full root-to-leaf path — the
-correct generalization of "weights sum to 100 per sibling group" to a nested hierarchy
-(each level's weight is only relative to its own siblings, so a leaf's true share of the
-*whole* scorecard is the product of its own weight fraction and every ancestor's weight
-fraction). Because every sibling group in a complete scorecard sums to 100, the leaves'
-effective weights always sum to 1.0, so this is a proper weighted average with no
-additional normalization needed.
+`effective_weight` is simply `leaf.weight / 100` directly — NOT a product along the
+root-to-leaf path. Category/grouping nodes at any depth carry no weight at all, so there
+is no ancestor chain to multiply through any more: the DB's weight-sum trigger enforces
+that every LEAF's weight sums to 100 across the WHOLE scorecard version (regardless of
+which category, if any, it's nested under — see that migration's own docstring), which is
+exactly what makes a flat `weight / 100` each leaf's true share of the whole scorecard.
+Because every leaf in a complete scorecard sums to 100 together, the leaves' effective
+weights always sum to 1.0, so this is still a proper weighted average with no additional
+normalization needed.
 
 Ensemble voting (k=3, median aggregation): a single LLM-judge call is a noisy point
 estimate — both from sampling variance AND from a stable, model-specific position/order
@@ -169,7 +172,10 @@ def leaf_nodes(nodes: list[KpiNode]) -> list[KpiNode]:
 
 
 def effective_leaf_weights(nodes: list[KpiNode]) -> dict[uuid.UUID, float]:
-    """Root-to-leaf product of weight/100 for every leaf node (see module docstring).
+    """A leaf's effective weight is simply its OWN `weight / 100` (see module docstring) —
+    category/grouping nodes (any node with children, at any depth) carry no weight of
+    their own at all (see migration 0008_category_nodes_no_weight), so there is no
+    ancestor chain left to multiply through.
 
     A leaf with `included_in_scoring=False` (see migration
     0005_scoring_formula_and_kpi_flags) is OMITTED from the returned dict entirely — it is
@@ -178,19 +184,11 @@ def effective_leaf_weights(nodes: list[KpiNode]) -> dict[uuid.UUID, float]:
     weighted-average formula. This is the one shared definition `compute_weighted_score`
     (below), the frontend's mirror (`lib/kpi-tree.ts::effectiveLeafWeights`), and the DB's
     own weight-sum trigger all agree with."""
-    by_id = {n.id: n for n in nodes}
-    memo: dict[uuid.UUID, float] = {}
-
-    def weight_of(node_id: uuid.UUID) -> float:
-        if node_id in memo:
-            return memo[node_id]
-        node = by_id[node_id]
-        own = float(node.weight) / 100.0
-        result = own if node.parent_id is None else own * weight_of(node.parent_id)
-        memo[node_id] = result
-        return result
-
-    return {leaf.id: weight_of(leaf.id) for leaf in leaf_nodes(nodes) if leaf.included_in_scoring}
+    return {
+        leaf.id: float(leaf.weight or 0) / 100.0
+        for leaf in leaf_nodes(nodes)
+        if leaf.included_in_scoring
+    }
 
 
 def compute_weighted_score(
@@ -307,7 +305,7 @@ async def _judge_one_kpi_call(
     `_judge_kpi_ensemble` below — never called with fewer/more than that context."""
     guideline_text = _format_guidelines(ordered_guidelines)
     prompt = (
-        f"KPI: {kpi.name} (weight {kpi.weight}% among its siblings)\n\n"
+        f"KPI: {kpi.name} (weight {kpi.weight}% of the whole scorecard)\n\n"
         f"Guideline rungs (0-10, listed in no particular order of merit — read every "
         f"rung and match on substance, not position in this list):\n{guideline_text}\n\n"
         f"Shared evidence extracted from the input:\n{shared_evidence}\n\n"

@@ -20,10 +20,15 @@ class KpiNode(UUIDPKMixin, TimestampMixin, Base):
     """A node in the (max depth 4) KPI/parameter hierarchy for one scorecard version.
 
     `path` is a Postgres `ltree` materialized path (e.g. "root.kpi1.subkpi2"), giving
-    O(1) ancestor lookups and fast GiST-indexed subtree queries. Sibling `weight` values
-    (same `parent_id`, or same `scorecard_version_id` for roots) must sum to 100 — enforced
-    by a deferred constraint trigger at the DB layer (see Alembic migration), since a plain
-    CHECK constraint cannot aggregate across sibling rows.
+    O(1) ancestor lookups and fast GiST-indexed subtree queries.
+
+    `weight` is nullable: only LEAF nodes (no other `kpi_nodes` row references this one as
+    `parent_id`) carry a weight. A node WITH children is a category/grouping node — purely
+    organizational (name + grouping only), never weighted (see migration
+    0008_category_nodes_no_weight and `app/ai/draft_schema.py`). Every LEAF `weight` in the
+    SAME `scorecard_version_id` (regardless of nesting/category) must sum to 100 —
+    enforced by a deferred constraint trigger at the DB layer (see that migration), since a
+    plain CHECK constraint cannot aggregate across rows.
     """
 
     __tablename__ = "kpi_nodes"
@@ -44,7 +49,7 @@ class KpiNode(UUIDPKMixin, TimestampMixin, Base):
     path: Mapped[str] = mapped_column(LtreeType, nullable=False)
     level: Mapped[int] = mapped_column(Integer, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    weight: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False)
+    weight: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # When False, this KPI is tracked/scored (its value is still recorded on an
     # evaluation) but excluded from the sibling weight-sum-to-100 rule AND from the

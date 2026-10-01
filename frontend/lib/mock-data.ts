@@ -872,7 +872,7 @@ const eval4Results: EvaluationKpiResult[] = leafKpiNodesOf(sc2KpiNodes).map((kpi
   kpiName: kpi.name,
   kpiPath: kpi.path,
   level: kpi.level,
-  weight: kpi.weight,
+  weight: kpi.weight ?? 0,
   score: eval4LeafScores[kpi.id],
   matchedGuidelineLevel: eval4LeafScores[kpi.id],
   matchedGuidelineText:

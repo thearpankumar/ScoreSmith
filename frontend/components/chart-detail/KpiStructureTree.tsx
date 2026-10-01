@@ -43,6 +43,7 @@ import {
   buildKpiTree,
   effectiveLeafWeights,
   guidelineCoverage,
+  leafDescendantsWeightSum,
   redistributeWeight,
   siblingWeightSum,
   type NestedKpiNode,
@@ -62,7 +63,6 @@ export interface StructureEditing {
 
 const MAX_LEVEL = 4;
 const ROOT = "__root__";
-const groupKey = (parentId: string | null) => parentId ?? ROOT;
 
 /**
  * The scorecard's full KPI hierarchy on the Overview tab: every node (L1->L4) as an
@@ -73,13 +73,18 @@ const groupKey = (parentId: string | null) => parentId ?? ROOT;
  *
  * EDIT MODE (when `editing.canEdit`): rename KPIs, rebalance weights, add/delete KPIs and
  * write guideline text — each wired straight to the real CRUD routes (no AI involved).
- * The DB enforces "every sibling group sums to 100" at commit, so:
- *  - weight edits are staged locally per sibling group, validated live with the same
- *    `siblingWeightSum` rule the chat live preview uses, and saved in one atomic call
- *    that is only enabled once every touched group is back at exactly 100%;
- *  - a new KPI joins its group at 0% (or 100% if it's the first child), then you
- *    rebalance;
- *  - deleting a weighted KPI first moves its weight proportionally onto its siblings.
+ * Only LEAF KPIs (no children) are weighted at all — a category/grouping node is purely
+ * organizational (name + grouping only) and shows no weight field (see backend migration
+ * 0008_category_nodes_no_weight). The DB enforces "every LEAF in the scorecard version
+ * sums to 100 together" at commit (no longer per immediate sibling group — see
+ * `lib/kpi-tree.ts`), so:
+ *  - weight edits are staged locally and validated live, as ONE global set, with the same
+ *    `siblingWeightSum` rule the chat live preview uses, saved in one atomic call that is
+ *    only enabled once every leaf KPI together is back at exactly 100%;
+ *  - a new leaf KPI starts at 0% (or 100% if it's the very first KPI in the scorecard),
+ *    then you rebalance;
+ *  - deleting a weighted leaf KPI first moves its weight proportionally onto its
+ *    immediate siblings (if any).
  *
  * Solid surface (dense data), consistent with KpiTreeTable/GuidelinesMatrix.
  */
@@ -115,30 +120,19 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
     return next;
   };
 
-  const weightOf = (n: KpiNode) => (n.id in staged ? staged[n.id] : n.weight);
+  const weightOf = (n: KpiNode): number => (n.id in staged ? staged[n.id] : (n.weight ?? 0));
   const siblingsOf = (parentId: string | null) => kpiNodes.filter((n) => n.parentId === parentId);
+  const isLeafNode = (n: KpiNode) => !kpiNodes.some((c) => c.parentId === n.id);
 
-  // Sibling groups with unsaved weight edits, each validated with the shared rule.
-  const changedGroups = useMemo(() => {
-    const keys = new Set(
-      Object.keys(staged)
-        .map((id) => kpiNodes.find((n) => n.id === id))
-        .filter((n): n is KpiNode => !!n)
-        .map((n) => groupKey(n.parentId)),
-    );
-    return Array.from(keys).map((key) => {
-      const parentId = key === ROOT ? null : key;
-      // Excluded (includedInScoring=false) siblings don't count toward or constrain the
-      // group's 100% total — mirrors the backend trigger (see migration
-      // 0005_scoring_formula_and_kpi_flags) and validateSiblingWeights above.
-      const members = kpiNodes.filter((n) => n.parentId === parentId && n.includedInScoring);
-      const check = siblingWeightSum(members.map((m) => (m.id in staged ? staged[m.id] : m.weight)));
-      const parentName = parentId ? (kpiNodes.find((n) => n.id === parentId)?.name ?? "Unknown") : "Top level";
-      return { key, parentName, ...check };
-    });
-  }, [staged, kpiNodes]);
+  // Every LEAF KPI in the WHOLE tree is now ONE group that must sum to 100 together (not
+  // per immediate parent — see migration 0008_category_nodes_no_weight / lib/kpi-tree.ts).
+  // Category/grouping nodes (anything with children) carry no weight and never appear here.
+  const globalLeafCheck = useMemo(() => {
+    const leaves = kpiNodes.filter((n) => isLeafNode(n) && n.includedInScoring);
+    return siblingWeightSum(leaves.map((n) => weightOf(n)));
+  }, [staged, kpiNodes]); // eslint-disable-line react-hooks/exhaustive-deps
   const hasStaged = Object.keys(staged).length > 0;
-  const allStagedOk = changedGroups.every((g) => g.ok);
+  const allStagedOk = globalLeafCheck.ok;
 
   async function run(action: () => Promise<void>, successNotice?: string) {
     setBusy(true);
@@ -159,7 +153,7 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
     const n = raw === "" ? NaN : Number(raw);
     setStaged((s) => {
       const next = { ...s };
-      if (Number.isFinite(n) && Math.abs(n - node.weight) < 0.001) delete next[node.id];
+      if (Number.isFinite(n) && Math.abs(n - (node.weight ?? 0)) < 0.001) delete next[node.id];
       else next[node.id] = Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : NaN;
       return next;
     });
@@ -184,8 +178,8 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
     return run(
       () => updateKpiIncludedInScoring(node.id, next),
       next
-        ? `“${node.name}” is back in the weighted score — its sibling group must sum to 100% again.`
-        : `“${node.name}” is now excluded from the weighted score — it's still tracked/scored, but doesn't count toward or constrain its sibling group's 100% total.`,
+        ? `“${node.name}” is back in the weighted score — every leaf KPI must sum to 100% again.`
+        : `“${node.name}” is now excluded from the weighted score — it's still tracked/scored, but doesn't count toward or constrain the scorecard's 100% total.`,
     );
   }
 
@@ -194,7 +188,12 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
     if (!name || !editing) return;
     const parent = parentKey === ROOT ? null : (kpiNodes.find((n) => n.id === parentKey) ?? null);
     const siblings = siblingsOf(parent?.id ?? null);
-    const weight = siblings.length === 0 ? 100 : 0;
+    // The new KPI is always a fresh LEAF (no children yet), so it always gets a real
+    // weight — 100% only when it's the very first KPI in an otherwise-empty scorecard,
+    // 0% otherwise (every leaf's weight is now a GLOBAL share of the whole scorecard, not
+    // just relative to its immediate siblings — see migration 0008_category_nodes_no_weight
+    // / lib/kpi-tree.ts), so the user rebalances afterwards either way.
+    const weight = kpiNodes.length === 0 ? 100 : 0;
     return run(
       async () => {
         await createKpiNode({
@@ -210,15 +209,20 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
         if (parent) setCollapsed((s) => new Set([...s].filter((id) => id !== parent.id)));
       },
       weight === 0
-        ? `Added “${name}” at 0%. Rebalance its group's weights to give it a share, then add its guidelines.`
-        : `Added “${name}” at 100% (it's the only KPI in its group). Add its guidelines so it can be scored.`,
+        ? `Added “${name}” at 0%. Rebalance the leaf weights to give it a share, then add its guidelines.`
+        : `Added “${name}” at 100% (it's the only KPI in the scorecard). Add its guidelines so it can be scored.`,
     );
   }
 
   function confirmDelete(node: KpiNode) {
     const siblings = siblingsOf(node.parentId).filter((s) => s.id !== node.id);
-    const needsRebalance = node.weight > 0 && siblings.length > 0;
-    const rebalanced = needsRebalance ? redistributeWeight(siblings, node.weight) : [];
+    const needsRebalance = (node.weight ?? 0) > 0 && siblings.length > 0;
+    const rebalanced = needsRebalance
+      ? redistributeWeight(
+          siblings.map((s) => ({ id: s.id, weight: s.weight ?? 0 })),
+          node.weight ?? 0,
+        )
+      : [];
     setDeleteTarget(null);
     return run(
       async () => {
@@ -232,7 +236,7 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
           if (needsRebalance) {
             // Put the weights back exactly as they were, best-effort.
             try {
-              await updateKpiWeights([...siblings, node].map((n) => ({ id: n.id, weight: n.weight })));
+              await updateKpiWeights([...siblings, node].map((n) => ({ id: n.id, weight: n.weight ?? 0 })));
             } catch {
               // ignore — the primary error below is what the user needs to see
             }
@@ -241,7 +245,7 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
         }
       },
       needsRebalance
-        ? `Deleted “${node.name}”; its ${node.weight}% was spread across the remaining ${siblings.length} KPI${siblings.length === 1 ? "" : "s"} in its group.`
+        ? `Deleted “${node.name}”; its ${node.weight ?? 0}% was spread across the remaining ${siblings.length} KPI${siblings.length === 1 ? "" : "s"} in its group.`
         : `Deleted “${node.name}”.`,
     );
   }
@@ -258,8 +262,6 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
       </SolidPanel>
     );
   }
-
-  const rootCheck = siblingWeightSum(tree.filter((n) => n.includedInScoring).map((n) => weightOf(n)));
 
   function renderAddRow(parentKey: string, depth: number, parent: KpiNode | null) {
     const becomesGroup = parent && siblingsOf(parent.id).length === 0;
@@ -312,7 +314,12 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
     const isCollapsed = collapsed.has(node.id);
     const ladderOpen = openLadders.has(node.id);
     const coverage = guidelineCoverage(node);
-    const childCheck = siblingWeightSum(node.children.filter((c) => c.includedInScoring).map((c) => weightOf(c)));
+    // A category/grouping node carries no weight of its own — this is purely an
+    // INFORMATIONAL rollup of what share of the WHOLE scorecard its own leaf descendants
+    // currently account for (never required to equal any particular number; only the
+    // global leaf-sum check at the top of this panel is a pass/fail constraint — see
+    // migration 0008_category_nodes_no_weight / lib/kpi-tree.ts).
+    const descendantWeightSum = !isLeaf ? leafDescendantsWeightSum(node, weightOf) : 0;
     const share = isLeaf ? effective[node.id] : undefined;
     const weightChanged = node.id in staged;
 
@@ -365,69 +372,78 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
               {!isLeaf && (
                 <p className="text-xs text-ink-muted">
                   {node.children.length} {isCategory ? "KPI" : "sub-KPI"}
-                  {node.children.length === 1 ? "" : "s"} ·{" "}
-                  <span className={childCheck.ok ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]"}>
-                    {isCategory ? "KPIs" : "children"} sum {childCheck.sum}%
-                    {!childCheck.ok && isEditing && ` (${childCheck.remaining > 0 ? "+" : ""}${childCheck.remaining}% to go)`}
-                  </span>
+                  {node.children.length === 1 ? "" : "s"} · {Math.round(descendantWeightSum * 100) / 100}% of
+                  total (no weight of its own)
                 </p>
               )}
             </div>
           </div>
 
           {isEditing ? (
-            <div className="flex flex-col items-end gap-1">
-              <label className="flex items-center justify-end gap-0.5">
-                <span className="sr-only">Weight for {node.name} (percent of its group)</span>
-                <input
-                  type="number"
-                  min={0}
-                  max={100}
-                  step={0.5}
-                  inputMode="decimal"
-                  value={Number.isFinite(weightOf(node)) ? weightOf(node) : ""}
-                  onChange={(e) => stageWeight(node, e.target.value)}
-                  disabled={busy || !node.includedInScoring}
+            isLeaf ? (
+              <div className="flex flex-col items-end gap-1">
+                <label className="flex items-center justify-end gap-0.5">
+                  <span className="sr-only">Weight for {node.name} (percent of the whole scorecard)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={0.5}
+                    inputMode="decimal"
+                    value={Number.isFinite(weightOf(node)) ? weightOf(node) : ""}
+                    onChange={(e) => stageWeight(node, e.target.value)}
+                    disabled={busy || !node.includedInScoring}
+                    className={cn(
+                      FIELD,
+                      "w-16 text-right tabular-nums",
+                      weightChanged && "border-[var(--focus)] bg-lemon-soft/60",
+                      !node.includedInScoring && "opacity-50",
+                    )}
+                  />
+                  <span className="text-xs text-ink-muted">%</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => toggleIncluded(node)}
+                  disabled={busy || hasStaged}
+                  title={
+                    hasStaged
+                      ? "Save or reset your weight changes first"
+                      : node.includedInScoring
+                        ? "Exclude this KPI from the weighted score (it stays tracked/scored, just doesn't count toward the 100% total)"
+                        : "Include this KPI back in the weighted score"
+                  }
                   className={cn(
-                    FIELD,
-                    "w-16 text-right tabular-nums",
-                    weightChanged && "border-[var(--focus)] bg-lemon-soft/60",
-                    !node.includedInScoring && "opacity-50",
+                    "rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide",
+                    "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--focus)]",
+                    node.includedInScoring
+                      ? "text-ink-muted hover:bg-black/5 hover:text-ink"
+                      : "bg-lemon-soft/60 text-lemon-ink",
                   )}
-                />
-                <span className="text-xs text-ink-muted">%</span>
-              </label>
-              <button
-                type="button"
-                onClick={() => toggleIncluded(node)}
-                disabled={busy || hasStaged}
-                title={
-                  hasStaged
-                    ? "Save or reset your weight changes first"
-                    : node.includedInScoring
-                      ? "Exclude this KPI from the weighted score (it stays tracked/scored, just doesn't count toward the 100% total)"
-                      : "Include this KPI back in the weighted score"
-                }
-                className={cn(
-                  "rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide",
-                  "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--focus)]",
-                  node.includedInScoring
-                    ? "text-ink-muted hover:bg-black/5 hover:text-ink"
-                    : "bg-lemon-soft/60 text-lemon-ink",
-                )}
-              >
-                {node.includedInScoring ? "Scored" : "Excluded"}
-              </button>
-            </div>
+                >
+                  {node.includedInScoring ? "Scored" : "Excluded"}
+                </button>
+              </div>
+            ) : (
+              <span className="text-right text-xs italic text-ink-muted" title="Categories are purely organizational — no weight of their own">
+                no weight
+              </span>
+            )
           ) : (
             <div className="flex flex-col items-end gap-0.5">
-              <span className="text-right text-sm font-medium tabular-nums text-ink" title="Weight within its sibling group">
-                {node.weight}%
-              </span>
+              {isLeaf ? (
+                <span className="text-right text-sm font-medium tabular-nums text-ink" title="Weight — this KPI's share of the whole scorecard">
+                  {node.weight ?? 0}%
+                </span>
+              ) : (
+                <span className="text-right text-xs italic text-ink-muted" title="Categories are purely organizational — no weight of their own">
+                  —
+                </span>
+              )}
               {!node.includedInScoring && (
                 <span
                   className="text-[10px] font-medium uppercase tracking-wide text-ink-muted"
-                  title="Tracked/scored, but excluded from the weighted score and its sibling group's 100% total"
+                  title="Tracked/scored, but excluded from the weighted score and the scorecard's 100% total"
                 >
                   Excluded
                 </span>
@@ -435,7 +451,11 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
             </div>
           )}
           <span className="hidden text-right text-xs tabular-nums text-ink-muted sm:block" title="Share of the whole scorecard">
-            {share !== undefined ? `${(share * 100).toFixed(1)}% of total` : "—"}
+            {share !== undefined
+              ? `${(share * 100).toFixed(1)}% of total`
+              : !isLeaf
+                ? `${Math.round(descendantWeightSum * 100) / 100}% of total`
+                : "—"}
           </span>
           <span className="hidden items-center justify-end gap-1 text-xs sm:flex">
             {isLeaf ? (
@@ -508,8 +528,10 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
           KPI structure
           {isEditing && <Badge variant="lemon">Editing</Badge>}
           <span className="font-normal text-ink-muted">
-            · {kpiNodes.length} KPIs, {leafCount} scored leaves · top level sums to{" "}
-            <span className={rootCheck.ok ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]"}>{rootCheck.sum}%</span>
+            · {kpiNodes.length} KPIs, {leafCount} scored leaves · all leaf KPIs sum to{" "}
+            <span className={globalLeafCheck.ok ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]"}>
+              {globalLeafCheck.sum}%
+            </span>
           </span>
         </p>
         <div className="flex flex-wrap gap-1">
@@ -555,7 +577,8 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
         <div className="space-y-1.5 border-b border-hairline bg-lemon-soft/40 px-4 py-2.5 text-xs text-ink">
           <p>
             Changes save straight to this scorecard. Rename a KPI by clicking its name (saved when you press Enter or
-            click away). Weights are percentages of their group and are saved together once every group you touched
+            click away). Only leaf KPIs (ones with no sub-KPIs) have a weight — categories are purely organizational.
+            Weights are each leaf&apos;s share of the WHOLE scorecard, and are saved together once every leaf KPI
             adds up to exactly 100%. Open a KPI&apos;s arrow to edit its 0–10 guidelines.
           </p>
           {editing && editing.evaluationCount > 0 && (
@@ -630,14 +653,15 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
         <div className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 border-t border-hairline bg-solid px-4 py-3 shadow-[0_-4px_12px_rgba(0,0,0,0.06)]">
           <div className="min-w-0 space-y-1 text-xs">
             <p className="font-semibold text-ink">Unsaved weight changes</p>
-            <ul className="flex flex-wrap gap-x-4 gap-y-1">
-              {changedGroups.map((g) => (
-                <li key={g.key} className={g.ok ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]"}>
-                  {g.parentName}: {g.sum}%{" "}
-                  {g.ok ? "✓" : `— ${g.remaining > 0 ? "add" : "remove"} ${Math.abs(g.remaining)}% to reach 100%`}
-                </li>
-              ))}
-            </ul>
+            {/* Every leaf KPI in the whole scorecard is now ONE group (see migration
+                0008_category_nodes_no_weight) — a single global check, not one per
+                immediate sibling group. */}
+            <p className={globalLeafCheck.ok ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]"}>
+              All leaf KPIs: {globalLeafCheck.sum}%{" "}
+              {globalLeafCheck.ok
+                ? "✓"
+                : `— ${globalLeafCheck.remaining > 0 ? "add" : "remove"} ${Math.abs(globalLeafCheck.remaining)}% to reach 100%`}
+            </p>
           </div>
           <div className="flex gap-2">
             <Button type="button" size="sm" variant="ghost" onClick={() => setStaged({})} disabled={busy}>
@@ -672,7 +696,7 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
               )}
               {deleteInfo.rebalanced.length > 0 ? (
                 <li>
-                  Its {deleteTarget?.weight}% weight is spread across the rest of its group so it still adds up to 100%:{" "}
+                  Its {deleteTarget?.weight ?? 0}% weight is spread across the rest of its group so it still adds up to 100%:{" "}
                   {deleteInfo.rebalanced.map((r) => `${r.name} → ${r.weight}%`).join(", ")}. You can adjust these
                   afterwards.
                 </li>
@@ -711,8 +735,11 @@ function describeDelete(node: KpiNode, all: KpiNode[]) {
   const siblings = all.filter((n) => n.parentId === node.parentId && n.id !== node.id);
   const byId = new Map(all.map((n) => [n.id, n]));
   const rebalanced =
-    node.weight > 0 && siblings.length > 0
-      ? redistributeWeight(siblings, node.weight).map((r) => ({ name: byId.get(r.id)?.name ?? "?", weight: r.weight }))
+    (node.weight ?? 0) > 0 && siblings.length > 0
+      ? redistributeWeight(
+          siblings.map((s) => ({ id: s.id, weight: s.weight ?? 0 })),
+          node.weight ?? 0,
+        ).map((r) => ({ name: byId.get(r.id)?.name ?? "?", weight: r.weight }))
       : [];
   return { descendants: doomed.size - 1, rebalanced, lastInGroup: siblings.length === 0 };
 }

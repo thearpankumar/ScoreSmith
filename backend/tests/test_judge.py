@@ -65,12 +65,17 @@ def _plain_node(*, node_id, parent_id, weight, level, included_in_scoring=True) 
 
 
 def test_effective_leaf_weights_and_rag_bands() -> None:
+    """`id_a` is a category/grouping node (has children) and carries NO weight of its own
+    (`weight=None` — see migration 0008_category_nodes_no_weight): a leaf's effective
+    weight is simply its own `weight / 100` directly, never multiplied through an
+    ancestor's weight, and every LEAF (`id_b`, `id_a1`, `id_a2`) sums to 100 together
+    across the whole tree regardless of which (if any) category it sits under."""
     id_a, id_b, id_a1, id_a2 = (uuid.uuid4() for _ in range(4))
     nodes = [
-        _plain_node(node_id=id_a, parent_id=None, weight=70, level=1),  # not a leaf (has children)
+        _plain_node(node_id=id_a, parent_id=None, weight=None, level=1),  # category: no weight
         _plain_node(node_id=id_b, parent_id=None, weight=30, level=1),  # leaf
-        _plain_node(node_id=id_a1, parent_id=id_a, weight=50, level=2),  # leaf
-        _plain_node(node_id=id_a2, parent_id=id_a, weight=50, level=2),  # leaf
+        _plain_node(node_id=id_a1, parent_id=id_a, weight=35, level=2),  # leaf
+        _plain_node(node_id=id_a2, parent_id=id_a, weight=35, level=2),  # leaf
     ]
 
     leaves = leaf_nodes(nodes)
@@ -78,7 +83,7 @@ def test_effective_leaf_weights_and_rag_bands() -> None:
 
     weights = effective_leaf_weights(nodes)
     assert weights[id_b] == pytest.approx(0.30)
-    assert weights[id_a1] == pytest.approx(0.35)  # 0.5 * 0.70
+    assert weights[id_a1] == pytest.approx(0.35)  # flat, no multiplication by id_a (no weight)
     assert weights[id_a2] == pytest.approx(0.35)
     assert sum(weights.values()) == pytest.approx(1.0)
 

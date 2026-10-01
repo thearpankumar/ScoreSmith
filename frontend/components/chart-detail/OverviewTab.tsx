@@ -107,7 +107,11 @@ export function OverviewTab({
       </div>
 
       <SolidPanel className="p-5">
-        <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-ink-muted">Weight integrity by group</p>
+        {/* Only LEAF KPIs are weighted (categories carry none of their own — see backend
+            migration 0008_category_nodes_no_weight), and every leaf in the scorecard sums
+            to 100 TOGETHER, not per group — validateSiblingWeights now returns at most one
+            entry, kept as a list for a stable shape across both schema generations. */}
+        <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-ink-muted">Weight integrity</p>
         <ul className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2 lg:grid-cols-3">
           {weightChecks.map((check) => (
             <li key={check.parentId ?? "root"} className="flex items-center justify-between gap-2 text-sm">
@@ -123,7 +127,7 @@ export function OverviewTab({
         </ul>
         {!allWeightsOk && (
           <p className="mt-2 text-xs text-[var(--rag-poor)]">
-            Sibling weights should sum to 100% — enforced at the database layer in production.
+            Every leaf KPI&apos;s weight should sum to 100% — enforced at the database layer in production.
           </p>
         )}
       </SolidPanel>

@@ -205,7 +205,9 @@ interface BeKpiNode {
   path: string;
   level: number;
   name: string;
-  weight: number;
+  // Nullable: a category/grouping node carries no weight of its own — see backend
+  // migration 0008_category_nodes_no_weight.
+  weight: number | null;
   display_order: number;
   included_in_scoring: boolean;
   guidelines?: BeGuideline[];
@@ -628,13 +630,17 @@ export async function getScorecardWithVersion(
 // Scorecard structure editing (Overview tab "Edit structure" mode)
 //
 // Thin wrappers over the existing auth-gated CRUD routes in
-// backend/app/api/v1/kpi_nodes.py + scorecards.py. The DB enforces "sibling weights sum
-// to 100" with a DEFERRED constraint trigger checked at each request's COMMIT, which
-// shapes how the editor sequences calls (see KpiStructureTree):
-//   - weights are only ever changed a whole sibling group at a time (bulk PATCH);
-//   - a new KPI joins an existing group at weight 0 (group still sums to 100), or at 100
-//     when it's the first child of its parent;
-//   - deleting a weighted KPI first moves its weight onto its siblings, then deletes.
+// backend/app/api/v1/kpi_nodes.py + scorecards.py. Only LEAF kpi_nodes (no children) are
+// weighted — a category/grouping node has none of its own (see migration
+// 0008_category_nodes_no_weight). The DB enforces "every leaf in the scorecard version
+// sums to 100 together" with a DEFERRED constraint trigger checked at each request's
+// COMMIT, which shapes how the editor sequences calls (see KpiStructureTree):
+//   - weights are only ever changed as a whole batch (bulk PATCH), covering every leaf
+//     touched by an edit;
+//   - a new (always-leaf) KPI starts at weight 0, or at 100 when it's the very first KPI
+//     in an otherwise-empty scorecard;
+//   - deleting a weighted leaf KPI first moves its weight onto its immediate siblings,
+//     then deletes.
 // ---------------------------------------------------------------------------
 
 export async function renameKpiNode(nodeId: string, name: string): Promise<void> {
@@ -1219,7 +1225,10 @@ function mapDraft(sessionId: string, be: BeScorecardDraft | null | undefined): S
     return {
       id: draftKpiId(k.name),
       name: k.name,
-      weight: k.weight ?? 0,
+      // `null` for a category (no weight of its own — see migration
+      // 0008_category_nodes_no_weight) OR a leaf the model hasn't weighted yet; both are
+      // genuinely "no value" rather than a real 0%, so it's passed through as-is.
+      weight: k.weight,
       level: (k.level ?? 1) as 1 | 2 | 3 | 4,
       parentId: k.parent_name ? draftKpiId(k.parent_name) : null,
       includedInScoring: k.included_in_scoring ?? true,

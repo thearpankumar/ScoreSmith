@@ -91,7 +91,7 @@ export function GuidelinesMatrix({ kpiNodes, evaluations }: { kpiNodes: KpiNode[
                   <td className="sticky left-0 z-10 border-b border-r border-hairline bg-solid px-4 py-3 align-top">
                     <p className="font-medium text-ink">{kpi.name}</p>
                     <p className="mt-0.5 text-xs text-ink-muted">
-                      L{kpi.level} · {kpi.weight}%{breadcrumbById.get(kpi.id) ? ` · ${breadcrumbById.get(kpi.id)}` : ""}
+                      L{kpi.level} · {kpi.weight ?? 0}%{breadcrumbById.get(kpi.id) ? ` · ${breadcrumbById.get(kpi.id)}` : ""}
                     </p>
                   </td>
                   {LEVELS.map((level) => {

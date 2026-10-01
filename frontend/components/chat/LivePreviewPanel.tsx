@@ -56,12 +56,22 @@ export function LivePreviewPanel({
   const leafKpiNames = draft.kpis.filter((k) => !parentIds.has(k.id)).map((k) => k.name);
 
   const topLevel = draft.kpis.filter((k) => k.parentId === null || !draft.kpis.some((p) => p.id === k.parentId));
-  // Excluded (includedInScoring=false) KPIs don't count toward or constrain the 100%
-  // total — mirrors the backend trigger (migration 0005_scoring_formula_and_kpi_flags).
-  const topLevelIncluded = topLevel.filter((k) => k.includedInScoring);
-  const topLevelCheck = siblingWeightSum(topLevelIncluded.map((k) => k.weight));
-  const topLevelSum = topLevelCheck.sum;
-  const weightsOk = topLevelIncluded.length === 0 || topLevelCheck.ok;
+  // Only LEAF KPIs (ones nothing else is nested under) carry a weight — a category/
+  // grouping node has none of its own (see backend migration
+  // 0008_category_nodes_no_weight / draft_schema.py). Every included leaf across the
+  // WHOLE draft must sum to 100 TOGETHER, not just the top-level/category ones.
+  const leafIncluded = draft.kpis.filter((k) => !parentIds.has(k.id) && k.includedInScoring);
+  const globalCheck = siblingWeightSum(leafIncluded.map((k) => k.weight ?? 0));
+  const globalSum = globalCheck.sum;
+  const weightsOk = leafIncluded.length === 0 || globalCheck.ok;
+
+  /** Informational-only rollup of a category's own leaf descendants' weights (never a
+   * pass/fail constraint — only the global leaf sum above is). */
+  function leafDescendantsSum(kpi: DraftKpi): number {
+    const children = draft.kpis.filter((k) => k.parentId === kpi.id);
+    if (children.length === 0) return kpi.weight ?? 0;
+    return children.reduce((sum, c) => sum + leafDescendantsSum(c), 0);
+  }
 
   function patch(p: Partial<ScorecardDraft>) {
     onChange({ ...draft, ...p });
@@ -104,19 +114,23 @@ export function LivePreviewPanel({
    * Renders one KPI and, recursively, its children — the single mechanism behind BOTH
    * plain nested indentation (unchanged for an un-categorized KPI) AND the new, visually
    * distinct CATEGORY header (a top-level, i.e. `depth === 0`, KPI that other KPIs are
-   * nested under via `parentId`). A category never shows the weight-inclusion toggle or
-   * the "proposed" sparkle quite like a leaf KPI does (it carries no guidelines of its
-   * own — see api-client.ts's `mapDraft`), but IS still a real, editable KPI row: its name
-   * and weight can be edited, and removing it removes its nested KPIs too (see `removeKpi`).
+   * nested under via `parentId`). A category has NO weight of its own (purely
+   * organizational — see backend migration 0008_category_nodes_no_weight) and never
+   * shows a weight field, the weight-inclusion toggle, or the "proposed" sparkle quite
+   * like a leaf KPI does (it also carries no guidelines of its own — see api-client.ts's
+   * `mapDraft`), but IS still a real, editable KPI row: its name can be edited, and
+   * removing it removes its nested KPIs too (see `removeKpi`).
    */
   function renderKpiNode(kpi: DraftKpi, depth: number): ReactNode {
     const children = draft.kpis.filter((k) => k.parentId === kpi.id);
     const isCategory = depth === 0 && children.length > 0;
 
     if (isCategory) {
-      const childCheck = siblingWeightSum(
-        children.filter((c) => c.includedInScoring).map((c) => c.weight),
-      );
+      // Categories carry NO weight of their own (see backend migration
+      // 0008_category_nodes_no_weight) — purely organizational. The "Σ" readout below is
+      // informational only (this category's current share of the whole scorecard), never
+      // a pass/fail requirement — only the global leaf-sum check above the list is.
+      const descendantSum = leafDescendantsSum(kpi);
       return (
         <li key={kpi.id} className="space-y-1.5">
           <div className="flex items-center gap-1.5 rounded-lg border border-lemon-ink/25 bg-lemon-soft/50 px-2 py-1.5">
@@ -130,26 +144,8 @@ export function LivePreviewPanel({
               className={cn(INLINE_INPUT, "min-w-0 flex-1 text-xs font-semibold uppercase tracking-wide text-ink")}
             />
             <span className="shrink-0 text-[10px] font-medium text-ink-muted">
-              {children.length} KPI{children.length === 1 ? "" : "s"}
+              {children.length} KPI{children.length === 1 ? "" : "s"} · {descendantSum}% of total
             </span>
-            <div className="flex shrink-0 items-center">
-              <input
-                type="number"
-                min={0}
-                max={100}
-                step={1}
-                inputMode="numeric"
-                value={Number.isFinite(kpi.weight) ? kpi.weight : ""}
-                aria-label={`Weight for category ${kpi.name || "Category"} (percent)`}
-                disabled={disabled}
-                onChange={(e) => {
-                  const n = e.target.value === "" ? 0 : Math.min(100, Math.max(0, Number(e.target.value)));
-                  if (Number.isFinite(n)) patchKpi(kpi.id, { weight: n });
-                }}
-                className={cn(INLINE_INPUT, "w-12 text-right text-xs font-semibold tabular-nums")}
-              />
-              <span className="text-xs text-ink-muted">%</span>
-            </div>
             <button
               type="button"
               onClick={() => removeKpi(kpi.id)}
@@ -159,14 +155,6 @@ export function LivePreviewPanel({
             >
               <Trash2 className="size-3.5" />
             </button>
-          </div>
-          <div className="flex items-center gap-1.5 pl-2 text-[10px] text-ink-muted">
-            <span
-              className={childCheck.ok ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]"}
-              title={`${kpi.name || "This category"}'s KPIs should sum to 100%`}
-            >
-              Σ {childCheck.sum}%
-            </span>
           </div>
           <ul className="ml-2 space-y-1.5 border-l border-hairline pl-3">
             {children.map((c) => renderKpiNode(c, depth + 1))}
@@ -206,7 +194,7 @@ export function LivePreviewPanel({
               max={100}
               step={1}
               inputMode="numeric"
-              value={Number.isFinite(kpi.weight) ? kpi.weight : ""}
+              value={kpi.weight ?? ""}
               aria-label={`Weight for ${kpi.name || "KPI"} (percent)`}
               disabled={disabled}
               onChange={(e) => {
@@ -369,9 +357,9 @@ export function LivePreviewPanel({
                     "text-xs font-medium tabular-nums",
                     weightsOk ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]",
                   )}
-                  title="Top-level KPI weights should sum to 100%"
+                  title="Every leaf KPI's weight (categories have none of their own) should sum to 100%"
                 >
-                  Σ {topLevelSum}%
+                  Σ {globalSum}%
                 </span>
               )}
             </div>
@@ -381,8 +369,9 @@ export function LivePreviewPanel({
             {/*
              * CATEGORY GROUPING: a Level-1 KPI that other KPIs reference via `parentId` is
              * a CATEGORY (see backend/app/ai/draft_schema.py / scorecard_builder.py's
-             * research fan-out — a category is a level=1 KpiDraft with its own weight and
-             * no guidelines, each researched KPI nested under it via `parent_name`). It
+             * research fan-out — a category is a level=1 KpiDraft with NO weight of its
+             * own and no guidelines, each researched KPI nested under it via
+             * `parent_name`). It
              * renders as a distinct, labeled header — never just a few extra pixels of
              * indentation — with its own KPIs listed underneath it, matching the requested
              *   <category-name>

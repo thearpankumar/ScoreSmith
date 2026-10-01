@@ -33,7 +33,11 @@ class KpiNodeCreate(BaseModel):
     parent_id: uuid.UUID | None = None
     level: int = Field(ge=1, le=4)
     name: str
-    weight: float = Field(ge=0, le=100)
+    # Nullable: a category/grouping node (one later given children) carries no weight at
+    # all — see migration 0008_category_nodes_no_weight. Only leaf KPIs need a real value;
+    # the weight-sum-to-100 DB trigger enforces that across every leaf in the scorecard
+    # version, not per immediate sibling group.
+    weight: float | None = Field(default=None, ge=0, le=100)
     display_order: int = 0
     included_in_scoring: bool = True
 
@@ -52,7 +56,7 @@ class KpiNodeRead(ORMBase):
     path: str
     level: int
     name: str
-    weight: float
+    weight: float | None
     display_order: int
     included_in_scoring: bool
     created_at: datetime

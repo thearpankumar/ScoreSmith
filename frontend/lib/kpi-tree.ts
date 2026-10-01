@@ -40,11 +40,14 @@ export function leafKpiNodes(nodes: KpiNode[]): KpiNode[] {
 }
 
 /**
- * Roll a leaf-level score map up through the hierarchy: a parent's score is
- * the weight-average of its direct children (sibling weights sum to 100 at
- * each level), recursively, up to the top-level weighted final score.
- * Returns a score for every node id (leaf scores pass through unchanged)
- * plus the overall final weighted score.
+ * Roll a leaf-level score map up through the hierarchy. Only LEAF nodes carry a weight
+ * (see `effectiveLeafWeights` below / backend migration 0008_category_nodes_no_weight) —
+ * a category/grouping node's own displayed "rolled up" score is simply the
+ * weight-weighted average of its OWN leaf descendants' scores, using those leaves'
+ * EFFECTIVE (already-global) weights as relative proportions within that subtree. This is
+ * purely a DISPLAY computation (never required to be any particular value) — the
+ * `finalScore` for the whole scorecard is computed the same way `effectiveLeafWeights`/
+ * `computeWeightedFinalScore` already do it: a flat sum over every leaf.
  */
 export function computeKpiRollup(
   nodes: KpiNode[],
@@ -52,22 +55,28 @@ export function computeKpiRollup(
 ): { finalScore: number; scoreByNodeId: Record<string, number> } {
   const tree = buildKpiTree(nodes);
   const scoreByNodeId: Record<string, number> = {};
+  const leafWeights = effectiveLeafWeights(nodes); // leaf id -> weight/100 (0 if excluded)
+
+  function collectLeaves(node: NestedKpiNode, acc: NestedKpiNode[]): void {
+    if (node.children.length === 0) acc.push(node);
+    else node.children.forEach((c) => collectLeaves(c, acc));
+  }
 
   function resolve(node: NestedKpiNode): number {
-    let score: number;
-    if (node.children.length === 0) {
-      score = leafScores[node.id] ?? 0;
-    } else {
-      const totalWeight = node.children.reduce((sum, c) => sum + c.weight, 0) || 100;
-      score = node.children.reduce((sum, c) => sum + (resolve(c) * c.weight) / totalWeight, 0);
-    }
+    const leaves: NestedKpiNode[] = [];
+    collectLeaves(node, leaves);
+    const totalWeight = leaves.reduce((sum, leaf) => sum + (leafWeights[leaf.id] ?? 0), 0);
+    const score =
+      totalWeight > 0
+        ? leaves.reduce((sum, leaf) => sum + (leafScores[leaf.id] ?? 0) * (leafWeights[leaf.id] ?? 0), 0) /
+          totalWeight
+        : 0;
     scoreByNodeId[node.id] = Math.round(score * 100) / 100;
     return score;
   }
 
-  const totalRootWeight = tree.reduce((sum, n) => sum + n.weight, 0) || 100;
-  const finalScore =
-    Math.round(tree.reduce((sum, n) => sum + (resolve(n) * n.weight) / totalRootWeight, 0) * 100) / 100;
+  tree.forEach((root) => resolve(root));
+  const finalScore = Math.round(computeWeightedFinalScore(nodes, leafScores) * 100) / 100;
 
   return { finalScore, scoreByNodeId };
 }
@@ -118,69 +127,61 @@ export interface WeightGroupCheck {
 }
 
 /**
- * Mirrors the backend's deferred-constraint trigger conceptually: sibling weights must
- * sum to 100 within each parent group (top-level KPIs are siblings of each other too,
- * parentId = null). Surfaced read-only in the Overview tab — Cycle 1 enforces this at the
- * DB layer, not here.
+ * Mirrors the backend's deferred-constraint trigger (`check_kpi_node_weight_sum`, see
+ * migration 0008_category_nodes_no_weight): every LEAF `kpi_node` (no children of its
+ * own) in the scorecard must have weights summing to 100 TOGETHER — not per immediate
+ * parent group. A category/grouping node (anything with children, at any depth) carries
+ * no weight of its own and never participates. Surfaced read-only in the Overview tab —
+ * the DB enforces this at commit, not here.
  *
  * A KPI with `includedInScoring === false` (see migration
- * 0005_scoring_formula_and_kpi_flags) is excluded from its sibling group's sum entirely —
- * exactly like the DB trigger (`check_kpi_node_weight_sum`, redefined in that migration).
- * A group with zero INCLUDED siblings is skipped (nothing to check), also matching the
- * trigger's own "zero remaining rows" no-op case.
+ * 0005_scoring_formula_and_kpi_flags) is excluded from the sum entirely — exactly like
+ * the DB trigger. Returns an empty array when there are no included leaves (nothing to
+ * check), matching the trigger's own "zero remaining rows" no-op case. Always at most one
+ * entry (there is only ever ONE group now), kept as an array so existing callers that
+ * iterate over `WeightGroupCheck[]` don't need special-casing.
  */
 export function validateSiblingWeights(nodes: KpiNode[]): WeightGroupCheck[] {
-  const included = nodes.filter((n) => n.includedInScoring);
-  const groups = new Map<string | null, KpiNode[]>();
-  included.forEach((n) => {
-    const key = n.parentId;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(n);
-  });
-
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  const checks: WeightGroupCheck[] = [];
-  groups.forEach((siblings, parentId) => {
-    const { sum, ok } = siblingWeightSum(siblings.map((n) => n.weight));
-    checks.push({
-      parentId,
-      parentName: parentId ? (byId.get(parentId)?.name ?? "Unknown parent") : "Top level",
-      sum,
-      ok,
-    });
-  });
-  return checks;
+  const leaves = leafKpiNodes(nodes).filter((n) => n.includedInScoring);
+  if (leaves.length === 0) return [];
+  const { sum, ok } = siblingWeightSum(leaves.map((n) => n.weight ?? 0));
+  return [{ parentId: null, parentName: "All leaf KPIs", sum, ok }];
 }
 
 /**
  * Exact mirror of the backend's `effective_leaf_weights` (backend/app/ai/judge.py): a
- * leaf's share of the whole scorecard is the product of `weight / 100` along its full
- * root-to-leaf path. For a complete scorecard (every sibling group sums to 100) these
- * sum to 1.0.
+ * leaf's share of the whole scorecard is simply its OWN `weight / 100` — category/
+ * grouping nodes (any node with children, at any depth) carry no weight of their own at
+ * all (see migration 0008_category_nodes_no_weight), so there is no ancestor chain left
+ * to multiply through any more. For a complete scorecard (every leaf sums to 100
+ * together) these sum to 1.0.
  *
  * A leaf with `includedInScoring === false` is OMITTED from the result entirely (still
  * scored/tracked elsewhere — see EvaluateTab — but contributes nothing to, and isn't
  * constrained by, the default weighted-average formula), mirroring the backend exactly.
  */
 export function effectiveLeafWeights(nodes: KpiNode[]): Record<string, number> {
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  const memo = new Map<string, number>();
-  const weightOf = (id: string, seen: Set<string> = new Set()): number => {
-    const cached = memo.get(id);
-    if (cached !== undefined) return cached;
-    const node = byId.get(id);
-    if (!node || seen.has(id)) return 0;
-    seen.add(id);
-    const own = node.weight / 100;
-    const result = node.parentId && byId.has(node.parentId) ? own * weightOf(node.parentId, seen) : own;
-    memo.set(id, result);
-    return result;
-  };
   const out: Record<string, number> = {};
   leafKpiNodes(nodes)
     .filter((leaf) => leaf.includedInScoring)
-    .forEach((leaf) => (out[leaf.id] = weightOf(leaf.id)));
+    .forEach((leaf) => (out[leaf.id] = (leaf.weight ?? 0) / 100));
   return out;
+}
+
+/**
+ * Sum of `weightOf(leaf)` over every LEAF descendant of `node` (inclusive of `node`
+ * itself if it's already a leaf) — a purely INFORMATIONAL rollup for a category/grouping
+ * node's own display row (e.g. "32% of total"), never a pass/fail constraint (only the
+ * flat, whole-scorecard leaf sum in `validateSiblingWeights`/`siblingWeightSum` is).
+ * `weightOf` defaults to a node's own `.weight` (coalesced to 0) but may be overridden
+ * (e.g. by `KpiStructureTree`'s locally-staged, not-yet-saved edits).
+ */
+export function leafDescendantsWeightSum(
+  node: NestedKpiNode,
+  weightOf: (n: KpiNode) => number = (n) => n.weight ?? 0,
+): number {
+  if (node.children.length === 0) return weightOf(node);
+  return node.children.reduce((sum, c) => sum + leafDescendantsWeightSum(c, weightOf), 0);
 }
 
 /**

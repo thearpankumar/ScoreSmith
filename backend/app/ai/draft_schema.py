@@ -19,12 +19,12 @@ Field mapping to the existing CRUD schema (`app/models/scorecard.py` et al.), us
   (the LLM never sees or invents UUIDs); `materialize_draft` resolves `parent_name` to a
   real `kpi_nodes.id` as it creates nodes level-by-level. The chat builder's research
   fan-out (`scorecard_builder.py::research_kpis`) uses exactly this mechanism to express
-  KPI CATEGORIES: a category is simply a `level=1` `KpiDraft` with `parent_name=None` and
-  its own `weight` (no guidelines of its own — see `missing_fields()` below, which treats
-  any KPI referenced as another KPI's `parent_name` as a grouping node that doesn't need
-  them), and each KPI researched under it is a `level=2` `KpiDraft` with
-  `parent_name=<category name>`. No schema addition was needed for this — `level`/
-  `parent_name` already supported it end to end.
+  KPI CATEGORIES: a category is simply a `level=1` `KpiDraft` with `parent_name=None` — no
+  weight and no guidelines of its own (see `missing_fields()` below, which treats any KPI
+  referenced as another KPI's `parent_name` as a purely organizational grouping node that
+  needs neither — see migration 0008_category_nodes_no_weight), and each KPI researched
+  under it is a `level=2` `KpiDraft` with `parent_name=<category name>`. No schema
+  addition was needed for this — `level`/`parent_name` already supported it end to end.
 - `KpiDraft.guidelines` (keyed by `0`-`10` score level) map 1:1 to `kpi_guidelines` rows.
 """
 
@@ -129,16 +129,18 @@ class ScorecardDraft(BaseModel):
             # node (see draft_schema.py module docstring) — it exists purely to group its
             # children (exactly mirroring `app/ai/judge.py::leaf_nodes`'s "only leaf KPI
             # nodes are judged directly; an internal node has no guidelines of its own to
-            # score against"), so it never needs guidelines itself. Every KPI still needs a
-            # weight regardless of level, since category weights (summing to 100 across
-            # categories) and leaf weights (summing to 100 within their parent group) are
-            # both required by the DB's generic per-parent-group sibling-weight-sum rule.
+            # score against"), so it never needs guidelines OR a weight of its own (see
+            # migration 0008_category_nodes_no_weight) — only LEAF KPIs are weighted, and
+            # every leaf's weight must sum to 100 across the WHOLE draft (see
+            # `_sibling_weight_issue` below), not per category.
             parent_names = {kpi.parent_name for kpi in self.kpis if kpi.parent_name}
             for kpi in self.kpis:
+                is_leaf = kpi.name not in parent_names
+                if not is_leaf:
+                    continue  # category/grouping node: no weight, no guidelines required
                 if kpi.weight is None:
                     missing.append(f"kpis[{kpi.name}].weight")
-                is_leaf = kpi.name not in parent_names
-                if is_leaf and not kpi.guidelines:
+                if not kpi.guidelines:
                     missing.append(f"kpis[{kpi.name}].guidelines")
             weight_issue = self._sibling_weight_issue()
             if weight_issue:
@@ -148,21 +150,31 @@ class ScorecardDraft(BaseModel):
         return missing
 
     def _sibling_weight_issue(self) -> str | None:
-        """Mirrors the DB's weight-sum-to-100-per-sibling-group rule (see
-        app/models/kpi_node.py / migration 0005_scoring_formula_and_kpi_flags), checked
-        here so the chat flow can catch it before the draft is ever materialized into real
-        KpiNode rows. A KPI with `included_in_scoring=False` is informational-only and is
-        excluded from its sibling group's sum entirely, exactly like the DB trigger."""
-        groups: dict[str | None, list[float]] = {}
+        """Mirrors the DB's weight-sum rule (see app/models/kpi_node.py / migration
+        0008_category_nodes_no_weight), checked here so the chat flow can catch it before
+        the draft is ever materialized into real KpiNode rows.
+
+        Only LEAF KPIs (never referenced as another KPI's `parent_name`) are weighted —
+        a category/grouping node carries no weight and never participates here, at any
+        level. Every included leaf across the WHOLE draft must sum to 100 together
+        (regardless of which category, if any, it's nested under) — NOT per immediate
+        parent group, since categories no longer have a weight share of their own for a
+        leaf's weight to be relative to (see that migration's own docstring for why the
+        old per-parent-group/multiplicative scheme was replaced with this flat one). A KPI
+        with `included_in_scoring=False` is informational-only and is excluded from the
+        sum entirely, exactly like the DB trigger."""
+        parent_names = {kpi.parent_name for kpi in self.kpis if kpi.parent_name}
+        weights: list[float] = []
         for kpi in self.kpis:
-            if kpi.weight is None or not kpi.included_in_scoring:
+            is_leaf = kpi.name not in parent_names
+            if not is_leaf or kpi.weight is None or not kpi.included_in_scoring:
                 continue
-            groups.setdefault(kpi.parent_name, []).append(kpi.weight)
-        for parent_name, weights in groups.items():
-            total = sum(weights)
-            if abs(total - 100.0) > 0.01:
-                label = parent_name or "root"
-                return f"sibling_weights[{label}]=~{total:.2f} (must sum to 100)"
+            weights.append(kpi.weight)
+        if not weights:
+            return None
+        total = sum(weights)
+        if abs(total - 100.0) > 0.01:
+            return f"sibling_weights[leaves]=~{total:.2f} (must sum to 100)"
         return None
 
     def is_complete(self) -> bool:

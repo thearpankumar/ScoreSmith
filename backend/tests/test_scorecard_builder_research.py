@@ -416,8 +416,10 @@ async def test_kpi_batches_merge_from_multiple_categories() -> None:
     - the dedup pass collapses a genuine near-duplicate concept proposed by two DIFFERENT
       categories ("Response Time" under Security Standards / "Response Time Speed" under
       Regulatory Compliance) — proving CROSS-category dedup, not just within one category;
-    - weights are renormalized to sum to 100 WITHIN each surviving category, and the
-      category-level weights themselves also sum to 100 across categories."""
+    - weights are renormalized to sum to 100 WITHIN each surviving category, then folded
+      together so every LEAF across ALL surviving categories sums to 100 globally — the
+      category nodes themselves carry no weight at all (see migration
+      0008_category_nodes_no_weight)."""
     session_id = str(uuid.uuid4())
 
     per_category_kpis = {
@@ -526,15 +528,16 @@ async def test_kpi_batches_merge_from_multiple_categories() -> None:
     for kpi in children:
         assert len(kpi["guidelines"]) == 11
 
-    # Category-level weights sum to 100 across the 3 surviving categories...
-    category_total = sum(c["weight"] for c in category_nodes)
-    assert category_total == pytest.approx(100.0, abs=0.05)
-    # ...and each category's own children separately sum to 100 WITHIN that category (each
-    # agent weighted its own batch to ~100 independently; the merge step rescales each
-    # category's surviving pool back down to sum to 100).
-    for category in _CATEGORIES:
-        group = [k for k in children if k["parent_name"] == category["name"]]
-        assert sum(k["weight"] for k in group) == pytest.approx(100.0, abs=0.05), category["name"]
+    # Category nodes carry NO weight of their own at all (see migration
+    # 0008_category_nodes_no_weight / draft_schema.py's "only leaf KPIs are weighted"
+    # rule) — purely organizational.
+    assert all(c["weight"] is None for c in category_nodes)
+    # Every LEAF (child) KPI across ALL 3 categories together sums to 100 — the DB's
+    # weight-sum rule is now global across every leaf in the scorecard, not per category
+    # (each agent weighted its own batch to ~100 independently; the merge step folds each
+    # category's relative importance in as a scaling factor and renormalizes the full leaf
+    # set back down to sum to exactly 100 overall).
+    assert sum(k["weight"] for k in children) == pytest.approx(100.0, abs=0.05)
 
 
 async def test_category_decision_failure_falls_back_gracefully_without_crashing_turn() -> None:
