@@ -36,9 +36,9 @@ from tests.fakes import FakeBedrockClient, FakeWebSearchClient, search_result, t
 
 pytestmark = pytest.mark.usefixtures("_migrated_db")
 
-_ANGLES = [
-    {"angle": "Security standards & frameworks", "query_focus": "ISO 27001 / NIST vendor security review controls"},
-    {"angle": "Regulatory/compliance requirements", "query_focus": "SOC 2 vendor compliance review requirements"},
+_CATEGORIES = [
+    {"name": "Security standards & frameworks", "focus": "ISO 27001 / NIST vendor security review controls"},
+    {"name": "Regulatory/compliance requirements", "focus": "SOC 2 vendor compliance review requirements"},
 ]
 
 _COMPLETE_PATCH = {
@@ -65,12 +65,12 @@ def _tools_offered(tools) -> set[str]:
     return {t.name for t in (tools or [])}
 
 
-def _angle_from_messages(messages) -> str | None:
+def _category_from_messages(messages) -> str | None:
     for m in messages:
         for block in m.get("content", []):
             text = block.get("text", "")
-            if text.startswith("Research angle: "):
-                return text.split("Research angle: ", 1)[1].split("\n", 1)[0]
+            if text.startswith("Category: "):
+                return text.split("Category: ", 1)[1].split("\n", 1)[0]
     return None
 
 
@@ -98,17 +98,17 @@ async def test_research_fanout_writes_distinct_actor_events(async_db_session, se
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
         names = _tools_offered(tools)
-        if "decide_research_angles" in names:
-            return tool_use_result("decide_research_angles", {"angles": _ANGLES})
+        if "decide_categories" in names:
+            return tool_use_result("decide_categories", {"categories": _CATEGORIES})
         if "record_research_finding" in names:
-            angle = _angle_from_messages(messages)
+            category = _category_from_messages(messages)
             return tool_use_result(
                 "record_research_finding",
                 {
-                    "summary": f"Finding for {angle}",
-                    "suggested_kpis": [{"name": f"KPI[{angle}]", "rationale": "r"}],
+                    "summary": f"Finding for {category}",
+                    "suggested_kpis": [{"name": f"KPI[{category}]", "rationale": "r"}],
                     "suggested_thresholds": [],
-                    "sources": [{"title": f"Source[{angle}]", "url": "https://example.com"}],
+                    "sources": [{"title": f"Source[{category}]", "url": "https://example.com"}],
                 },
             )
         return tool_use_result("update_draft", {"patch": _COMPLETE_PATCH, "confirmed": True})
@@ -149,28 +149,28 @@ async def test_research_fanout_writes_distinct_actor_events(async_db_session, se
 
     # Each research agent has its own distinct, real, non-generic trace: started -> at
     # least one searching/search_result pair -> completed. Crucially, agent 1's events
-    # never mention agent 2's angle and vice versa — proving they are not cross-labeled.
-    for i, spec in enumerate(_ANGLES, start=1):
+    # never mention agent 2's category and vice versa — proving they are not cross-labeled.
+    for i, spec in enumerate(_CATEGORIES, start=1):
         actor = f"research_agent_{i}"
         agent_rows = [r for r in rows if r.actor == actor]
         event_types = {r.event_type for r in agent_rows}
         assert "started" in event_types
         assert "completed" in event_types
-        assert any(spec["angle"] in r.message for r in agent_rows)
-        other_angle = _ANGLES[1 - (i - 1)]["angle"]
-        assert not any(other_angle in r.message for r in agent_rows), (
-            f"{actor}'s events mention the OTHER agent's angle {other_angle!r} — "
+        assert any(spec["name"] in r.message for r in agent_rows)
+        other_category = _CATEGORIES[1 - (i - 1)]["name"]
+        assert not any(other_category in r.message for r in agent_rows), (
+            f"{actor}'s events mention the OTHER agent's category {other_category!r} — "
             "actors are not being kept distinct."
         )
 
     master_types = {r.event_type for r in rows if r.actor == "master"}
-    assert "deciding_angles" in master_types
+    assert "deciding_categories" in master_types
     assert "proposing" in master_types
     assert "completed" in master_types
     # The message text is genuinely descriptive, not just the bare event_type code.
-    deciding = next(r for r in rows if r.actor == "master" and r.event_type == "deciding_angles")
-    assert _ANGLES[0]["angle"] in deciding.message
-    assert _ANGLES[1]["angle"] in deciding.message
+    deciding = next(r for r in rows if r.actor == "master" and r.event_type == "deciding_categories")
+    assert _CATEGORIES[0]["name"] in deciding.message
+    assert _CATEGORIES[1]["name"] in deciding.message
 
 
 async def test_multi_round_research_writes_distinct_round_tagged_events(async_db_session, seed_user_id: str) -> None:
@@ -184,30 +184,30 @@ async def test_multi_round_research_writes_distinct_round_tagged_events(async_db
     async_db_session.add(ChatSession(id=session_id, user_id=uuid.UUID(seed_user_id)))
     await async_db_session.commit()
 
-    round2_angle = {
-        "angle": "Escalation timing benchmarks",
-        "query_focus": "recommended incident escalation SLAs",
+    round2_category = {
+        "name": "Escalation timing benchmarks",
+        "focus": "recommended incident escalation SLAs",
     }
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
         names = _tools_offered(tools)
-        if "decide_research_angles" in names:
-            return tool_use_result("decide_research_angles", {"angles": _ANGLES})
+        if "decide_categories" in names:
+            return tool_use_result("decide_categories", {"categories": _CATEGORIES})
         if "assess_research_coverage" in names:
             return tool_use_result(
                 "assess_research_coverage",
                 {
                     "sufficient": False,
                     "reasoning": "Missing escalation timing coverage.",
-                    "next_angles": [round2_angle],
+                    "next_categories": [round2_category],
                 },
             )
         if "record_research_finding" in names:
-            angle = _angle_from_messages(messages)
+            category = _category_from_messages(messages)
             return tool_use_result(
                 "record_research_finding",
                 {
-                    "summary": f"Finding for {angle}",
+                    "summary": f"Finding for {category}",
                     "suggested_kpis": [],
                     "suggested_thresholds": [],
                     "sources": [],
@@ -248,20 +248,20 @@ async def test_multi_round_research_writes_distinct_round_tagged_events(async_db
     assert round1_rows, "expected round-1 events"
     assert round2_rows, "expected round-2 events"
 
-    # Round 2 has its own "research_agent_1" (one agent, for round2_angle) — same actor
+    # Round 2 has its own "research_agent_1" (one agent, for round2_category) — same actor
     # label as round 1's first agent, but a genuinely distinct round.
     round2_agent_rows = [r for r in round2_rows if r.actor == "research_agent_1"]
     assert round2_agent_rows
-    assert any(round2_angle["angle"] in r.message for r in round2_agent_rows)
-    assert not any(round2_angle["angle"] in r.message for r in round1_rows), (
-        "round 2's angle leaked into round 1's events — rounds are not being kept distinct"
+    assert any(round2_category["name"] in r.message for r in round2_agent_rows)
+    assert not any(round2_category["name"] in r.message for r in round1_rows), (
+        "round 2's category leaked into round 1's events — rounds are not being kept distinct"
     )
 
-    # Master's round-2 "deciding_angles" event uses genuinely distinct wording from round 1's.
+    # Master's round-2 "deciding_categories" event uses genuinely distinct wording from round 1's.
     round2_master_deciding = next(
-        r for r in round2_rows if r.actor == "master" and r.event_type == "deciding_angles"
+        r for r in round2_rows if r.actor == "master" and r.event_type == "deciding_categories"
     )
-    assert round2_angle["angle"] in round2_master_deciding.message
+    assert round2_category["name"] in round2_master_deciding.message
     assert "Round 2" in round2_master_deciding.message
 
 
@@ -312,17 +312,17 @@ def test_events_visible_mid_flight_via_api(client: TestClient, seed_user_id: str
             mid_flight_actor_snapshots.append({r.actor for r in rows})
 
         names = _tools_offered(tools)
-        if "decide_research_angles" in names:
-            return tool_use_result("decide_research_angles", {"angles": _ANGLES})
+        if "decide_categories" in names:
+            return tool_use_result("decide_categories", {"categories": _CATEGORIES})
         if "record_research_finding" in names:
-            angle = _angle_from_messages(messages)
+            category = _category_from_messages(messages)
             return tool_use_result(
                 "record_research_finding",
                 {
-                    "summary": f"Finding for {angle}",
+                    "summary": f"Finding for {category}",
                     "suggested_kpis": [],
                     "suggested_thresholds": [
-                        {"metric": "m", "value_or_range": "v", "source_note": angle}
+                        {"metric": "m", "value_or_range": "v", "source_note": category}
                     ],
                     "sources": [],
                 },

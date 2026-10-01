@@ -302,6 +302,13 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
 
   function renderNode(node: NestedKpiNode, depth: number): ReactNode {
     const isLeaf = node.children.length === 0;
+    // A top-level (depth 0) grouping node is a CATEGORY (see backend/app/ai/
+    // scorecard_builder.py's research fan-out and draft_schema.py's module docstring — a
+    // category is a Level-1 KpiDraft/KpiNode with no guidelines of its own, grouping its
+    // Level-2 children). Styled distinctly from an ordinary grouping KPI deeper in the
+    // tree so the category structure a scorecard was organized into on screen is
+    // unambiguous, not just a few pixels of extra indentation.
+    const isCategory = depth === 0 && !isLeaf;
     const isCollapsed = collapsed.has(node.id);
     const ladderOpen = openLadders.has(node.id);
     const coverage = guidelineCoverage(node);
@@ -317,7 +324,7 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
             isEditing
               ? "grid-cols-[minmax(0,1fr)_auto_auto] sm:grid-cols-[minmax(0,1fr)_5.5rem_6rem_8.5rem_4.5rem]"
               : "grid-cols-[minmax(0,1fr)_auto] sm:grid-cols-[minmax(0,1fr)_4.5rem_6rem_8.5rem]",
-            depth === 0 && "bg-bg/50",
+            isCategory ? "bg-lemon-soft/40" : depth === 0 && "bg-bg/50",
           )}
         >
           <div className="flex min-w-0 items-center gap-1.5" style={{ paddingLeft: `${depth * 1.25}rem` }}>
@@ -342,7 +349,13 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
                 <ChevronRight className={cn("size-3.5 transition-transform", !isCollapsed && "rotate-90")} />
               </button>
             )}
-            <Badge variant="muted" className="shrink-0">L{node.level}</Badge>
+            {isCategory ? (
+              <Badge variant="lemon" className="shrink-0 uppercase tracking-wide">
+                Category
+              </Badge>
+            ) : (
+              <Badge variant="muted" className="shrink-0">L{node.level}</Badge>
+            )}
             <div className="min-w-0 flex-1">
               {isEditing ? (
                 <RenameInput key={`${node.id}:${node.name}`} node={node} disabled={busy} onCommit={(v) => rename(node, v)} />
@@ -351,9 +364,10 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
               )}
               {!isLeaf && (
                 <p className="text-xs text-ink-muted">
-                  {node.children.length} sub-KPI{node.children.length === 1 ? "" : "s"} ·{" "}
+                  {node.children.length} {isCategory ? "KPI" : "sub-KPI"}
+                  {node.children.length === 1 ? "" : "s"} ·{" "}
                   <span className={childCheck.ok ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]"}>
-                    children sum {childCheck.sum}%
+                    {isCategory ? "KPIs" : "children"} sum {childCheck.sum}%
                     {!childCheck.ok && isEditing && ` (${childCheck.remaining > 0 ? "+" : ""}${childCheck.remaining}% to go)`}
                   </span>
                 </p>
@@ -435,7 +449,7 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
                 </span>
               )
             ) : (
-              <span className="text-ink-muted">grouping KPI</span>
+              <span className="text-ink-muted">{isCategory ? "category" : "grouping KPI"}</span>
             )}
           </span>
           {isEditing && (

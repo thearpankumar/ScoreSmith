@@ -1,7 +1,7 @@
 "use client";
 
 import { useId, useState, type ReactNode } from "react";
-import { ChevronDown, FileText, Plus, Send, Sparkles, Trash2, Undo2 } from "lucide-react";
+import { ChevronDown, FileText, FolderKanban, Plus, Send, Sparkles, Trash2, Undo2 } from "lucide-react";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
 import { Badge } from "@/components/ui/badge";
@@ -98,6 +98,161 @@ export function LivePreviewPanel({
       includedInScoring: true,
     };
     onChange({ ...draft, kpis: [...draft.kpis, kpi] });
+  }
+
+  /**
+   * Renders one KPI and, recursively, its children — the single mechanism behind BOTH
+   * plain nested indentation (unchanged for an un-categorized KPI) AND the new, visually
+   * distinct CATEGORY header (a top-level, i.e. `depth === 0`, KPI that other KPIs are
+   * nested under via `parentId`). A category never shows the weight-inclusion toggle or
+   * the "proposed" sparkle quite like a leaf KPI does (it carries no guidelines of its
+   * own — see api-client.ts's `mapDraft`), but IS still a real, editable KPI row: its name
+   * and weight can be edited, and removing it removes its nested KPIs too (see `removeKpi`).
+   */
+  function renderKpiNode(kpi: DraftKpi, depth: number): ReactNode {
+    const children = draft.kpis.filter((k) => k.parentId === kpi.id);
+    const isCategory = depth === 0 && children.length > 0;
+
+    if (isCategory) {
+      const childCheck = siblingWeightSum(
+        children.filter((c) => c.includedInScoring).map((c) => c.weight),
+      );
+      return (
+        <li key={kpi.id} className="space-y-1.5">
+          <div className="flex items-center gap-1.5 rounded-lg border border-lemon-ink/25 bg-lemon-soft/50 px-2 py-1.5">
+            <FolderKanban className="size-3.5 shrink-0 text-lemon-ink" aria-hidden />
+            <input
+              type="text"
+              value={kpi.name}
+              aria-label="Category name"
+              disabled={disabled}
+              onChange={(e) => patchKpi(kpi.id, { name: e.target.value })}
+              className={cn(INLINE_INPUT, "min-w-0 flex-1 text-xs font-semibold uppercase tracking-wide text-ink")}
+            />
+            <span className="shrink-0 text-[10px] font-medium text-ink-muted">
+              {children.length} KPI{children.length === 1 ? "" : "s"}
+            </span>
+            <div className="flex shrink-0 items-center">
+              <input
+                type="number"
+                min={0}
+                max={100}
+                step={1}
+                inputMode="numeric"
+                value={Number.isFinite(kpi.weight) ? kpi.weight : ""}
+                aria-label={`Weight for category ${kpi.name || "Category"} (percent)`}
+                disabled={disabled}
+                onChange={(e) => {
+                  const n = e.target.value === "" ? 0 : Math.min(100, Math.max(0, Number(e.target.value)));
+                  if (Number.isFinite(n)) patchKpi(kpi.id, { weight: n });
+                }}
+                className={cn(INLINE_INPUT, "w-12 text-right text-xs font-semibold tabular-nums")}
+              />
+              <span className="text-xs text-ink-muted">%</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => removeKpi(kpi.id)}
+              disabled={disabled}
+              className="shrink-0 rounded-md p-1 text-ink-muted hover:bg-black/5 hover:text-[var(--rag-poor)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)] disabled:opacity-50"
+              aria-label={`Remove category ${kpi.name} and its KPIs`}
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </div>
+          <div className="flex items-center gap-1.5 pl-2 text-[10px] text-ink-muted">
+            <span
+              className={childCheck.ok ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]"}
+              title={`${kpi.name || "This category"}'s KPIs should sum to 100%`}
+            >
+              Σ {childCheck.sum}%
+            </span>
+          </div>
+          <ul className="ml-2 space-y-1.5 border-l border-hairline pl-3">
+            {children.map((c) => renderKpiNode(c, depth + 1))}
+          </ul>
+        </li>
+      );
+    }
+
+    return (
+      <li key={kpi.id}>
+        <div
+          className={cn(
+            "flex items-center gap-1.5 rounded-lg border px-1.5 py-1",
+            kpi.status === "proposed" ? "border-dashed border-hairline" : "border-hairline bg-white/70",
+          )}
+        >
+          <div className="min-w-0 flex-1">
+            <input
+              type="text"
+              value={kpi.name}
+              aria-label={`KPI name (level ${kpi.level})`}
+              disabled={disabled}
+              onChange={(e) => patchKpi(kpi.id, { name: e.target.value })}
+              className={cn(INLINE_INPUT, "w-full text-xs")}
+            />
+            {kpi.status === "proposed" && (
+              <span className="ml-1.5 flex items-center gap-0.5 text-[10px] text-lemon-ink">
+                <Sparkles className="size-2.5" aria-hidden />
+                proposed
+              </span>
+            )}
+          </div>
+          <div className="flex shrink-0 items-center">
+            <input
+              type="number"
+              min={0}
+              max={100}
+              step={1}
+              inputMode="numeric"
+              value={Number.isFinite(kpi.weight) ? kpi.weight : ""}
+              aria-label={`Weight for ${kpi.name || "KPI"} (percent)`}
+              disabled={disabled}
+              onChange={(e) => {
+                const n = e.target.value === "" ? 0 : Math.min(100, Math.max(0, Number(e.target.value)));
+                if (Number.isFinite(n)) patchKpi(kpi.id, { weight: n });
+              }}
+              className={cn(INLINE_INPUT, "w-14 text-right text-xs tabular-nums")}
+            />
+            <span className="text-xs text-ink-muted">%</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => patchKpi(kpi.id, { includedInScoring: !kpi.includedInScoring })}
+            disabled={disabled}
+            title={
+              kpi.includedInScoring
+                ? "Exclude from the weighted score (still tracked/scored, just doesn't count toward the 100% total)"
+                : "Include back in the weighted score"
+            }
+            className={cn(
+              "shrink-0 rounded px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide",
+              "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--focus)]",
+              kpi.includedInScoring
+                ? "text-ink-muted hover:bg-black/5 hover:text-ink"
+                : "bg-lemon-soft/60 text-lemon-ink",
+            )}
+          >
+            {kpi.includedInScoring ? "Scored" : "Excl."}
+          </button>
+          <button
+            type="button"
+            onClick={() => removeKpi(kpi.id)}
+            disabled={disabled}
+            className="shrink-0 rounded-md p-1 text-ink-muted hover:bg-black/5 hover:text-[var(--rag-poor)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)] disabled:opacity-50"
+            aria-label={`Remove KPI ${kpi.name}`}
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        </div>
+        {children.length > 0 && (
+          <ul className="mt-1.5 space-y-1.5" style={{ marginLeft: "0.75rem" }}>
+            {children.map((c) => renderKpiNode(c, depth + 1))}
+          </ul>
+        )}
+      </li>
+    );
   }
 
   return (
@@ -223,81 +378,22 @@ export function LivePreviewPanel({
 
             {draft.kpis.length === 0 && <p className="mb-2 text-xs italic text-ink-muted">Not proposed yet.</p>}
 
-            <ul className="space-y-1.5">
-              {draft.kpis.map((kpi) => (
-                <li
-                  key={kpi.id}
-                  className={cn(
-                    "flex items-center gap-1.5 rounded-lg border px-1.5 py-1",
-                    kpi.status === "proposed" ? "border-dashed border-hairline" : "border-hairline bg-white/70",
-                  )}
-                  style={{ marginLeft: `${(kpi.level - 1) * 0.75}rem` }}
-                >
-                  <div className="min-w-0 flex-1">
-                    <input
-                      type="text"
-                      value={kpi.name}
-                      aria-label={`KPI name (level ${kpi.level})`}
-                      disabled={disabled}
-                      onChange={(e) => patchKpi(kpi.id, { name: e.target.value })}
-                      className={cn(INLINE_INPUT, "w-full text-xs")}
-                    />
-                    {kpi.status === "proposed" && (
-                      <span className="ml-1.5 flex items-center gap-0.5 text-[10px] text-lemon-ink">
-                        <Sparkles className="size-2.5" aria-hidden />
-                        proposed
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex shrink-0 items-center">
-                    <input
-                      type="number"
-                      min={0}
-                      max={100}
-                      step={1}
-                      inputMode="numeric"
-                      value={Number.isFinite(kpi.weight) ? kpi.weight : ""}
-                      aria-label={`Weight for ${kpi.name || "KPI"} (percent)`}
-                      disabled={disabled}
-                      onChange={(e) => {
-                        const n = e.target.value === "" ? 0 : Math.min(100, Math.max(0, Number(e.target.value)));
-                        if (Number.isFinite(n)) patchKpi(kpi.id, { weight: n });
-                      }}
-                      className={cn(INLINE_INPUT, "w-14 text-right text-xs tabular-nums")}
-                    />
-                    <span className="text-xs text-ink-muted">%</span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => patchKpi(kpi.id, { includedInScoring: !kpi.includedInScoring })}
-                    disabled={disabled}
-                    title={
-                      kpi.includedInScoring
-                        ? "Exclude from the weighted score (still tracked/scored, just doesn't count toward the 100% total)"
-                        : "Include back in the weighted score"
-                    }
-                    className={cn(
-                      "shrink-0 rounded px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide",
-                      "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--focus)]",
-                      kpi.includedInScoring
-                        ? "text-ink-muted hover:bg-black/5 hover:text-ink"
-                        : "bg-lemon-soft/60 text-lemon-ink",
-                    )}
-                  >
-                    {kpi.includedInScoring ? "Scored" : "Excl."}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => removeKpi(kpi.id)}
-                    disabled={disabled}
-                    className="shrink-0 rounded-md p-1 text-ink-muted hover:bg-black/5 hover:text-[var(--rag-poor)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)] disabled:opacity-50"
-                    aria-label={`Remove KPI ${kpi.name}`}
-                  >
-                    <Trash2 className="size-3.5" />
-                  </button>
-                </li>
-              ))}
-            </ul>
+            {/*
+             * CATEGORY GROUPING: a Level-1 KPI that other KPIs reference via `parentId` is
+             * a CATEGORY (see backend/app/ai/draft_schema.py / scorecard_builder.py's
+             * research fan-out — a category is a level=1 KpiDraft with its own weight and
+             * no guidelines, each researched KPI nested under it via `parent_name`). It
+             * renders as a distinct, labeled header — never just a few extra pixels of
+             * indentation — with its own KPIs listed underneath it, matching the requested
+             *   <category-name>
+             *     - <KPI-name>
+             *   <category-name>
+             *     - <KPI-name>
+             * nested format. A top-level KPI with NO children (an ordinary flat KPI, or a
+             * domain simple enough that the assistant didn't categorize it) renders exactly
+             * as before — categorization is additive, not forced.
+             */}
+            <ul className="space-y-2.5">{topLevel.map((kpi) => renderKpiNode(kpi, 0))}</ul>
 
             <Button type="button" variant="ghost" size="sm" onClick={addKpi} disabled={disabled} className="mt-2">
               <Plus className="size-3.5" aria-hidden />

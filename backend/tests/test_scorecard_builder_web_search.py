@@ -7,8 +7,8 @@ only exercised by the live end-to-end pass, not by `pytest`).
 Since `research_kpis` (see app/ai/scorecard_builder.py) now runs once, ahead of
 `propose_kpis`, on any session wired with a `web_search_client`, every `converse_fn` below
 dispatches on the OFFERED TOOL NAMES rather than call position/count — robust to that extra
-"decide research angles" call, and clearer about which node's turn is being scripted.
-Tests here script `decide_research_angles` to return NO angles (`angles: []`), i.e. "this
+"decide categories" call, and clearer about which node's turn is being scripted.
+Tests here script `decide_categories` to return NO categories (`categories: []`), i.e. "this
 domain doesn't need a dedicated research fan-out" — deliberately isolating and exercising
 propose_kpis's own single-agent ad hoc `web_search` loop, unrelated to the fan-out itself
 (see test_scorecard_builder_research.py for the fan-out's own concurrency/grounding/
@@ -53,13 +53,13 @@ def _tools_offered(tools) -> set[str]:
     return {t.name for t in (tools or [])}
 
 
-def _no_dedicated_research_angles(tools) -> tuple[bool, object]:
-    """If `decide_research_angles` is being offered (research_kpis's own call), respond
-    with an empty angle list — "no dedicated fan-out needed for this domain" — so the rest
+def _no_dedicated_research_categories(tools) -> tuple[bool, object]:
+    """If `decide_categories` is being offered (research_kpis's own call), respond
+    with an empty category list — "no dedicated fan-out needed for this domain" — so the rest
     of the scripted conversation exercises propose_kpis's own ad hoc web_search loop in
     isolation. Returns (handled, response)."""
-    if "decide_research_angles" in _tools_offered(tools):
-        return True, tool_use_result("decide_research_angles", {"angles": []})
+    if "decide_categories" in _tools_offered(tools):
+        return True, tool_use_result("decide_categories", {"categories": []})
     return False, None
 
 
@@ -72,7 +72,7 @@ async def test_web_search_tool_offered_and_results_fed_back_into_proposal() -> N
     propose_call_log: list[dict] = []
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
-        handled, response = _no_dedicated_research_angles(tools)
+        handled, response = _no_dedicated_research_categories(tools)
         if handled:
             return response
         propose_call_log.append({"messages": messages, "tools": tools})
@@ -119,7 +119,7 @@ async def test_web_search_not_offered_when_no_client_wired() -> None:
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
         assert "web_search" not in _tools_offered(tools)
-        assert "decide_research_angles" not in _tools_offered(tools)
+        assert "decide_categories" not in _tools_offered(tools)
         return tool_use_result("update_draft", {"patch": _COMPLETE_PATCH, "confirmed": True})
 
     fake_bedrock = FakeBedrockClient(converse_fn=converse_fn)
@@ -138,7 +138,7 @@ async def test_bounded_search_loop_forces_closure_after_budget() -> None:
     session_id = str(uuid.uuid4())
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
-        handled, response = _no_dedicated_research_angles(tools)
+        handled, response = _no_dedicated_research_categories(tools)
         if handled:
             return response
         if "web_search" in _tools_offered(tools):
@@ -157,7 +157,7 @@ async def test_bounded_search_loop_forces_closure_after_budget() -> None:
 
     # llm_turn_count increments once per propose_kpis NODE VISIT, regardless of how many
     # web_search sub-calls happened inside that single visit's inner loop, and regardless
-    # of research_kpis's own (separate) decide-angles call — see MAX_LLM_TURNS_PER_HUMAN_TURN
+    # of research_kpis's own (separate) decide-categories call — see MAX_LLM_TURNS_PER_HUMAN_TURN
     # docs in scorecard_builder.py for why research_kpis never touches this counter.
     compiled = await sb.get_graph_manager().get_compiled_graph()
     snapshot = await compiled.aget_state({"configurable": {"thread_id": session_id}})
@@ -172,7 +172,7 @@ async def test_failed_web_search_returns_empty_and_does_not_break_turn() -> None
     propose_call_log: list[dict] = []
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
-        handled, response = _no_dedicated_research_angles(tools)
+        handled, response = _no_dedicated_research_categories(tools)
         if handled:
             return response
         propose_call_log.append(1)
@@ -199,7 +199,7 @@ async def test_web_search_client_raising_unexpectedly_is_swallowed() -> None:
     propose_call_log: list[dict] = []
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
-        handled, response = _no_dedicated_research_angles(tools)
+        handled, response = _no_dedicated_research_categories(tools)
         if handled:
             return response
         propose_call_log.append(1)

@@ -67,9 +67,11 @@ def test_validate_kpi_batch_items_recovers_bare_string_guidelines_instead_of_dro
             "guidelines": _bare_string_guidelines("No review performed"),
         }
     ]
-    validated = sb._validate_kpi_batch_items(raw_items)
+    validated = sb._validate_kpi_batch_items(raw_items, "Test Category")
     assert len(validated) == 1
     assert validated[0]["name"] == "Substantive Review Comments Per Pull Request"
+    assert validated[0]["level"] == 2
+    assert validated[0]["parent_name"] == "Test Category"
     assert len(validated[0]["guidelines"]) == 11
     assert validated[0]["guidelines"]["0"]["qualitative_text"].startswith("No review performed")
 
@@ -78,7 +80,7 @@ def test_validate_kpi_batch_items_still_drops_a_genuinely_invalid_item() -> None
     """The fix must NOT paper over a REAL validation failure (e.g. a weight out of the
     0-100 range) — only the specific bare-string-guideline shape is repaired."""
     raw_items = [{"name": "Bad Weight KPI", "weight": 250, "guidelines": _bare_string_guidelines("x")}]
-    assert sb._validate_kpi_batch_items(raw_items) == []
+    assert sb._validate_kpi_batch_items(raw_items, "Test Category") == []
 
 
 # --- End-to-end: the same repair inside a real research-agent batch call ----------------
@@ -89,15 +91,15 @@ async def test_research_agent_batch_with_bare_string_guidelines_is_recovered_end
     tool call returns KPIs with bare-string guidelines (exactly as GLM-5 did live) — the
     KPI must now survive into the final merged draft instead of being silently dropped."""
     session_id = str(uuid.uuid4())
-    angle = {"angle": "Test angle", "query_focus": "Test focus"}
+    category = {"name": "Test Category", "focus": "Test focus"}
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
         names = {t.name for t in (tools or [])}
-        if "decide_research_angles" in names:
-            return tool_use_result("decide_research_angles", {"angles": [angle]})
+        if "decide_categories" in names:
+            return tool_use_result("decide_categories", {"categories": [category]})
         if "assess_research_coverage" in names:
             return tool_use_result(
-                "assess_research_coverage", {"sufficient": True, "reasoning": "ok", "next_angles": []}
+                "assess_research_coverage", {"sufficient": True, "reasoning": "ok", "next_categories": []}
             )
         if "record_research_finding" in names:
             return tool_use_result(

@@ -8,11 +8,11 @@ import type { ChatTurnEvent } from "@/lib/types";
  * Replaces the old generic "Assistant is thinking…" bouncing-dots indicator with a real,
  * granular, LIVE trace of what the AI pipeline is actually doing — including, when the
  * multi-agent research fan-out (`research_kpis` in `backend/app/ai/scorecard_builder.py`)
- * spawns up to `MAX_RESEARCH_ANGLES` concurrent research agents, what EACH one is doing
- * individually (its own searches, result counts, synthesis) — not just one shared
- * "thinking" line for the whole turn.
+ * spawns up to `MAX_CATEGORIES` concurrent research agents (one per decided KPI category),
+ * what EACH one is doing individually (its own searches, result counts, synthesis) — not
+ * just one shared "thinking" line for the whole turn.
  *
- * Layout: a "Master" section for the orchestrator (`research_kpis`'s angle-deciding step,
+ * Layout: a "Master" section for the orchestrator (`research_kpis`'s category-deciding step,
  * `propose_kpis`'s consolidate/propose/confirm steps), plus one card per concurrently
  * running research agent, laid out in a grid so it visually reads as "several things
  * happening at once", not a single sequential list — the exact problem the old indicator

@@ -162,7 +162,15 @@ UPDATE_DRAFT_TOOL = ToolSpec(
                     "rung with no quantitative benchmark rather than writing prose into it. "
                     "Pass an empty object `{}` here (not an omitted `patch`, since `patch` "
                     "is required) when confirming an already-complete draft with nothing "
-                    "left to change."
+                    "left to change. CATEGORIES: when it's useful for the domain, organize "
+                    "`kpis` into named categories (e.g. 'Schedule', 'Budget', 'Quality') — "
+                    "a category is a `level=1` KPI with `parent_name=null` and its OWN "
+                    "weight (no guidelines needed on the category itself), and each KPI "
+                    "belonging to it is a `level=2` KPI with `parent_name` set to that "
+                    "category's exact name. Category weights must sum to 100 across "
+                    "categories, and each category's own children must separately sum to "
+                    "100 within that category — the same sibling-weight-sum-to-100 rule "
+                    "applied at both levels."
                 ),
             },
             "confirmed": {
@@ -329,7 +337,7 @@ MAX_WEB_SEARCH_CALLS_PER_PROPOSE = 3
 # research_kpis fan-out's findings, exactly like the graceful-degradation path when no
 # web_search_client is wired in at all. Does NOT count research_kpis's own fan-out search
 # calls (those are already separately, tightly bounded by MAX_RESEARCH_ROUNDS x
-# MAX_RESEARCH_ANGLES x MAX_SEARCH_CALLS_PER_RESEARCH_AGENT — see those constants) — mixing
+# MAX_CATEGORIES x MAX_SEARCH_CALLS_PER_RESEARCH_AGENT — see those constants) — mixing
 # the two counters would conflate two independently-reasoned-about budgets for no benefit.
 MAX_WEB_SEARCH_CALLS_PER_SESSION = 15
 
@@ -337,27 +345,45 @@ MAX_WEB_SEARCH_CALLS_PER_SESSION = 15
 # --- Multi-agent research fan-out (research_kpis node) ----------------------------------
 #
 # Genuine concurrent fan-out, run ONCE per session (guarded by BuilderState.research_done),
-# immediately before the first propose_kpis call: one Bedrock call decides 0-MAX_RESEARCH_
-# ANGLES distinct research angles for the user's stated domain/purpose, then that many
-# instances of the SAME bounded research-agent worker (`_run_research_agent` below — one
-# definition, N concurrent invocations via `asyncio.gather`, mirroring judge.py's
-# k-ensemble concurrency idiom) each independently research their one angle with their own
-# small web_search budget, and return a structured `ResearchFinding`.
+# immediately before the first propose_kpis call: one Bedrock call decides 0-MAX_CATEGORIES
+# named, business-recognizable KPI CATEGORIES for the user's stated domain/purpose — e.g.
+# for a project-milestone quality scorecard: "Schedule", "Budget", "Quality" (a real example
+# from the product owner: "Schedule (4 KPIs), Budget (4 KPIs), Quality (12 KPIs)") — never
+# abstract "research angles" a business user wouldn't recognize. The category decision IS
+# the research assignment: each category dispatches exactly one instance of the SAME bounded
+# research-agent worker (`_run_research_agent` below — one definition, N concurrent
+# invocations via `asyncio.gather`, mirroring judge.py's k-ensemble concurrency idiom), which
+# researches and proposes KPIs scoped SPECIFICALLY to that one category — not a generic
+# "angle" that might or might not end up mapping onto the final structure.
 #
-# **KPI batching (the fix for "chat only ever proposes 4 KPIs")**: each research agent, once
-# it has recorded its finding, makes ONE additional bounded tool call
-# (`propose_kpi_batch`/`PROPOSE_KPI_BATCH_TOOL`) proposing its OWN small batch (2-4) of
-# fully-specified KPIs — name, weight, AND full 11-level guidelines each — grounded
-# entirely in ITS OWN research (it already has the context; no separate downstream call
-# re-derives them). Doing this once per agent, in parallel, is the actual mechanism that
-# lets the TOTAL KPI count grow with the number of research angles instead of being capped
-# by how much one giant end-of-pipeline tool call can productively pack into one JSON
-# response — the root cause of the old "always 4 KPIs" behavior. `research_kpis` (below)
-# merges every agent's batch (dedup + weight-renormalize + cap — see
-# `_merge_research_kpi_batches`) directly into `draft.kpis` BEFORE `propose_kpis` ever
-# runs, so `propose_kpis`'s job shifts from "generate KPIs from scratch" to "review this
-# already-comprehensive, already-grounded set and reconcile/confirm it with the user" (see
-# `propose_kpis`'s own docstring/system prompt update).
+# **Category = Level-1 KpiDraft; its KPIs = Level-2 KpiDraft(parent_name=category)**: this
+# reuses `draft_schema.py`'s existing, already-fully-supported-end-to-end (by
+# `materialize_draft` and the real DB schema — see that module's docstring) hierarchy
+# mechanism completely unchanged — a "category" is simply a `KpiDraft(level=1,
+# parent_name=None)`, and each KPI researched under it is a `KpiDraft(level=2,
+# parent_name=<category name>)`. No schema change of any kind; this is purely how THIS
+# generation pipeline now shapes what it proposes. Categories carry their own `weight` too
+# (summing to 100 across categories, mirroring the DB's per-parent-group sibling-weight-sum-
+# to-100 rule, which already operates generically/identically at every level of the
+# hierarchy) — see `_merge_research_kpi_batches` for exactly how that weight is derived.
+#
+# **KPI batching** (the mechanism, carried over unchanged in spirit from before this
+# category restructure, that lets the TOTAL KPI count grow with research breadth instead of
+# being capped by what one giant end-of-pipeline tool call could pack into a single JSON
+# response): each research agent, once it has recorded its finding, makes ONE additional
+# bounded tool call (`propose_kpi_batch`/`PROPOSE_KPI_BATCH_TOOL`) proposing its OWN small
+# batch of fully-specified KPIs — name, weight, AND full 11-level guidelines each — grounded
+# entirely in ITS OWN research. Every item in that batch is AUTOMATICALLY tagged
+# `level=2, parent_name=<its category>` server-side (see `_validate_kpi_batch_items`) — a
+# research agent never has to (and cannot) decide its own place in the hierarchy, since it
+# IS that category's dedicated research assignment by construction. `research_kpis` merges
+# every agent's batch (cross-category dedup + per-category weight-renormalize + category-
+# level weight-renormalize + a total safety cap — see `_merge_research_kpi_batches`) directly
+# into `draft.kpis` BEFORE `propose_kpis` ever runs, so `propose_kpis`'s job shifts from
+# "generate KPIs from scratch" to "review this already-comprehensive, already-categorized,
+# already-grounded set and reconcile/confirm it with the user" (see `propose_kpis`'s own
+# system prompt, which now also explicitly preserves the category structure on any further
+# reconciliation edit).
 #
 # All findings (KPI batches included) are also consolidated into
 # `BuilderState.research_findings` and woven into every subsequent propose_kpis system
@@ -371,134 +397,149 @@ MAX_WEB_SEARCH_CALLS_PER_SESSION = 15
 # run at most once per session (not once per propose_kpis visit), it adds one bounded burst
 # of latency on the session's first turn and is a no-op on every later human turn — it
 # cannot itself cause propose_kpis to loop more times, so MAX_LLM_TURNS_PER_HUMAN_TURN's
-# existing value needs no adjustment for this feature. The one extra
-# `propose_kpi_batch` call each research agent now makes similarly doesn't touch
-# MAX_SEARCH_CALLS_PER_RESEARCH_AGENT (it isn't a web_search call) or any per-propose_kpis
-# budget — it's one more bounded Bedrock call inside a node that already ran exactly once.
-# MAX_LLM_TURNS_PER_HUMAN_TURN itself is ALSO left unchanged even though propose_kpis's job
-# changed: reviewing/renormalizing/confirming an already-populated, already-grounded draft
-# is if anything LESS work per turn than generating one from scratch, so the existing
-# budget (4 consecutive turns) remains generous for that lighter task.
-MAX_RESEARCH_ANGLES = 4
+# existing value needs no adjustment. The one extra `propose_kpi_batch` call each research
+# agent makes similarly doesn't touch MAX_SEARCH_CALLS_PER_RESEARCH_AGENT (it isn't a
+# web_search call) or any per-propose_kpis budget.
+MAX_CATEGORIES = 5
 MAX_SEARCH_CALLS_PER_RESEARCH_AGENT = 2
 
-# How many KPIs one research agent proposes in its own batch (small and bounded, per KPI
-# batch tool call, is exactly what lets the total grow — see the module comment above), and
-# the hard ceiling on the TOTAL merged/deduped KPI count `research_kpis` will hand to
-# propose_kpis — a safety cap ("can't run away"), deliberately NOT a fixed target (real
-# coverage is driven by what research actually surfaced: with 0 angles this is 0, with a
-# narrow domain it might land under the cap even with several agents, per the explicit
-# "never just a fixed N" instruction).
-MAX_KPIS_PER_RESEARCH_BATCH = 4
-MAX_TOTAL_MERGED_KPIS = 24
+# How many KPIs one research agent proposes in its own batch (per category), and the hard
+# ceiling on the TOTAL merged/deduped KPI count `research_kpis` will hand to propose_kpis —
+# a safety cap ("can't run away"), deliberately NOT a fixed target (real coverage is driven
+# by what research actually surfaced). Both bumped slightly from this feature's earlier,
+# pre-category values (4 / 24): each batch now maps 1:1 onto a whole thematic CATEGORY (e.g.
+# "Quality") rather than one narrow "angle", and a category — per the product owner's own
+# real example ("Quality (12 KPIs)" vs. "Schedule (4 KPIs)") — can legitimately need more
+# than 4 KPIs of its own even before a second research round (see MAX_RESEARCH_ROUNDS below)
+# deepens it further.
+MAX_KPIS_PER_RESEARCH_BATCH = 6
+MAX_TOTAL_MERGED_KPIS = 30
 
 # --- Iterative / multi-round research (bounded) -----------------------------------------
 #
-# Originally `research_kpis` ran exactly ONE round: decide angles -> fan out -> merge ->
-# fall through to propose_kpis, unconditionally. The owner's ask: if the master isn't
-# confident that round's research is genuinely sufficient, let it launch ONE MORE bounded
-# round of research agents — with NEW/REFINED angles targeting whatever gap it identified
-# (see `_assess_research_coverage`), not a repeat of the same searches — before ever
-# reaching propose_kpis.
+# `research_kpis` runs round 1 (decide categories -> fan out one agent per category -> merge
+# into the category/KPI hierarchy), then — if the master isn't confident that round's
+# research genuinely covers the domain, and `MAX_RESEARCH_ROUNDS` hasn't been reached yet —
+# launches ONE more bounded round (see `_assess_research_coverage`). A category composes
+# cleanly across rounds with ZERO extra plumbing: `_assess_research_coverage` can propose
+# either a genuinely NEW category (a name never used before) or the EXACT same name as an
+# existing category to "deepen" it (more KPIs for a category whose round-1 coverage felt
+# shallow) — either way, round 2's research agent(s) tag their batch with that category name
+# exactly like round 1 did, and the merge step (which re-groups ALL rounds' findings by
+# category name every time it runs — see `_merge_research_kpi_batches`) naturally folds a
+# "deepen" round's new KPIs in alongside that same category's round-1 KPIs (deduped,
+# renormalized together), while a genuinely new category name naturally becomes its own
+# additional Level-1 node. No separate "is this a new or existing category" branch is needed
+# anywhere in this module — grouping by name is the entire mechanism.
 #
 # Why the cap is 2, not 3+ (explicit latency/cost reasoning, not a reflexive round number):
-# each round is itself 2-4 CONCURRENT research agents, and each agent makes up to
+# each round is itself 2-5 CONCURRENT research agents, and each agent makes up to
 # MAX_SEARCH_CALLS_PER_RESEARCH_AGENT (2) web_search calls PLUS one record_research_finding
 # call PLUS one propose_kpi_batch call — i.e. up to ~4 sequential Bedrock/web_search round-
 # trips per agent, observed live (per this project's own prior live-testing passes) to take
 # 20-90+ seconds for a SINGLE round depending on model/Gateway latency. A second round adds
 # one more `_assess_research_coverage` call (cheap, one Bedrock call) plus a second full
 # agent fan-out (another 20-90+s) — already a meaningful chunk of a synchronous HTTP
-# request's total latency (the chat-turn endpoints block for the whole LangGraph run per
-# this module's docstring). A THIRD round would compound that same cost again for
-# diminishing returns (by round 3, coverage gaps worth a dedicated concurrent fan-out are
-# rare — see `_ASSESS_COVERAGE_SYSTEM_PROMPT`'s explicit "most domains ARE adequately
-# covered after one round" framing) while risking a chat turn that feels broken/hung to a
-# user waiting on a single HTTP response. 2 is therefore the default; bumping to 3 is a
-# one-line change here if the product later decides the extra latency is worth it for
-# specific domains, but nothing in this implementation hardcodes "exactly 2" anywhere else.
+# request's total latency. A THIRD round would compound that same cost again for diminishing
+# returns while risking a chat turn that feels broken/hung to a user waiting on a single HTTP
+# response. 2 is therefore the default; bumping it is a one-line change if the product later
+# decides the extra latency is worth it for specific domains.
 #
-# Interaction with MAX_LLM_TURNS_PER_HUMAN_TURN (the real bug from an earlier pass this
-# task explicitly calls out: propose_kpis running out of turns before ever confirming) —
-# **this cannot recur from multi-round research**, by construction: every round of the
-# loop, the angle-decision call, AND every `_assess_research_coverage` call all happen
-# INSIDE this one `research_kpis` node invocation (a plain Python `while` loop below, not
-# additional LangGraph nodes/edges) — `research_kpis` still runs at MOST once per session
-# (guarded by `research_done`, unchanged) and still never touches `llm_turn_count` (that
-# counter only increments on each `propose_kpis` node VISIT — see that counter's own
-# docstring). So however many research rounds run (1 or MAX_RESEARCH_ROUNDS), propose_kpis
-# always starts its own turn budget completely fresh at MAX_LLM_TURNS_PER_HUMAN_TURN (4) —
-# research rounds and the reconciliation/confirmation turns that follow are accounted
-# entirely separately, by simply never sharing a counter, rather than needing any new
-# bookkeeping to keep them apart.
+# Interaction with MAX_LLM_TURNS_PER_HUMAN_TURN: unchanged from before this category
+# restructure — every round of the loop, the category-decision call, AND every
+# `_assess_research_coverage` call all happen INSIDE this one `research_kpis` node
+# invocation (a plain Python `while` loop below, not additional LangGraph nodes/edges), which
+# still runs at MOST once per session and still never touches `llm_turn_count`.
 MAX_RESEARCH_ROUNDS = 2
 
 # --- Quality gate (self-critique layer via Jev/OpenRouter — see app/ai/jev_client.py) ---
 #
 # Three checkpoints, each wrapping an existing decision point with a bounded
-# instruction/answer "does this genuinely serve the request?" rating from Jev:
-#   1. _decide_research_angles's plan (research_kpis) — see _decide_research_angles_with_gate.
-#   2. Each research agent's synthesized finding (_run_research_agent), right after
-#      record_research_finding.
+# instruction/answer "does this genuinely serve the request?" rating from Jev — reframed
+# around categories, not removed or weakened:
+#   1. The decided CATEGORY PLAN (research_kpis) — see _decide_categories_with_gate. Rates
+#      the plan (category names + their research focus) against the user's actual request.
+#   2. Each category research agent's synthesized finding (_run_research_agent), right after
+#      record_research_finding — rated against THAT agent's assigned category/focus
+#      specifically, never a generic "did you do something useful" check.
 #   3. propose_kpis's final per-visit decision (ask_clarification/update_draft/
-#      update_scoring_formula/respond_conversationally).
+#      update_scoring_formula/respond_conversationally) — unchanged by this restructure.
 #
 # MAX_QUALITY_GATE_RETRIES=2 (the same "original attempt + up to 2 revisions" shape used
 # throughout this module already — see MAX_RESEARCH_ROUNDS/MAX_WEB_SEARCH_CALLS_PER_
 # PROPOSE for the same "small, explicit, bounded" pattern): a checkpoint that never clears
 # QUALITY_GATE_THRESHOLD (0.75, from jev_client.py) after 2 revision attempts proceeds
 # with its BEST-SCORING attempt seen so far rather than hanging the turn or silently
-# dropping the result — "never silently hang or crash a turn over this" is the task's own
-# explicit requirement. `quality_gate()` itself never raises (see jev_client.py), so an
+# dropping the result. `quality_gate()` itself never raises (see jev_client.py), so an
 # unreachable Jev degrades every checkpoint to "passed, no retry" transparently — these
 # retry loops only ever engage on a REAL, successfully-obtained low score.
 MAX_QUALITY_GATE_RETRIES = 2
 
-DECIDE_RESEARCH_ANGLES_TOOL = ToolSpec(
-    name="decide_research_angles",
+DECIDE_CATEGORIES_TOOL = ToolSpec(
+    name="decide_categories",
     description=(
-        "Decide which distinct research angles are worth investigating on the web to "
-        "ground the KPIs and quantitative thresholds you'll propose for this domain. "
-        "Each angle is handed to an independent research agent that runs concurrently "
-        "with the others."
+        "Decide which distinct, business-recognizable KPI CATEGORIES this scorecard's "
+        "domain calls for — e.g. for a project-milestone quality scorecard: 'Schedule', "
+        "'Budget', 'Quality'. Each category becomes its own top-level grouping in the "
+        "final scorecard AND is handed to one independent research agent, running "
+        "concurrently with the others, that researches and proposes KPIs belonging "
+        "specifically to that category. This is NOT a list of abstract research topics — "
+        "it IS the category structure the user will see grouping their KPIs, so pick names "
+        "a business user in this domain would immediately recognize, never a vague research "
+        "theme."
     ),
     input_schema={
         "type": "object",
         "properties": {
-            "angles": {
+            "categories": {
                 "type": "array",
                 "minItems": 0,
-                "maxItems": MAX_RESEARCH_ANGLES,
+                "maxItems": MAX_CATEGORIES,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "angle": {
+                        "name": {
                             "type": "string",
                             "description": (
-                                "A short label for this research angle, e.g. "
-                                "'Industry MTTR/MTTD benchmarks'."
+                                "The category's name EXACTLY as it should appear to the "
+                                "user, e.g. 'Schedule', 'Budget', 'Quality' — short, plain, "
+                                "business-recognizable."
                             ),
                         },
-                        "query_focus": {
+                        "focus": {
                             "type": "string",
                             "description": (
-                                "A specific, researchable question or focus for this angle "
-                                "(not a vague topic) — this is what the research agent is told to investigate."
+                                "A specific, researchable brief for this category's "
+                                "dedicated research agent: what to investigate on the web "
+                                "to ground this category's KPIs and quantitative "
+                                "thresholds (not a vague topic)."
+                            ),
+                        },
+                        "initial_weight": {
+                            "type": ["number", "null"],
+                            "description": (
+                                "OPTIONAL relative weight (0-100) for this category among "
+                                "the OTHERS you're deciding now (e.g. Quality might "
+                                "reasonably outweigh Schedule for a milestone scorecard). "
+                                "Every category's weight is renormalized to sum to 100 "
+                                "once research is in, so this only needs to be your best "
+                                "relative judgment now — omit/null for an equal default "
+                                "share instead."
                             ),
                         },
                     },
-                    "required": ["angle", "query_focus"],
+                    "required": ["name", "focus"],
                 },
             },
         },
-        "required": ["angles"],
+        "required": ["categories"],
     },
 )
 
 RECORD_RESEARCH_FINDING_TOOL = ToolSpec(
     name="record_research_finding",
     description=(
-        "Record your research finding for YOUR SINGLE assigned angle. Call this exactly "
+        "Record your research finding for YOUR SINGLE assigned category. Call this exactly "
         "once, after using your web_search budget (if you used it)."
     ),
     input_schema={
@@ -506,7 +547,7 @@ RECORD_RESEARCH_FINDING_TOOL = ToolSpec(
         "properties": {
             "summary": {
                 "type": "string",
-                "description": "A concise summary of what you found for this angle.",
+                "description": "A concise summary of what you found for this category.",
             },
             "suggested_kpis": {
                 "type": "array",
@@ -518,7 +559,7 @@ RECORD_RESEARCH_FINDING_TOOL = ToolSpec(
                     },
                     "required": ["name", "rationale"],
                 },
-                "description": "KPI name/rationale candidates this angle's research supports. Empty array if none.",
+                "description": "KPI name/rationale candidates this category's research supports. Empty array if none.",
             },
             "suggested_thresholds": {
                 "type": "array",
@@ -552,16 +593,16 @@ RECORD_RESEARCH_FINDING_TOOL = ToolSpec(
 PROPOSE_KPI_BATCH_TOOL = ToolSpec(
     name="propose_kpi_batch",
     description=(
-        "Propose YOUR OWN small batch of KPIs (2-4), grounded entirely in the research "
-        "you just recorded for your single assigned angle — full name, weight, AND a "
-        "full 11-level (0-10) qualitative + quantitative guideline for each. Call this "
-        "exactly once, immediately after record_research_finding. Weight each KPI "
-        "relative to the OTHERS IN THIS BATCH ONLY (as if they were the only KPIs in the "
-        "scorecard) — every other research agent is doing the same for its own batch, and "
-        "all batches get merged and re-normalized together afterward, so do not worry "
-        "about the overall scorecard's total weight budget here. Return an EMPTY array "
-        "only if your research genuinely didn't surface anything KPI-worthy for this "
-        "angle."
+        "Propose YOUR OWN small batch of KPIs for YOUR CATEGORY, grounded entirely in the "
+        "research you just recorded. Full name, weight, AND a full 11-level (0-10) "
+        "qualitative + quantitative guideline for each. Call this exactly once, "
+        "immediately after record_research_finding. Weight each KPI relative to the OTHER "
+        "KPIs IN THIS CATEGORY ONLY (as if they were the only KPIs in the scorecard) — "
+        "every other research agent is doing the same for its own category, and every "
+        "category's children get renormalized to sum to 100 WITHIN that category "
+        "afterward, so do not worry about the overall scorecard's total weight budget "
+        "here. Return an EMPTY array only if your research genuinely didn't surface "
+        "anything KPI-worthy for this category."
     ),
     input_schema={
         "type": "object",
@@ -579,7 +620,7 @@ PROPOSE_KPI_BATCH_TOOL = ToolSpec(
                             "minimum": 0,
                             "maximum": 100,
                             "description": (
-                                "Relative weight among just this batch's KPIs "
+                                "Relative weight among just this category's KPIs "
                                 "(this batch should sum to ~100)."
                             ),
                         },
@@ -604,12 +645,13 @@ PROPOSE_KPI_BATCH_TOOL = ToolSpec(
 ASSESS_RESEARCH_COVERAGE_TOOL = ToolSpec(
     name="assess_research_coverage",
     description=(
-        "Given the research findings and KPIs gathered so far for this domain, decide "
-        "whether research coverage is genuinely SUFFICIENT to proceed to KPI proposal now, "
-        "or whether an important, DISTINCT angle/gap remains unresearched. This is the "
-        "confidence check between research rounds — be honest: most domains ARE adequately "
-        "covered after one round; only report insufficient coverage when you can name a "
-        "real, specific, meaningfully different concern the research so far hasn't touched."
+        "Given the categories and KPIs gathered so far for this domain, decide whether "
+        "coverage is genuinely SUFFICIENT to proceed to KPI proposal now, or whether an "
+        "important, DISTINCT category/gap remains unresearched. This is the confidence "
+        "check between research rounds — be honest: most domains ARE adequately covered "
+        "after one round; only report insufficient coverage when you can name a real, "
+        "specific, meaningfully different category or gap the research so far hasn't "
+        "touched."
     ),
     input_schema={
         "type": "object",
@@ -618,60 +660,78 @@ ASSESS_RESEARCH_COVERAGE_TOOL = ToolSpec(
                 "type": "boolean",
                 "description": (
                     "true if coverage is genuinely adequate to propose a comprehensive, "
-                    "well-grounded KPI set now; false only if there's a real, specific gap."
+                    "well-grounded, well-categorized KPI set now; false only if there's a "
+                    "real, specific gap."
                 ),
             },
             "reasoning": {
                 "type": "string",
                 "description": (
-                    "Brief reasoning for this judgment, grounded in the actual findings/KPIs "
-                    "listed above — not a generic statement."
+                    "Brief reasoning for this judgment, grounded in the actual categories/"
+                    "findings/KPIs listed above — not a generic statement."
                 ),
             },
-            "next_angles": {
+            "next_categories": {
                 "type": "array",
                 "minItems": 0,
-                "maxItems": MAX_RESEARCH_ANGLES,
+                "maxItems": MAX_CATEGORIES,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "angle": {"type": "string", "description": "A short label for this NEW research angle."},
-                        "query_focus": {
+                        "name": {
                             "type": "string",
-                            "description": "A specific, researchable question or focus for this angle.",
+                            "description": (
+                                "A category name. Use the EXACT SAME name as an existing "
+                                "category above to deepen/extend it with more research "
+                                "(its new KPIs join its existing ones), or a genuinely NEW "
+                                "name to add a brand-new category."
+                            ),
+                        },
+                        "focus": {
+                            "type": "string",
+                            "description": "A specific, researchable focus for this round's research agent.",
+                        },
+                        "initial_weight": {
+                            "type": ["number", "null"],
+                            "description": "Same meaning as decide_categories' initial_weight. Optional.",
                         },
                     },
-                    "required": ["angle", "query_focus"],
+                    "required": ["name", "focus"],
                 },
                 "description": (
-                    "ONLY populate when sufficient=false: 1 or more NEW angles that are "
-                    "genuinely DIFFERENT from every angle already investigated (never a "
-                    "repeat/rephrasing of one already covered) and that specifically target "
-                    "the gap identified in `reasoning`. Leave empty when sufficient=true."
+                    "ONLY populate when sufficient=false: 1 or more categories (new, or an "
+                    "existing name to deepen) that specifically target the gap identified "
+                    "in `reasoning`. Leave empty when sufficient=true."
                 ),
             },
         },
-        "required": ["sufficient", "reasoning", "next_angles"],
+        "required": ["sufficient", "reasoning", "next_categories"],
     },
 )
 
-_DECIDE_ANGLES_SYSTEM_PROMPT = f"""You are the research-planning step for the Quality \
+_DECIDE_CATEGORIES_SYSTEM_PROMPT = f"""You are the research-planning step for the Quality \
 Scorecard System's scorecard-design assistant. Given what the user has said so far about \
-the scorecard they want, decide which DISTINCT research angles (0 to {MAX_RESEARCH_ANGLES}) \
-are worth investigating on the web to ground the KPIs and quantitative guideline \
-thresholds that will be proposed for this domain.
+the scorecard they want, decide which DISTINCT, business-recognizable KPI CATEGORIES (0 to \
+{MAX_CATEGORIES}) this domain calls for — the top-level groupings the user will actually SEE \
+organizing their KPIs, each handed to its own dedicated research agent.
 
 Guidelines:
-- Each angle must investigate something meaningfully DIFFERENT — never propose \
-near-duplicate angles (e.g. for "vendor security compliance reviews": one angle on \
-security standards/frameworks (ISO 27001, NIST, SOC 2), another on regulatory/compliance \
-requirements, another on vendor-risk-assessment practice — three genuinely different \
-concerns, not the same question worded three ways).
-- Choose the NUMBER of angles based on the domain's actual breadth, not a fixed default: \
-0 if the domain is narrow/simple enough that no dedicated fan-out is needed (an ordinary \
-web_search tool is still available later for ad hoc lookups); 1 if there is exactly one \
-clear research need; 2-4 for a domain that genuinely spans multiple distinct concerns.
-- Each angle needs a short `angle` label and a specific, researchable `query_focus`.
+- Categories must be real, business-recognizable groupings a stakeholder in this domain \
+would immediately understand — e.g. for a project-milestone quality scorecard: "Schedule", \
+"Budget", "Quality" (a real example: Schedule had 4 KPIs, Budget had 4, Quality had 12). \
+NEVER invent abstract "research angle" labels nobody would recognize as a category of their \
+scorecard.
+- Each category must be meaningfully DISTINCT — never two categories that are really the \
+same concern worded two ways.
+- Choose the NUMBER of categories based on the domain's actual breadth, not a fixed default: \
+0 if the domain is narrow/simple enough that no dedicated category structure or research \
+fan-out is needed (an ordinary web_search tool is still available later for ad hoc \
+lookups); 1 if there is exactly one clear grouping; 2-5 for a domain that genuinely spans \
+multiple distinct concerns (most real scorecards land here).
+- Each category needs a short `name` (exactly as it should appear to the user) and a \
+specific, researchable `focus` for its dedicated research agent. `initial_weight` is \
+optional — your best relative guess at this category's share of the total score; omit it \
+for an equal default share.
 
 Base your decision on what the user actually said below — the structured draft fields may \
 still be empty/null this early in the conversation (e.g. on the very first message, before \
@@ -684,36 +744,37 @@ What the user has said so far (most recent message last):
 
 Current draft (JSON, may still be mostly empty this early — see above): {{draft_json}}
 
-Call `decide_research_angles` exactly once."""
+Call `decide_categories` exactly once."""
 
 _RESEARCH_WORKER_SYSTEM_PROMPT_TEMPLATE = """You are ONE independent research agent, one \
-of several running concurrently, each investigating a different angle to help ground a \
-quality scorecard's KPIs and quantitative thresholds in real, checkable information.
+of several running concurrently, each responsible for ONE category of a quality \
+scorecard's KPIs and quantitative thresholds.
 
-Your assigned angle: "{angle}"
-Your specific research focus: "{query_focus}"
+Your assigned category: "{category}"
+Your specific research focus: "{focus}"
 
 Use `web_search` (you have a budget of at most {max_calls} search call(s) this session) to \
 find real, current, checkable information — published industry benchmarks, standards, \
-frameworks, or regulatory requirements relevant to YOUR angle only. Then call \
-`record_research_finding` exactly once. Stay focused on your angle — do not try to cover \
-the whole scorecard; other agents are covering the other angles."""
+frameworks, or regulatory requirements relevant to YOUR category only. Then call \
+`record_research_finding` exactly once. Stay focused on your category — do not try to cover \
+the whole scorecard; other agents are covering the other categories."""
 
 _PROPOSE_KPI_BATCH_SYSTEM_PROMPT_TEMPLATE = """You are the SAME research agent that just \
-investigated angle "{angle}" (focus: "{query_focus}") and recorded this finding:
+investigated category "{category}" (focus: "{focus}") and recorded this finding:
 
 Summary: {summary}
 Suggested KPI ideas: {suggested_kpis}
 Suggested quantitative thresholds: {suggested_thresholds}
 Sources: {sources}
 
-Now propose a small batch (2-4) of fully-specified KPIs for a quality scorecard, grounded \
-in what you JUST found above. Each needs: a specific, distinct name; a weight (0-100, \
-relative to the other KPIs in THIS batch only — other agents are proposing their own \
-batches independently, and everything gets merged and re-normalized afterward); and a \
-FULL 11-level (0-10) qualitative + quantitative guideline. Use the suggested_thresholds \
-above to ground the quantitative_criteria at each level wherever relevant, rather than \
-inventing plausible-sounding numbers. Call `propose_kpi_batch` exactly once."""
+Now propose a small batch of fully-specified KPIs for YOUR category, grounded in what you \
+JUST found above. Each needs: a specific, distinct name; a weight (0-100, relative to the \
+other KPIs in THIS CATEGORY only — other agents are proposing their own categories' \
+batches independently, and every category's children get renormalized together \
+afterward); and a FULL 11-level (0-10) qualitative + quantitative guideline. Use the \
+suggested_thresholds above to ground the quantitative_criteria at each level wherever \
+relevant, rather than inventing plausible-sounding numbers. Call `propose_kpi_batch` \
+exactly once."""
 
 _ASSESS_COVERAGE_SYSTEM_PROMPT = f"""You are the research-planning step for the Quality \
 Scorecard System's scorecard-design assistant, reviewing the results of research round \
@@ -725,22 +786,25 @@ round of concurrent research agents runs at all.
 What the user has said so far (most recent message last):
 {{conversation_context}}
 
-Research angle(s) already investigated so far: {{angles_covered}}
+Categories already investigated so far: {{categories_covered}}
 
-Consolidated findings and KPIs gathered so far:
+Consolidated findings and KPIs gathered so far (grouped by category):
 {{findings_summary}}
 
-Decide honestly: is this coverage genuinely SUFFICIENT to propose a comprehensive, well- \
-grounded set of KPIs for this domain now, or is there a real, DISTINCT gap — an important \
-angle or concern this domain needs that none of the above touched? Most domains ARE \
-adequately covered after one round of focused research — only report `sufficient: false` \
-when you can name a SPECIFIC, meaningful, missing concern, never merely "more research is \
-always better" or a marginal refinement/rephrasing of an angle already covered above.
+Decide honestly: is this category structure and KPI coverage genuinely SUFFICIENT to \
+propose a comprehensive, well-grounded scorecard for this domain now, or is there a real, \
+DISTINCT gap — an important category this domain needs that none of the above covers, or an \
+existing category whose coverage feels genuinely shallow? Most domains ARE adequately \
+covered after one round of focused research — only report `sufficient: false` when you can \
+name a SPECIFIC, meaningful, missing category or gap, never merely "more research is always \
+better" or a marginal refinement already covered above.
 
-If (and only if) insufficient, propose 1 to {MAX_RESEARCH_ANGLES} NEW research angles that \
-are genuinely DIFFERENT from every angle listed above and specifically target the gap you \
-identified — the whole point of a second round is covering NEW ground, not re-searching \
-the same territory.
+If (and only if) insufficient, propose 1 to {MAX_CATEGORIES} categories to research next: \
+use the EXACT SAME name as an existing category above to deepen it (its new KPIs join its \
+existing ones), or a genuinely NEW name for a category not yet covered — whichever \
+specifically targets the gap you identified. The whole point of a second round is covering \
+NEW ground (a new category) or going deeper where it's genuinely thin (an existing one), \
+never re-searching territory that's already adequately covered.
 
 Call `assess_research_coverage` exactly once."""
 
@@ -748,20 +812,21 @@ Call `assess_research_coverage` exactly once."""
 @dataclass
 class ResearchFinding:
     """Structured output of ONE research-agent invocation (see `_run_research_agent`) —
-    what `research_kpis` fans out N of concurrently and consolidates into
-    `BuilderState.research_findings`. `degraded=True` marks a finding produced by the
-    graceful-failure path (the agent's own Bedrock/web_search calls raised, or the model
-    never called `record_research_finding`) rather than a real recorded finding — see
-    `research_kpis`'s consolidation step, which drops a degraded finding with no usable
-    content instead of feeding empty noise into propose_kpis's context.
+    what `research_kpis` fans out N of concurrently (one per CATEGORY — see the module
+    comment above `MAX_CATEGORIES`) and consolidates into `BuilderState.research_findings`.
+    `degraded=True` marks a finding produced by the graceful-failure path (the agent's own
+    Bedrock/web_search calls raised, or the model never called `record_research_finding`)
+    rather than a real recorded finding — see `research_kpis`'s consolidation step, which
+    drops a degraded finding with no usable content instead of feeding empty noise into
+    propose_kpis's context.
 
     `proposed_kpis`: this agent's own small batch of fully-specified KPI dicts (see
-    `PROPOSE_KPI_BATCH_TOOL` — each already has name/weight/guidelines, validated against
-    `KpiDraft` by `_run_research_agent` before being placed here), the actual mechanism
-    behind Part 1's "KPIs arrive in batches, not one giant end-of-pipeline proposal" fix —
-    see the module comment above `MAX_RESEARCH_ANGLES`. Always `[]` for a degraded finding."""
+    `PROPOSE_KPI_BATCH_TOOL` — each already has name/weight/guidelines PLUS
+    `level=2`/`parent_name=self.category` forced on by `_validate_kpi_batch_items`), the
+    actual mechanism behind "KPIs arrive in batches, already tagged with their category, not
+    one giant end-of-pipeline proposal". Always `[]` for a degraded finding."""
 
-    angle: str
+    category: str
     summary: str = ""
     suggested_kpis: list[dict[str, str]] = field(default_factory=list)
     suggested_thresholds: list[dict[str, str]] = field(default_factory=list)
@@ -787,71 +852,70 @@ class CoverageAssessment:
 
     sufficient: bool
     reasoning: str
-    next_angles: list[dict[str, str]]
+    next_categories: list[dict[str, Any]]
 
 
-def _decide_research_angles(
+def _decide_categories(
     bedrock: BedrockClientProtocol,
     model_id: str | None,
     draft: ScorecardDraft,
     conversation_context: str,
     revision_feedback: str | None = None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """One synchronous Bedrock call (run via `asyncio.to_thread` by the caller) deciding
-    how many/which research angles this domain warrants. Never raises past this function's
-    own belt-and-suspenders try/except at the call site in `research_kpis` — a malformed or
-    missing tool response here is treated as "no angles decided", not a crash.
+    how many/which KPI CATEGORIES this domain warrants — the top-level groupings the user
+    will see, each also doubling as one research agent's assignment (see the module comment
+    above `MAX_CATEGORIES`). Never raises past this function's own belt-and-suspenders
+    try/except at the call site in `research_kpis` — a malformed or missing tool response
+    here is treated as "no categories decided", not a crash.
 
     `conversation_context` (the user's own messages so far — see `research_kpis`) is the
     critical signal on a session's very first turn, when `draft` is still entirely empty:
     research_kpis runs BEFORE propose_kpis has ever had a chance to populate the structured
     draft fields, so the draft alone would tell this call nothing about the domain yet.
 
-    `revision_feedback` (set only on a retry — see `_decide_research_angles_with_gate`,
+    `revision_feedback` (set only on a retry — see `_decide_categories_with_gate`,
     quality-gate checkpoint 1) appends Jev's below-threshold verdict to the system prompt
-    so a revised plan is a genuine reconsideration, not a blind re-roll of the same call."""
-    system_prompt = _DECIDE_ANGLES_SYSTEM_PROMPT.format(
+    so a revised plan is a genuine reconsideration, not a blind re-roll of the same call.
+
+    Returns a list of `{"name": str, "focus": str, "initial_weight": float | None}`."""
+    system_prompt = _DECIDE_CATEGORIES_SYSTEM_PROMPT.format(
         draft_json=json.dumps(draft.model_dump(mode="json")),
         conversation_context=conversation_context or "(nothing yet)",
     )
     if revision_feedback:
         system_prompt += f"\n\n{revision_feedback}"
     result = bedrock.converse(
-        messages=[{"role": "user", "content": [{"text": "Decide the research angles for this scorecard."}]}],
+        messages=[{"role": "user", "content": [{"text": "Decide the KPI categories for this scorecard."}]}],
         system=system_prompt,
-        tools=[DECIDE_RESEARCH_ANGLES_TOOL],
+        tools=[DECIDE_CATEGORIES_TOOL],
         force_tool_use=True,
         model_id=model_id,
     )
-    if not result.is_tool_use or result.tool_name != "decide_research_angles":
+    if not result.is_tool_use or result.tool_name != "decide_categories":
         return []
-    raw_angles = (result.tool_input or {}).get("angles") or []
-    cleaned: list[dict[str, str]] = []
-    for raw in raw_angles[:MAX_RESEARCH_ANGLES]:
-        if not isinstance(raw, dict):
-            continue
-        angle = str(raw.get("angle") or "").strip()
-        query_focus = str(raw.get("query_focus") or "").strip()
-        if angle and query_focus:
-            cleaned.append({"angle": angle, "query_focus": query_focus})
-    return cleaned
+    raw_categories = (result.tool_input or {}).get("categories") or []
+    return _clean_category_items(raw_categories)
 
 
-def _angles_to_gate_text(angles: list[dict[str, str]]) -> str:
-    """Renders a decided research-angle plan as plain text for the quality gate's `answer`
-    (see `_decide_research_angles_with_gate`) — an empty plan is itself a valid, ratable
-    answer ("the model judged no dedicated research was needed"), not a special case."""
-    if not angles:
+def _categories_to_gate_text(categories: list[dict[str, Any]]) -> str:
+    """Renders a decided category plan as plain text for the quality gate's `answer` (see
+    `_decide_categories_with_gate`) — an empty plan is itself a valid, ratable answer ("the
+    model judged no dedicated category structure/research was needed"), not a special
+    case."""
+    if not categories:
         return (
-            "(No dedicated research angles were planned — the domain was judged "
-            "narrow/simple enough that no research fan-out is needed.)"
+            "(No dedicated KPI categories were planned — the domain was judged "
+            "narrow/simple enough that no category structure or research fan-out is needed.)"
         )
-    return "Planned research angles:\n" + "\n".join(
-        f'- "{a["angle"]}" — focus: {a["query_focus"]}' for a in angles
+    return "Planned KPI categories:\n" + "\n".join(
+        f'- "{c["name"]}" — focus: {c["focus"]}'
+        + (f" (initial_weight={c['initial_weight']})" if c.get("initial_weight") is not None else "")
+        for c in categories
     )
 
 
-async def _decide_research_angles_with_gate(
+async def _decide_categories_with_gate(
     bedrock: BedrockClientProtocol,
     model_id: str | None,
     draft: ScorecardDraft,
@@ -859,79 +923,87 @@ async def _decide_research_angles_with_gate(
     jev_client: JevClientProtocol | None,
     session_id: str,
     turn_started_at: datetime | None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Quality-gate checkpoint 1 (see the module comment above `MAX_QUALITY_GATE_RETRIES`):
-    wraps `_decide_research_angles` with a Jev rating of how well the decided plan serves
-    the user's actual request (instruction=`conversation_context`, answer=the plan
+    wraps `_decide_categories` with a Jev rating of how well the decided CATEGORY PLAN
+    serves the user's actual request (instruction=`conversation_context`, answer=the plan
     itself). Below `QUALITY_GATE_THRESHOLD`, the master revises its plan — bounded at
     `MAX_QUALITY_GATE_RETRIES` revisions — then proceeds with the best-scoring attempt
     seen (never hangs, never silently drops a low-scoring plan)."""
     instruction = conversation_context or "(nothing yet)"
-    best_angles: list[dict[str, str]] = []
+    best_categories: list[dict[str, Any]] = []
     best_score = -1.0
     revision_feedback: str | None = None
 
     for attempt in range(MAX_QUALITY_GATE_RETRIES + 1):
-        angles = await asyncio.to_thread(
-            _decide_research_angles, bedrock, model_id, draft, conversation_context, revision_feedback
+        categories = await asyncio.to_thread(
+            _decide_categories, bedrock, model_id, draft, conversation_context, revision_feedback
         )
-        gate = await quality_gate(jev_client, instruction=instruction, answer=_angles_to_gate_text(angles))
+        gate = await quality_gate(jev_client, instruction=instruction, answer=_categories_to_gate_text(categories))
 
         if gate.degraded:
             await emit_turn_event(
                 session_id, turn_started_at, "master", "quality_gate",
-                "Research plan quality check: Jev was unreachable — gate treated as passed "
+                "Category plan quality check: Jev was unreachable — gate treated as passed "
                 "(graceful degradation).",
             )
-            return angles  # Jev unreachable — gate passed by policy; no point retrying.
+            return categories  # Jev unreachable — gate passed by policy; no point retrying.
         assert gate.score is not None  # guaranteed whenever degraded=False
         if gate.score > best_score:
-            best_angles, best_score = angles, gate.score
+            best_categories, best_score = categories, gate.score
 
         if gate.passed:
             await emit_turn_event(
                 session_id, turn_started_at, "master", "quality_gate",
-                f"Research plan quality check scored {gate.score:.2f} (>= {QUALITY_GATE_THRESHOLD}) — "
+                f"Category plan quality check scored {gate.score:.2f} (>= {QUALITY_GATE_THRESHOLD}) — "
                 + ("passed after revision." if attempt > 0 else "passed."),
             )
-            return angles
+            return categories
 
         if attempt < MAX_QUALITY_GATE_RETRIES:
             await emit_turn_event(
                 session_id, turn_started_at, "master", "quality_gate_retry",
                 f"Quality check scored {gate.score:.2f} (below {QUALITY_GATE_THRESHOLD}) — "
-                "revising the research plan…",
+                "revising the category plan…",
             )
             revision_feedback = (
-                f"An automated quality check scored your previous research-angle plan "
+                f"An automated quality check scored your previous KPI-category plan "
                 f"{gate.score:.2f}/1.0 (threshold {QUALITY_GATE_THRESHOLD}) for how well it "
-                "serves the user's actual request. Reconsider whether your chosen angles "
-                "genuinely target what the user asked for, and revise the angles and/or "
-                "query_focus wording to better match their request before deciding again."
+                "serves the user's actual request. Reconsider whether your chosen categories "
+                "genuinely match what the user asked for (business-recognizable groupings, "
+                "not abstract research topics), and revise the categories and/or their "
+                "focus wording before deciding again."
             )
 
     await emit_turn_event(
         session_id, turn_started_at, "master", "quality_gate",
-        f"Research plan quality check still below {QUALITY_GATE_THRESHOLD} after "
+        f"Category plan quality check still below {QUALITY_GATE_THRESHOLD} after "
         f"{MAX_QUALITY_GATE_RETRIES} revision(s) (best score {best_score:.2f}) — "
         "proceeding with the best attempt.",
     )
-    return best_angles
+    return best_categories
 
 
-def _clean_angle_items(raw_angles: list[Any]) -> list[dict[str, str]]:
-    """Shared cleaning logic for a list of `{angle, query_focus}` dicts, however they were
-    produced (`decide_research_angles`'s `angles` or `assess_research_coverage`'s
-    `next_angles` — both use the identical shape) — factored out of `_decide_research_angles`
+def _clean_category_items(raw_items: list[Any]) -> list[dict[str, Any]]:
+    """Shared cleaning logic for a list of `{name, focus, initial_weight}` dicts, however
+    they were produced (`decide_categories`'s `categories` or `assess_research_coverage`'s
+    `next_categories` — both use the identical shape) — factored out of `_decide_categories`
     so `_assess_research_coverage` doesn't duplicate the same defensive parsing."""
-    cleaned: list[dict[str, str]] = []
-    for raw in raw_angles[:MAX_RESEARCH_ANGLES]:
+    cleaned: list[dict[str, Any]] = []
+    for raw in raw_items[:MAX_CATEGORIES]:
         if not isinstance(raw, dict):
             continue
-        angle = str(raw.get("angle") or "").strip()
-        query_focus = str(raw.get("query_focus") or "").strip()
-        if angle and query_focus:
-            cleaned.append({"angle": angle, "query_focus": query_focus})
+        name = str(raw.get("name") or "").strip()
+        focus = str(raw.get("focus") or "").strip()
+        if not (name and focus):
+            continue
+        raw_weight = raw.get("initial_weight")
+        initial_weight: float | None
+        try:
+            initial_weight = float(raw_weight) if raw_weight is not None else None
+        except (TypeError, ValueError):
+            initial_weight = None
+        cleaned.append({"name": name, "focus": focus, "initial_weight": initial_weight})
     return cleaned
 
 
@@ -941,30 +1013,32 @@ def _assess_research_coverage(
     draft: ScorecardDraft,
     conversation_context: str,
     findings: list[ResearchFinding],
-    angles_covered: list[dict[str, str]],
+    categories_covered: list[dict[str, Any]],
     rounds_so_far: int,
 ) -> CoverageAssessment:
     """One synchronous Bedrock call (run via `asyncio.to_thread` by the caller, mirrors
-    `_decide_research_angles`'s own shape) — the confidence-check mechanism behind the
+    `_decide_categories`'s own shape) — the confidence-check mechanism behind the
     multi-round research loop (see `research_kpis` and `MAX_RESEARCH_ROUNDS`'s own
     docstring). A REAL judgment: the model is shown the actual consolidated findings and
-    the KPIs merged so far and asked to decide, grounded in that real content, whether a
-    genuine gap remains — never a hardcoded heuristic, a coin flip, or an always-true/
-    always-false stub (per the task's explicit requirement).
+    the categorized KPIs merged so far and asked to decide, grounded in that real content,
+    whether a genuine gap remains — never a hardcoded heuristic, a coin flip, or an
+    always-true/always-false stub.
 
     Fails SAFE: any malformed tool response, wrong tool name, or exception is treated as
     `sufficient=True` (see `CoverageAssessment`'s own docstring) — so a Bedrock hiccup on
-    this one call degrades to "proceed with what we have", exactly what happened before
-    this feature existed, never an infinite or stuck research loop."""
+    this one call degrades to "proceed with what we have", never an infinite or stuck
+    research loop."""
     findings_summary = _format_research_findings_for_prompt([asdict(f) for f in findings]) or "(no findings yet)"
-    current_kpi_names = ", ".join(kpi.name for kpi in draft.kpis) or "(none yet)"
-    angles_text = (
-        "; ".join(f'"{a["angle"]}" (focus: {a["query_focus"]})' for a in angles_covered) or "(none)"
+    current_kpi_names = ", ".join(
+        f'{kpi.name} (under "{kpi.parent_name}")' if kpi.parent_name else kpi.name for kpi in draft.kpis
+    ) or "(none yet)"
+    categories_text = (
+        "; ".join(f'"{c["name"]}" (focus: {c["focus"]})' for c in categories_covered) or "(none)"
     )
     system_prompt = _ASSESS_COVERAGE_SYSTEM_PROMPT.format(
         rounds_so_far=rounds_so_far,
         conversation_context=conversation_context or "(nothing yet)",
-        angles_covered=angles_text,
+        categories_covered=categories_text,
         findings_summary=f"{findings_summary}\n\nKPIs merged so far: {current_kpi_names}",
     )
     result = bedrock.converse(
@@ -980,15 +1054,16 @@ def _assess_research_coverage(
             "(stop_reason=%r); treating as sufficient (fail-safe).",
             getattr(result, "stop_reason", None),
         )
-        return CoverageAssessment(sufficient=True, reasoning="(no usable assessment returned)", next_angles=[])
+        return CoverageAssessment(sufficient=True, reasoning="(no usable assessment returned)", next_categories=[])
 
     data = result.tool_input or {}
-    next_angles = _clean_angle_items(data.get("next_angles") or [])
-    # sufficient=True OR no usable next_angles both mean "stop" — an "insufficient" verdict
-    # with nothing concrete to research next is functionally the same as "sufficient" here.
-    sufficient = bool(data.get("sufficient", True)) or not next_angles
+    next_categories = _clean_category_items(data.get("next_categories") or [])
+    # sufficient=True OR no usable next_categories both mean "stop" — an "insufficient"
+    # verdict with nothing concrete to research next is functionally the same as
+    # "sufficient" here.
+    sufficient = bool(data.get("sufficient", True)) or not next_categories
     return CoverageAssessment(
-        sufficient=sufficient, reasoning=str(data.get("reasoning") or ""), next_angles=next_angles
+        sufficient=sufficient, reasoning=str(data.get("reasoning") or ""), next_categories=next_categories
     )
 
 
@@ -1008,8 +1083,8 @@ def _finding_to_gate_text(finding: ResearchFinding) -> str:
 
 
 async def _run_research_agent(
-    angle: str,
-    query_focus: str,
+    category: str,
+    focus: str,
     bedrock: BedrockClientProtocol,
     web_search_client: WebSearchClientProtocol,
     model_id: str | None,
@@ -1025,42 +1100,43 @@ async def _run_research_agent(
     `research_kpis` via `asyncio.gather`, never duplicated in code) — a bounded ReAct-style
     worker: LLM + web_search, capped at MAX_SEARCH_CALLS_PER_RESEARCH_AGENT search calls
     then forced to close with `record_research_finding`, mirroring propose_kpis's own
-    bounded web_search loop (see MAX_WEB_SEARCH_CALLS_PER_PROPOSE).
+    bounded web_search loop (see MAX_WEB_SEARCH_CALLS_PER_PROPOSE). One invocation = one
+    CATEGORY's dedicated research assignment (see the module comment above `MAX_CATEGORIES`)
+    — `category`/`focus` here are exactly one `decide_categories`/`assess_research_coverage`
+    item's `name`/`focus`.
 
     `actor` (e.g. `"research_agent_2"`, assigned index-based by the caller WITHIN its
     round — see `research_kpis`) is this specific concurrent invocation's stable identifier
     for the live-trace event log (see `app/ai/turn_events.py`): every event this worker
     emits is tagged with it, so a reader can tell which of the N concurrently-running
-    agents produced which event even though they interleave in `created_at` order.
-    `round_num` (default 1) additionally tags every event with which research ROUND this
-    invocation belongs to (see `MAX_RESEARCH_ROUNDS`) — `actor` alone is ambiguous across
-    rounds since it resets to `research_agent_1`, `research_agent_2`, ... at the start of
-    every round; `round_num` is what lets a reader (or `TurnTraceCard.tsx`) tell round 2's
-    `research_agent_1` apart from round 1's.
+    agents produced which event even though they interleave in `created_at` order — and,
+    since every event's own message text names the category too (e.g. 'Researching
+    "Schedule": ...'), reading `chat_turn_events` directly proves "one agent per category"
+    end to end. `round_num` (default 1) additionally tags every event with which research
+    ROUND this invocation belongs to (see `MAX_RESEARCH_ROUNDS`).
 
     Contract: NEVER raises — mirrors web_search.py's own "return [], never raise" contract
     (see that module's docstring) one level up. Any failure anywhere in this worker (a
     Bedrock call, a malformed response, an unexpected web_search exception) is caught here
-    and turned into a thin `degraded=True` finding, so one failing angle can never crash
-    the whole turn or the other concurrently-running agents (which are independent asyncio
-    tasks and are completely unaffected by this one's exception either way).
+    and turned into a thin `degraded=True` finding, so one failing category can never crash
+    the whole turn or the other concurrently-running agents.
 
     `jev_client`/`conversation_context` power quality-gate checkpoint 2 (see the module
     comment above `MAX_QUALITY_GATE_RETRIES`): once `record_research_finding` produces a
-    finding, Jev rates how well it matches this agent's assigned angle/focus
-    (instruction=`conversation_context` + angle/focus, answer=the finding). Below
+    finding, Jev rates how well it matches THIS agent's assigned category/focus
+    (instruction=`conversation_context` + category/focus, answer=the finding). Below
     threshold, the agent researches further and re-synthesizes — bounded at
     `MAX_QUALITY_GATE_RETRIES` attempts, sharing the SAME `MAX_SEARCH_CALLS_PER_RESEARCH_
     AGENT` web_search budget across every attempt (not reset per retry) — then returns its
-    best-scoring finding rather than hanging or dropping the angle."""
+    best-scoring finding rather than hanging or dropping the category."""
     try:
         await emit_turn_event(
-            session_id, turn_started_at, actor, "started", f'Researching "{angle}": {query_focus}', round=round_num
+            session_id, turn_started_at, actor, "started", f'Researching "{category}": {focus}', round=round_num
         )
         local_messages: list[dict[str, Any]] = [
             {
                 "role": "user",
-                "content": [{"text": f"Research angle: {angle}\nFocus: {query_focus}"}],
+                "content": [{"text": f"Category: {category}\nFocus: {focus}"}],
             }
         ]
         search_calls_made = 0
@@ -1084,7 +1160,7 @@ async def _run_research_agent(
                     else [RECORD_RESEARCH_FINDING_TOOL]
                 )
                 system_prompt = _RESEARCH_WORKER_SYSTEM_PROMPT_TEMPLATE.format(
-                    angle=angle, query_focus=query_focus, max_calls=MAX_SEARCH_CALLS_PER_RESEARCH_AGENT
+                    category=category, focus=focus, max_calls=MAX_SEARCH_CALLS_PER_RESEARCH_AGENT
                 )
                 if not budget_left:
                     system_prompt += (
@@ -1097,7 +1173,7 @@ async def _run_research_agent(
                     # several-second) Bedrock call returns, not just after the fact.
                     await emit_turn_event(
                         session_id, turn_started_at, actor, "synthesizing",
-                        f'Synthesizing findings for "{angle}"…',
+                        f'Synthesizing findings for "{category}"…',
                         round=round_num,
                     )
                 if revision_feedback:
@@ -1120,8 +1196,8 @@ async def _run_research_agent(
                         session_id, turn_started_at, actor, "searching", f'Searching: "{query}"', round=round_num
                     )
                     logger.info(
-                        "research agent angle=%r: web_search (%d/%d) query=%r",
-                        angle,
+                        "research agent category=%r: web_search (%d/%d) query=%r",
+                        category,
                         search_calls_made,
                         MAX_SEARCH_CALLS_PER_RESEARCH_AGENT,
                         query,
@@ -1130,8 +1206,8 @@ async def _run_research_agent(
                         results = await web_search_client.search(query) if query else []
                     except Exception:  # noqa: BLE001 — see web_search.py's own "never raise" contract
                         logger.warning(
-                            "research agent angle=%r: web_search raised unexpectedly; treating as no results.",
-                            angle,
+                            "research agent category=%r: web_search raised unexpectedly; treating as no results.",
+                            category,
                             exc_info=True,
                         )
                         results = []
@@ -1141,8 +1217,8 @@ async def _run_research_agent(
                         round=round_num,
                     )
                     logger.info(
-                        "research agent angle=%r: web_search query=%r -> %d result(s)%s",
-                        angle,
+                        "research agent category=%r: web_search query=%r -> %d result(s)%s",
+                        category,
                         query,
                         len(results),
                         f"; first={results[0].title!r} ({results[0].url})" if results else "",
@@ -1167,7 +1243,7 @@ async def _run_research_agent(
 
             data = result.tool_input or {}
             candidate = ResearchFinding(
-                angle=angle,
+                category=category,
                 summary=str(data.get("summary") or ""),
                 suggested_kpis=[k for k in (data.get("suggested_kpis") or []) if isinstance(k, dict)],
                 suggested_thresholds=[
@@ -1181,8 +1257,8 @@ async def _run_research_agent(
             # agent was actually assigned to research.
             gate_instruction = (
                 f"User's original request: {conversation_context or '(nothing yet)'}\n"
-                f'This research agent\'s assigned angle: "{angle}"\n'
-                f'Specific research focus: "{query_focus}"'
+                f'This research agent\'s assigned category: "{category}"\n'
+                f'Specific research focus: "{focus}"'
             )
             gate = await quality_gate(
                 jev_client, instruction=gate_instruction, answer=_finding_to_gate_text(candidate)
@@ -1191,7 +1267,7 @@ async def _run_research_agent(
             if gate.degraded:
                 await emit_turn_event(
                     session_id, turn_started_at, actor, "quality_gate",
-                    f'"{angle}": finding quality check — Jev was unreachable — gate treated as '
+                    f'"{category}": finding quality check — Jev was unreachable — gate treated as '
                     "passed (graceful degradation).",
                     round=round_num,
                 )
@@ -1206,7 +1282,7 @@ async def _run_research_agent(
                 finding = candidate
                 await emit_turn_event(
                     session_id, turn_started_at, actor, "quality_gate",
-                    f'"{angle}": finding quality check scored {gate.score:.2f} '
+                    f'"{category}": finding quality check scored {gate.score:.2f} '
                     f"(>= {QUALITY_GATE_THRESHOLD}) — "
                     + ("passed after revision." if gate_attempt > 0 else "passed."),
                     round=round_num,
@@ -1216,7 +1292,7 @@ async def _run_research_agent(
             if gate_attempt < MAX_QUALITY_GATE_RETRIES:
                 await emit_turn_event(
                     session_id, turn_started_at, actor, "quality_gate_retry",
-                    f'"{angle}": finding quality check scored {gate.score:.2f} '
+                    f'"{category}": finding quality check scored {gate.score:.2f} '
                     f"(below {QUALITY_GATE_THRESHOLD}) — researching further…",
                     round=round_num,
                 )
@@ -1225,8 +1301,8 @@ async def _run_research_agent(
                 )
                 revision_feedback = (
                     f"An automated quality check scored your recorded finding {gate.score:.2f}/1.0 "
-                    f"(threshold {QUALITY_GATE_THRESHOLD}) for how well it matches your assigned angle "
-                    f'"{angle}" (focus: "{query_focus}"). Research further (use any remaining '
+                    f"(threshold {QUALITY_GATE_THRESHOLD}) for how well it matches your assigned category "
+                    f'"{category}" (focus: "{focus}"). Research further (use any remaining '
                     "web_search budget) and call record_research_finding again with an improved, "
                     "more relevant finding."
                 )
@@ -1238,7 +1314,7 @@ async def _run_research_agent(
             finding = best_finding if best_finding is not None else candidate
             await emit_turn_event(
                 session_id, turn_started_at, actor, "quality_gate",
-                f'"{angle}": finding quality check still below {QUALITY_GATE_THRESHOLD} after '
+                f'"{category}": finding quality check still below {QUALITY_GATE_THRESHOLD} after '
                 f"{MAX_QUALITY_GATE_RETRIES} revision(s) (best score {best_score:.2f}) — "
                 "using the best attempt.",
                 round=round_num,
@@ -1246,20 +1322,19 @@ async def _run_research_agent(
             break
 
         if finding is not None:
-            # --- KPI batch proposal (Part 1 fix — see the module comment above
-            # MAX_RESEARCH_ANGLES): ONE additional bounded tool call, grounded in the
+            # --- KPI batch proposal: ONE additional bounded tool call, grounded in the
             # finding this same agent just recorded (post-quality-gate), proposing this
-            # agent's own small batch of fully-specified KPIs. Never lets a failure here
+            # category's own small batch of fully-specified KPIs. Never lets a failure here
             # lose the finding itself (finding.proposed_kpis simply stays [] — the finding
             # above is already fully formed and returned regardless).
             await emit_turn_event(
-                session_id, turn_started_at, actor, "proposing_kpis", f'Proposing KPIs for "{angle}"…',
+                session_id, turn_started_at, actor, "proposing_kpis", f'Proposing KPIs for "{category}"…',
                 round=round_num,
             )
             try:
                 batch_system_prompt = _PROPOSE_KPI_BATCH_SYSTEM_PROMPT_TEMPLATE.format(
-                    angle=angle,
-                    query_focus=query_focus,
+                    category=category,
+                    focus=focus,
                     summary=finding.summary or "(none)",
                     suggested_kpis=json.dumps(finding.suggested_kpis),
                     suggested_thresholds=json.dumps(finding.suggested_thresholds),
@@ -1275,70 +1350,77 @@ async def _run_research_agent(
                 )
                 if batch_result.is_tool_use and batch_result.tool_name == "propose_kpi_batch":
                     raw_items = (batch_result.tool_input or {}).get("kpis") or []
-                    finding.proposed_kpis = _validate_kpi_batch_items(raw_items)
+                    finding.proposed_kpis = _validate_kpi_batch_items(raw_items, category)
                 else:
                     logger.warning(
-                        "research agent angle=%r: propose_kpi_batch did not return a usable tool call "
+                        "research agent category=%r: propose_kpi_batch did not return a usable tool call "
                         "(stop_reason=%r).",
-                        angle,
+                        category,
                         getattr(batch_result, "stop_reason", None),
                     )
             except Exception:  # noqa: BLE001 — a failed KPI-batch call must never lose the finding itself
-                logger.warning("research agent angle=%r: propose_kpi_batch call failed.", angle, exc_info=True)
+                logger.warning("research agent category=%r: propose_kpi_batch call failed.", category, exc_info=True)
 
             if finding.proposed_kpis:
                 names = ", ".join(k["name"] for k in finding.proposed_kpis)
                 await emit_turn_event(
                     session_id, turn_started_at, actor, "proposed_kpis",
-                    f'Proposed {len(finding.proposed_kpis)} KPI(s) for "{angle}": {names}',
+                    f'Proposed {len(finding.proposed_kpis)} KPI(s) for "{category}": {names}',
                     round=round_num,
                 )
             else:
                 await emit_turn_event(
                     session_id, turn_started_at, actor, "proposed_kpis",
-                    f'"{angle}": no KPIs proposed from this angle.',
+                    f'"{category}": no KPIs proposed from this category.',
                     round=round_num,
                 )
 
             await emit_turn_event(
                 session_id, turn_started_at, actor, "completed",
-                f'Finished "{angle}": {len(finding.proposed_kpis)} KPI(s) proposed, '
+                f'Finished "{category}": {len(finding.proposed_kpis)} KPI(s) proposed, '
                 f"{len(finding.suggested_thresholds)} threshold(s), {len(finding.sources)} source(s).",
                 round=round_num,
             )
             return finding
 
         logger.warning(
-            "research agent angle=%r: model did not call record_research_finding "
+            "research agent category=%r: model did not call record_research_finding "
             "(stop_reason=%r); returning a degraded finding.",
-            angle,
+            category,
             getattr(last_result, "stop_reason", None),
         )
         await emit_turn_event(
             session_id, turn_started_at, actor, "error",
-            f'"{angle}": model did not produce a usable finding — skipping this angle.',
+            f'"{category}": model did not produce a usable finding — skipping this category.',
             round=round_num,
         )
-        return ResearchFinding(angle=angle, summary=(last_result.text if last_result else "") or "", degraded=True)
+        return ResearchFinding(
+            category=category, summary=(last_result.text if last_result else "") or "", degraded=True
+        )
     except Exception:  # noqa: BLE001 — this worker's whole-agent "never raise" contract; see docstring
-        logger.warning("research agent angle=%r failed entirely; returning a degraded finding.", angle, exc_info=True)
+        logger.warning(
+            "research agent category=%r failed entirely; returning a degraded finding.", category, exc_info=True
+        )
         await emit_turn_event(
-            session_id, turn_started_at, actor, "error", f'"{angle}": research agent failed — skipping this angle.',
+            session_id, turn_started_at, actor, "error",
+            f'"{category}": research agent failed — skipping this category.',
             round=round_num,
         )
-        return ResearchFinding(angle=angle, degraded=True)
+        return ResearchFinding(category=category, degraded=True)
 
 
 def _format_research_findings_for_prompt(findings: list[dict[str, Any]]) -> str:
     if not findings:
         return ""
     lines = [
-        f"Grounding research from {len(findings)} independently-researched angle(s) — weave "
-        "these real findings, and ESPECIALLY their suggested_thresholds/sources, into your "
-        "KPI proposal and quantitative_criteria instead of inventing plausible-sounding numbers:"
+        f"Grounding research from {len(findings)} independently-researched categor"
+        + ("y" if len(findings) == 1 else "ies")
+        + " — weave these real findings, and ESPECIALLY their suggested_thresholds/sources, "
+        "into your KPI proposal and quantitative_criteria instead of inventing "
+        "plausible-sounding numbers:"
     ]
     for f in findings:
-        lines.append(f"\n## Angle: {f.get('angle', '(unknown)')}")
+        lines.append(f"\n## Category: {f.get('category', '(unknown)')}")
         if f.get("summary"):
             lines.append(f"Summary: {f['summary']}")
         for kpi in f.get("suggested_kpis") or []:
@@ -1382,15 +1464,21 @@ def _normalize_kpi_guidelines(candidate: dict[str, Any]) -> dict[str, Any]:
     return {**candidate, "guidelines": {k: _normalize_guideline_value(v) for k, v in guidelines.items()}}
 
 
-def _validate_kpi_batch_items(raw_items: list[Any]) -> list[dict[str, Any]]:
+def _validate_kpi_batch_items(raw_items: list[Any], category_name: str) -> list[dict[str, Any]]:
     """Validates each raw `propose_kpi_batch` item against `KpiDraft` (weight bounds,
     guideline score-level keys, etc — the same schema `update_draft` patches are validated
     against) — an invalid item is dropped and logged, never allowed to reach the merge step
-    or corrupt draft state. Every item is forced flat (`level=1`, `parent_name=None`): a
-    research agent only ever proposes independent, non-hierarchical KPI candidates (it has
-    no visibility into what the OTHER concurrently-running agents are proposing, so it
-    cannot meaningfully nest under a sibling it doesn't know exists) — restructuring into a
-    hierarchy, if the user wants one, is left to propose_kpis's reconciliation pass.
+    or corrupt draft state.
+
+    Every item is forced to `level=2, parent_name=category_name`: a research agent IS one
+    category's dedicated research assignment (see the module comment above
+    `MAX_CATEGORIES`), so every KPI it proposes unambiguously belongs under that category —
+    there is no longer any "flat, unparented" KPI shape coming out of the research fan-out
+    (contrast with this function's pre-category behavior, which forced `level=1,
+    parent_name=None` since an "angle" had no defined place in any hierarchy). The
+    category itself becomes its own `level=1, parent_name=None` KpiDraft — see
+    `_merge_research_kpi_batches`, which builds that node once per surviving category
+    rather than here (this function only ever sees ONE category's own KPI items).
 
     Guideline values are repaired via `_normalize_kpi_guidelines` BEFORE validation (see
     that function's own docstring for the real, observed failure mode it recovers from) —
@@ -1401,7 +1489,7 @@ def _validate_kpi_batch_items(raw_items: list[Any]) -> list[dict[str, Any]]:
     for raw in raw_items[:MAX_KPIS_PER_RESEARCH_BATCH]:
         if not isinstance(raw, dict):
             continue
-        candidate = _normalize_kpi_guidelines({**raw, "level": 1, "parent_name": None})
+        candidate = _normalize_kpi_guidelines({**raw, "level": 2, "parent_name": category_name})
         try:
             kpi = KpiDraft.model_validate(candidate)
         except ValidationError:
@@ -1416,12 +1504,22 @@ def _normalize_kpi_name_for_dedup(name: str) -> str:
 
 
 def _dedupe_kpi_batch_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Simple name/concept-similarity dedup across different agents' batches (e.g. two
-    agents both proposing a "Response Time" KPI) — doesn't need to be fancy per this
-    feature's own spec. A pair is treated as a duplicate when their normalized names are
+    """Name/concept-similarity dedup — now applied ACROSS every category's pooled batch at
+    once (see `_merge_research_kpi_batches`), not per category in isolation, since the same
+    KPI concept (e.g. "Response Time") can genuinely surface under two different categories'
+    independent research. A pair is treated as a duplicate when their normalized names are
     either a close fuzzy match (`difflib.SequenceMatcher` ratio >= 0.82) or one is a
     substring of the other AND both are long enough (>= 8 normalized chars) for that
-    substring relationship to be meaningful rather than a coincidence of short names."""
+    substring relationship to be meaningful rather than a coincidence of short names —
+    regardless of which category each item's `parent_name` says it belongs to.
+
+    Resolution policy (simple and deterministic, documented here rather than left implicit):
+    whichever occurrence appears FIRST in `items`' order wins and is kept; every later
+    near-duplicate is dropped. The caller (`_merge_research_kpi_batches`) always passes
+    `items` round-robin-interleaved across categories, so in practice this means "the
+    category whose research agent proposed this concept earliest in the fair, round-robin
+    ordering keeps it" — a reasonable, cheap proxy for "best-fitting category" without
+    needing a second LLM call just to adjudicate duplicates."""
     kept: list[dict[str, Any]] = []
     kept_norms: list[str] = []
     for item in items:
@@ -1443,16 +1541,16 @@ def _dedupe_kpi_batch_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def _normalize_weights_to_100(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Each research agent weighted its own batch relative to itself only (see
-    `PROPOSE_KPI_BATCH_TOOL`'s description) — after merging N agents' batches the pool's
-    total is roughly N x 100, not 100. Proportionally rescale every `included_in_scoring`
-    KPI's weight so the merged set already satisfies the DB's sibling-sum-to-100 rule
-    (mirrors `redistribute_weight`'s "remainder on the largest" rounding-drift fix in
-    `frontend/lib/kpi-tree.ts`) — this is a mechanical starting point, not a qualitative
-    judgment; `propose_kpis`'s reconciliation pass can still adjust it based on the user's
-    actual priorities. KPIs with `included_in_scoring=False` are left untouched (they are
-    not part of the sum-to-100 group at all — see migration
-    0005_scoring_formula_and_kpi_flags)."""
+    """Proportionally rescales every `included_in_scoring` item's `weight` so the set sums
+    to 100 — a mechanical starting point, not a qualitative judgment. Generic over WHICH
+    sibling group it's applied to: `_merge_research_kpi_batches` below calls this once per
+    category (to renormalize that category's children) and once more across the surviving
+    categories themselves (to renormalize their own top-level weights) — exactly the DB's
+    own per-parent-group sibling-weight-sum-to-100 rule, applied at whichever level is
+    relevant, the same helper either way. Mirrors `redistributeWeight`'s "remainder on the
+    largest" rounding-drift fix in `frontend/lib/kpi-tree.ts`. Items with
+    `included_in_scoring=False` are left untouched (not part of the sum-to-100 group at
+    all — see migration 0005_scoring_formula_and_kpi_flags)."""
     included = [it for it in items if it.get("included_in_scoring", True)]
     total = sum(float(it.get("weight") or 0) for it in included)
     if total <= 0:
@@ -1472,14 +1570,43 @@ def _normalize_weights_to_100(items: list[dict[str, Any]]) -> list[dict[str, Any
     return out
 
 
-def _merge_research_kpi_batches(findings: list[ResearchFinding]) -> list[dict[str, Any]]:
-    """The merge point (Part 1 fix — see the module comment above MAX_RESEARCH_ANGLES):
-    round-robin interleaves every agent's own KPI batch (so, if the pool ends up over the
-    cap, no single agent's whole batch crowds out the others), dedupes near-identical
-    concepts across agents, caps the total at MAX_TOTAL_MERGED_KPIS (a safety ceiling, NOT
-    a fixed target — real coverage is whatever the research actually surfaced), then
-    renormalizes weights to sum to 100. Returns `[]` (a no-op merge) if no agent proposed
-    anything usable."""
+def _merge_research_kpi_batches(
+    findings: list[ResearchFinding], category_meta: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """THE merge point, now category/hierarchy-aware (see the module comment above
+    `MAX_CATEGORIES`): every agent's own KPI batch already carries `parent_name=<its
+    category>` and `level=2` (forced by `_validate_kpi_batch_items`), so this step:
+
+    1. Round-robin interleaves every category's own KPI batch (unchanged mechanism — if the
+       pool ends up over the cap, no single category's whole batch crowds out the others).
+    2. Dedupes near-identical KPI CONCEPTS ACROSS THE WHOLE merged pool, not per category in
+       isolation — see `_dedupe_kpi_batch_items`'s own docstring for the exact matching rule
+       and its "first in round-robin order wins" resolution policy, which is what actually
+       decides which category a cross-category duplicate survives under.
+    3. Caps the total at MAX_TOTAL_MERGED_KPIS (a safety ceiling, NOT a fixed target).
+    4. Groups the survivors by their (surviving) category and renormalizes each category's
+       children to sum to 100 WITHIN that category — mirrors the DB's own per-parent-group
+       weight-sum rule. A category that ends up with ZERO surviving children (e.g. every
+       one of its proposed KPIs lost a cross-category dedup to another category) is dropped
+       entirely — this function never emits an empty, childless "category" parent node,
+       since that would itself become a leaf with no guidelines and nothing to score.
+    5. Builds the Level-1 category `KpiDraft` dict for every category that still has at
+       least one surviving child: `weight` is that category's `initial_weight` guess (see
+       `category_meta`, sourced from `decide_categories`/`assess_research_coverage`'s
+       optional `initial_weight` field) if one was given, else an equal default share —
+       either way, every surviving category's weight is then renormalized together to sum
+       to 100 (same `_normalize_weights_to_100` helper, applied once more at the category
+       level), so an explicit guess and the default both end up rescaled consistently
+       rather than one winning outright over the other.
+
+    `category_meta` accumulates across every research round in `research_kpis` (keyed by
+    category name — see that function), so a round-2 "deepen an existing category" finding
+    (same name as a round-1 category) is grouped and renormalized together with that
+    category's round-1 children automatically, with zero special-casing here: grouping by
+    name IS the entire "new category vs. deepen an existing one" mechanism.
+
+    Returns `[]` (a no-op merge) if no category proposed anything usable — identical
+    graceful-degradation contract to this function's pre-category behavior."""
     batches = [f.proposed_kpis for f in findings if f.proposed_kpis]
     interleaved: list[dict[str, Any]] = []
     i = 0
@@ -1491,16 +1618,43 @@ def _merge_research_kpi_batches(findings: list[ResearchFinding]) -> list[dict[st
 
     deduped = _dedupe_kpi_batch_items(interleaved)
     capped = deduped[:MAX_TOTAL_MERGED_KPIS]
-    return _normalize_weights_to_100(capped)
+    if not capped:
+        return []
+
+    by_category: dict[str, list[dict[str, Any]]] = {}
+    for item in capped:
+        by_category.setdefault(str(item.get("parent_name") or ""), []).append(item)
+    surviving_names = [name for name in by_category if name]
+    if not surviving_names:
+        return []
+
+    default_weight = 100.0 / len(surviving_names)
+    children: list[dict[str, Any]] = []
+    category_nodes: list[dict[str, Any]] = []
+    for name in surviving_names:
+        children.extend(_normalize_weights_to_100(by_category[name]))
+        initial_weight = (category_meta.get(name) or {}).get("initial_weight")
+        category_nodes.append(
+            {
+                "name": name,
+                "weight": float(initial_weight) if initial_weight is not None else default_weight,
+                "level": 1,
+                "parent_name": None,
+                "included_in_scoring": True,
+                "guidelines": {},
+            }
+        )
+
+    return [*_normalize_weights_to_100(category_nodes), *children]
 
 
 def _web_search_usable(client: WebSearchClientProtocol | None) -> bool:
-    """Whether it's worth spending the extra `decide_research_angles` Bedrock call at all.
+    """Whether it's worth spending the extra `decide_categories` Bedrock call at all.
     Unlike propose_kpis's own ad hoc `web_search` tool offering (unchanged — still offered
     whenever `client is not None`, since a misconfigured real client's own `.search()`
     gracefully returns `[]` per its documented contract, and offering it costs nothing
     extra there), `research_kpis` unconditionally spends one whole Bedrock call up front
-    just to decide angles — not worth it if search can't possibly return anything.
+    just to decide categories — not worth it if search can't possibly return anything.
     `AgentCoreWebSearchClient` exposes `is_configured` for exactly this; a client that
     doesn't expose it (e.g. `FakeWebSearchClient`/`FakeBedrockClient` in tests, or any
     other `WebSearchClientProtocol` implementation) is assumed usable."""
@@ -1511,33 +1665,34 @@ def _web_search_usable(client: WebSearchClientProtocol | None) -> bool:
 
 async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str, Any]:
     """The master/orchestrator step: given the user's stated domain/purpose so far, decides
-    (one Bedrock call, see `_decide_research_angles`) how many distinct research angles this
-    domain warrants, then runs that many instances of the ONE `_run_research_agent` worker
-    CONCURRENTLY via `asyncio.gather` (genuine parallel execution — every angle's Bedrock +
-    web_search calls are in flight together, not one after another), and consolidates the
-    structured findings into state for `propose_kpis` to ground its proposal in.
+    (one Bedrock call, see `_decide_categories`) which named KPI CATEGORIES this domain
+    warrants, then runs one instance of the ONE `_run_research_agent` worker PER CATEGORY,
+    CONCURRENTLY via `asyncio.gather` (genuine parallel execution — every category's
+    Bedrock + web_search calls are in flight together, not one after another), and
+    consolidates the structured findings — already organized by category — into state for
+    `propose_kpis` to ground its proposal in. See the module comment above `MAX_CATEGORIES`
+    for the full category = Level-1 KpiDraft / KPI = Level-2 KpiDraft(parent_name=category)
+    design this orchestrator builds.
 
     **Iterative / multi-round research**: after round 1's fan-out and merge, if
     `MAX_RESEARCH_ROUNDS` (2) hasn't been reached yet, the master runs ONE real confidence
     check (`_assess_research_coverage` — a genuine Bedrock judgment grounded in the actual
-    consolidated findings/KPIs gathered so far, never a hardcoded heuristic) asking whether
-    coverage is genuinely sufficient or whether a real, distinct gap remains. If the model
-    identifies a real gap AND proposes new/refined angles for it, a SECOND bounded round of
-    the same concurrent fan-out runs against those NEW angles (given full context on what
-    round 1 already covered, so it targets an actual gap rather than re-searching the same
-    ground — see `_ASSESS_COVERAGE_SYSTEM_PROMPT`). This whole multi-round loop is a plain
-    Python `while` loop INSIDE this one node invocation, not additional LangGraph nodes —
-    see `MAX_RESEARCH_ROUNDS`'s own docstring for why that's what keeps this feature from
-    ever affecting `MAX_LLM_TURNS_PER_HUMAN_TURN`.
+    consolidated findings/categorized KPIs gathered so far, never a hardcoded heuristic)
+    asking whether coverage is genuinely sufficient or whether a real, distinct category/gap
+    remains. If the model identifies a real gap AND proposes categories for it (new names,
+    or an existing name to deepen), a SECOND bounded round of the same concurrent fan-out
+    runs — see `MAX_RESEARCH_ROUNDS`'s own docstring for exactly how "new category" vs.
+    "deepen an existing one" composes for free through `_merge_research_kpi_batches`
+    grouping by name.
 
     Runs at most ONCE per session (guarded by `research_done`, set on every path out of this
-    node, unchanged by this feature) — see `MAX_RESEARCH_ROUNDS`'s own docstring for why
-    this (now potentially multi-round) node still can't affect MAX_LLM_TURNS_PER_HUMAN_TURN.
-    A no-op (research_done=True, no findings) when no `web_search_client` is wired in
-    (mirrors propose_kpis's own gating), or when round 1's angle decision itself fails/
-    returns nothing — propose_kpis then simply proceeds exactly as it did before this
-    feature existed (its own ad hoc web_search + the model's own knowledge), which is the
-    graceful-degradation path required when Bedrock/web_search is unavailable."""
+    node) — see `MAX_RESEARCH_ROUNDS`'s own docstring for why this (potentially multi-round)
+    node still can't affect MAX_LLM_TURNS_PER_HUMAN_TURN. A no-op (research_done=True, no
+    findings) when no `web_search_client` is wired in (mirrors propose_kpis's own gating),
+    or when round 1's category decision itself fails/returns nothing — propose_kpis then
+    simply proceeds exactly as it did before this feature existed (its own ad hoc
+    web_search + the model's own knowledge), which is the graceful-degradation path
+    required when Bedrock/web_search is unavailable."""
     if state.get("research_done"):
         return {}
 
@@ -1557,53 +1712,60 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
 
     await emit_turn_event(
         session_id, turn_started_at, "master", "started",
-        "Reviewing what you've said so far to plan research angles…",
+        "Reviewing what you've said so far to plan KPI categories…",
     )
 
     try:
-        angles = await _decide_research_angles_with_gate(
+        categories = await _decide_categories_with_gate(
             bedrock, model_id, draft, conversation_context, jev_client, session_id, turn_started_at
         )
-    except Exception:  # noqa: BLE001 — angle decision failing must not break the turn either
-        logger.warning("research_kpis: failed to decide research angles; skipping fan-out.", exc_info=True)
+    except Exception:  # noqa: BLE001 — category decision failing must not break the turn either
+        logger.warning("research_kpis: failed to decide categories; skipping fan-out.", exc_info=True)
         await emit_turn_event(
             session_id, turn_started_at, "master", "error",
-            "Could not plan research angles — proceeding without dedicated research.",
+            "Could not plan KPI categories — proceeding without dedicated research.",
         )
         return {"research_done": True}
 
-    if not angles:
-        logger.info("research_kpis: model decided no dedicated research angles were needed.")
+    if not categories:
+        logger.info("research_kpis: model decided no dedicated category/research fan-out was needed.")
         await emit_turn_event(
-            session_id, turn_started_at, "master", "deciding_angles",
-            "Determined this domain doesn't need a dedicated research fan-out.",
+            session_id, turn_started_at, "master", "deciding_categories",
+            "Determined this domain doesn't need a dedicated category structure or research fan-out.",
         )
         return {"research_done": True}
 
     # --- Multi-round loop (bounded by MAX_RESEARCH_ROUNDS — see that constant's own
     # docstring for the full latency/cost/MAX_LLM_TURNS_PER_HUMAN_TURN reasoning). Round 1
-    # always runs with the angles `_decide_research_angles` just chose above; every
-    # subsequent round (if any) runs with the NEW angles `_assess_research_coverage`
-    # proposed for a genuine identified gap. `all_findings`/`all_angles_covered` accumulate
-    # across every round so far, so the merge step (`_merge_research_kpi_batches`) and the
-    # confidence check both always see the FULL picture, not just the latest round.
+    # always runs with the categories `_decide_categories` just chose above; every
+    # subsequent round (if any) runs with the categories `_assess_research_coverage`
+    # proposed for a genuine identified gap (new names, or an existing name to deepen).
+    # `all_findings`/`all_categories_covered`/`category_meta` accumulate across every round
+    # so far, so the merge step (`_merge_research_kpi_batches`) and the confidence check
+    # both always see the FULL picture, not just the latest round. `category_meta` (keyed
+    # by category name) is what lets the merge step recover each surviving category's
+    # `initial_weight` guess without needing to re-derive it from the findings themselves.
     all_findings: list[ResearchFinding] = []
-    all_angles_covered: list[dict[str, str]] = []
+    all_categories_covered: list[dict[str, Any]] = []
+    category_meta: dict[str, dict[str, Any]] = {}
     merged_kpis: list[dict[str, Any]] = []
     updated_draft_dict = draft.model_dump(mode="json")
     total_proposed_before_merge = 0
     round_num = 1
 
     while True:
+        for c in categories:
+            category_meta[c["name"]] = {**category_meta.get(c["name"], {}), **c}
+
         logger.info(
-            "research_kpis: round %d dispatching %d research agent(s) concurrently: %s",
-            round_num, len(angles), angles,
+            "research_kpis: round %d dispatching %d research agent(s) concurrently (one per category): %s",
+            round_num, len(categories), categories,
         )
         if round_num == 1:
             await emit_turn_event(
-                session_id, turn_started_at, "master", "deciding_angles",
-                f"Decided on {len(angles)} research angle(s): "
-                + "; ".join(f'"{a["angle"]}"' for a in angles),
+                session_id, turn_started_at, "master", "deciding_categories",
+                f"Decided on {len(categories)} KPI categor{'y' if len(categories) == 1 else 'ies'}: "
+                + "; ".join(f'"{c["name"]}"' for c in categories),
                 round=round_num,
             )
         else:
@@ -1611,17 +1773,18 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
             # UI/logs make clear this round exists BECAUSE round 1 wasn't judged
             # sufficient — see `_assess_research_coverage`'s reasoning, echoed here too.
             await emit_turn_event(
-                session_id, turn_started_at, "master", "deciding_angles",
-                f"Round {round_num}: investigating {len(angles)} new angle(s) to address a "
-                "gap round 1 didn't cover: " + "; ".join(f'"{a["angle"]}"' for a in angles),
+                session_id, turn_started_at, "master", "deciding_categories",
+                f"Round {round_num}: investigating {len(categories)} categor"
+                f"{'y' if len(categories) == 1 else 'ies'} to address a gap round 1 didn't "
+                "cover: " + "; ".join(f'"{c["name"]}"' for c in categories),
                 round=round_num,
             )
 
         raw_findings = await asyncio.gather(
             *(
                 _run_research_agent(
-                    a["angle"],
-                    a["query_focus"],
+                    c["name"],
+                    c["focus"],
                     bedrock,
                     web_search_client,
                     model_id,
@@ -1632,7 +1795,7 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
                     jev_client=jev_client,
                     conversation_context=conversation_context,
                 )
-                for i, a in enumerate(angles)
+                for i, c in enumerate(categories)
             ),
             return_exceptions=True,  # belt-and-suspenders — _run_research_agent already never raises
         )
@@ -1647,19 +1810,20 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
         usable = [f for f in round_findings if f.has_content()]
         logger.info(
             "research_kpis: round %d — %d/%d agent(s) returned usable findings (%d degraded/empty excluded).",
-            round_num, len(usable), len(angles), len(round_findings) - len(usable),
+            round_num, len(usable), len(categories), len(round_findings) - len(usable),
         )
 
         all_findings.extend(usable)
-        all_angles_covered.extend(angles)
+        all_categories_covered.extend(categories)
         total_proposed_before_merge += sum(len(f.proposed_kpis) for f in usable)
 
-        # --- Merge point (Part 1 fix) — see _merge_research_kpi_batches's own docstring.
-        # Re-run over ALL findings accumulated so far (not just this round's), so a
-        # round-2 agent's near-duplicate of a round-1 KPI is caught by the same dedup pass
-        # and the whole pool is renormalized together — never two independently-normalized
-        # pools bolted together.
-        candidate_kpis = _merge_research_kpi_batches(all_findings)
+        # --- Merge point — see _merge_research_kpi_batches's own docstring. Re-run over
+        # ALL findings accumulated so far (not just this round's), so a round-2 agent's
+        # near-duplicate of a round-1 KPI is caught by the same dedup pass, a "deepen"
+        # round's new KPIs join that same category's round-1 children, and the whole pool
+        # is renormalized together — never two independently-normalized pools bolted
+        # together.
+        candidate_kpis = _merge_research_kpi_batches(all_findings, category_meta)
         if candidate_kpis:
             candidate_draft_dict = {**draft.model_dump(mode="json"), "kpis": candidate_kpis}
             try:
@@ -1673,10 +1837,12 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
                     round_num, exc_info=True,
                 )
 
+        categories_in_merge = sorted({k["name"] for k in merged_kpis if k.get("level") == 1})
         logger.info(
             "research_kpis: round %d — merged %d proposed KPI(s) from %d agent batch(es) so far into "
-            "%d deduped/capped KPI(s): %s",
+            "%d categorized KPI(s) across %d categor%s: %s",
             round_num, total_proposed_before_merge, len(all_findings), len(merged_kpis),
+            len(categories_in_merge), "y" if len(categories_in_merge) == 1 else "ies",
             [k["name"] for k in merged_kpis],
         )
 
@@ -1699,7 +1865,7 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
                     ScorecardDraft.model_validate(updated_draft_dict),
                     conversation_context,
                     all_findings,
-                    all_angles_covered,
+                    all_categories_covered,
                     round_num,
                 )
             except Exception:  # noqa: BLE001 — a failed confidence check must never break the turn
@@ -1717,19 +1883,20 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
             not reached_cap
             and assessment is not None
             and not assessment.sufficient
-            and bool(assessment.next_angles)
+            and bool(assessment.next_categories)
         )
 
         if will_continue:
             assert assessment is not None  # for mypy/readability — guarded by will_continue above
             await emit_turn_event(
                 session_id, turn_started_at, "master", "completed",
-                f"Round {round_num} complete — {len(usable)}/{len(angles)} finding(s), "
-                f"{len(merged_kpis)} KPI(s) merged so far. Not yet sufficient: "
+                f"Round {round_num} complete — {len(usable)}/{len(categories)} finding(s), "
+                f"{len(merged_kpis)} KPI(s) merged across {len(categories_in_merge)} categor"
+                f"{'y' if len(categories_in_merge) == 1 else 'ies'} so far. Not yet sufficient: "
                 f"{assessment.reasoning or 'a real gap remains'} — starting round {round_num + 1}.",
                 round=round_num,
             )
-            angles = assessment.next_angles
+            categories = assessment.next_categories
             round_num += 1
             continue
 
@@ -1742,18 +1909,25 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
         await emit_turn_event(
             session_id, turn_started_at, "master", "completed",
             f"Research phase complete after {round_num} round(s) ({stop_reason}) — consolidated "
-            f"{len(all_findings)} finding(s) across {len(all_angles_covered)} angle(s); merged "
-            f"{total_proposed_before_merge} proposed KPI(s) into {len(merged_kpis)} deduped KPI(s) for review.",
+            f"{len(all_findings)} finding(s) across {len(all_categories_covered)} categor"
+            f"{'y' if len(all_categories_covered) == 1 else 'ies'}; merged {total_proposed_before_merge} "
+            f"proposed KPI(s) into {len(merged_kpis)} categorized KPI(s) across {len(categories_in_merge)} "
+            f"categor{'y' if len(categories_in_merge) == 1 else 'ies'} for review.",
             round=round_num,
         )
         break
 
     note = (
-        f"[research] investigated {len(all_angles_covered)} angle(s) across {round_num} round(s): "
-        + ", ".join(a["angle"] for a in all_angles_covered)
+        f"[research] investigated {len(all_categories_covered)} categor"
+        f"{'y' if len(all_categories_covered) == 1 else 'ies'} across {round_num} round(s): "
+        + ", ".join(c["name"] for c in all_categories_covered)
         + (
-            f"; merged {len(merged_kpis)} KPI(s) from per-agent batches: "
-            + ", ".join(k["name"] for k in merged_kpis)
+            f"; merged {len(merged_kpis)} KPI(s), organized under {len(categories_in_merge)} categor"
+            f"{'y' if len(categories_in_merge) == 1 else 'ies'}: "
+            + ", ".join(
+                f'{k["name"]} (under "{k["parent_name"]}")' if k.get("parent_name") else k["name"]
+                for k in merged_kpis
+            )
             if merged_kpis
             else ""
         )
@@ -1764,7 +1938,6 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
         "draft": updated_draft_dict,
         "messages": [{"role": "assistant", "content": note}],
     }
-
 
 # A non-confirming update_draft always routes back to propose_kpis for another LLM turn
 # (so the model can chain several update_draft calls, or follow one straight up with a
@@ -1779,7 +1952,7 @@ async def research_kpis(state: BuilderState, config: RunnableConfig) -> dict[str
 # fan-out cannot itself push a human turn closer to this cutoff; MAX_LLM_TURNS_PER_HUMAN_TURN
 # is left at its pre-existing value, reasoned through rather than raised reflexively. This
 # holds EXACTLY as true now that research_kpis can run up to MAX_RESEARCH_ROUNDS bounded
-# rounds internally (angle decisions, confidence checks, and every round's agent fan-out
+# rounds internally (category decisions, confidence checks, and every round's agent fan-out
 # all happen inside that one node invocation, still before propose_kpis's first visit) —
 # see MAX_RESEARCH_ROUNDS's own docstring for the full reasoning on why research rounds and
 # propose_kpis's reconciliation/confirmation turns are accounted completely separately.
@@ -1853,26 +2026,40 @@ actually need an answer — "I asked it in words" does not count as "I asked it 
 question the user can answer."
 
 If the draft already has KPIs (e.g. merged in from the multi-agent research fan-out that \
-ran before your first turn this session — each already has a name, weight, and full \
-11-level guidelines, grounded in real research), your job THIS TURN is RECONCILIATION, \
-not fresh generation: review the set for genuine quality/coverage gaps or true near-\
-duplicates, do a final sanity pass on the weights (sibling groups must sum to 100 — see \
-"Fields still missing/incomplete" below), and present it to the user for confirmation/\
-adjustment via ask_clarification rather than inventing an entirely new KPI list from \
-scratch. Only propose ADDITIONAL new KPIs via update_draft if there is a real, identified \
-coverage gap the research didn't touch — do not discard or rewrite an already-researched \
-KPI's guidelines just to "improve" them unless the user specifically asked you to change \
-that KPI. If the ONLY thing missing is a scalar field (name/purpose/domain/audience/\
-target_score, NOT the KPIs themselves), send update_draft with JUST those field(s) in \
-`patch` and OMIT `kpis` entirely — do not re-type the existing KPI list just to fill in \
-an unrelated field; omitting `kpis` from `patch` leaves every already-merged KPI exactly \
-as it is, automatically. Re-typing a large KPI list from memory risks silently truncating \
-it, which would undo the whole point of the research merge.
+ran before your first turn this session — organized into named CATEGORIES, each a Level-1 \
+KPI with its own weight, grouping its Level-2 children, each child already has a name, \
+weight, and full 11-level guidelines, grounded in real research), your job THIS TURN is \
+RECONCILIATION, not fresh generation: review the set for genuine quality/coverage gaps or \
+true near-duplicates (within a category AND across categories), do a final sanity pass on \
+the weights (every sibling group — the categories themselves, AND each category's own \
+children — must separately sum to 100, see "Fields still missing/incomplete" below), and \
+present it to the user for confirmation/adjustment via ask_clarification rather than \
+inventing an entirely new KPI list from scratch. PRESERVE the existing category structure \
+(each KPI's `level`/`parent_name`) exactly as merged unless the user explicitly asks you to \
+regroup something — never flatten an already-categorized KPI back to a bare top-level item. \
+Only propose ADDITIONAL new KPIs via update_draft if there is a real, identified coverage \
+gap the research didn't touch, and when you do, nest each new KPI under the MOST FITTING \
+existing category (`parent_name` = that category's exact name, `level=2`) rather than \
+appending it flat — only introduce a genuinely new category (a new `level=1` KPI of its \
+own, with a weight, and the merged category set's weights re-summed to 100) if the gap \
+truly doesn't belong under any category already present. Do not discard or rewrite an \
+already-researched KPI's guidelines just to "improve" them unless the user specifically \
+asked you to change that KPI. If the ONLY thing missing is a scalar field (name/purpose/\
+domain/audience/target_score, NOT the KPIs themselves), send update_draft with JUST those \
+field(s) in `patch` and OMIT `kpis` entirely — do not re-type the existing KPI list just to \
+fill in an unrelated field; omitting `kpis` from `patch` leaves every already-merged KPI, \
+and its category grouping, exactly as it is, automatically. Re-typing a large KPI list from \
+memory risks silently truncating it (or its category structure), which would undo the \
+whole point of the research merge.
 
 If the draft has NO KPIs yet (e.g. the research fan-out found nothing for this domain, or \
 was skipped), prefer `update_draft` with your own best-guess proposal before you \
 `ask_clarification` (LLM first, human second — propose candidate KPIs from what the user \
-already told you, then ask about what's genuinely ambiguous or missing).
+already told you, then ask about what's genuinely ambiguous or missing). Where it's \
+genuinely useful for the domain, organize your proposal into named categories the same way \
+(a Level-1 KPI per category with its own weight, Level-2 KPIs nested under it via \
+`parent_name`) rather than one flat list — a flat list is still fine for a domain simple \
+enough that categorization wouldn't add real clarity.
 
 When a `web_search` tool is available to you, use it to research real industry KPIs, \
 published standards, and benchmark thresholds for the user's stated domain BEFORE \
@@ -1979,7 +2166,7 @@ def _last_user_message(messages: list[ChatTurn]) -> str:
 
 def _conversation_context_text(messages: list[ChatTurn], max_turns: int = 8) -> str:
     """Plain-text rendering of the most recent user/assistant turns, for `research_kpis`'s
-    `decide_research_angles` call (see `_decide_research_angles`) — this is deliberately
+    `decide_categories` call (see `_decide_categories`) — this is deliberately
     NOT the structured `draft`, since on a session's first turn the draft is still entirely
     empty and the user's own words are the only real signal for the domain. Internal "tool"
     role notes (validation-error bookkeeping) are skipped as noise for this purpose."""

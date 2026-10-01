@@ -66,13 +66,13 @@ def _tools_offered(tools) -> set[str]:
     return {t.name for t in (tools or [])}
 
 
-def _no_dedicated_research_angles(tools) -> tuple[bool, object]:
+def _no_dedicated_research_categories(tools) -> tuple[bool, object]:
     """Same helper as test_scorecard_builder_web_search.py — respond to research_kpis's
-    own `decide_research_angles` call (when a web_search_client is wired in) with an empty
-    angle list, so the rest of the scripted conversation exercises propose_kpis's own
+    own `decide_categories` call (when a web_search_client is wired in) with an empty
+    category list, so the rest of the scripted conversation exercises propose_kpis's own
     tool-selection logic in isolation from the separate multi-agent research fan-out."""
-    if "decide_research_angles" in _tools_offered(tools):
-        return True, tool_use_result("decide_research_angles", {"angles": []})
+    if "decide_categories" in _tools_offered(tools):
+        return True, tool_use_result("decide_categories", {"categories": []})
     return False, None
 
 
@@ -155,7 +155,7 @@ async def test_on_demand_web_search_mid_conversation_outside_initial_research_ph
     session_id = str(uuid.uuid4())
 
     def turn1_converse_fn(*, messages, system, tools, force_tool_use, model_id):
-        handled, response = _no_dedicated_research_angles(tools)
+        handled, response = _no_dedicated_research_categories(tools)
         if handled:
             return response
         # First real propose_kpis call this session: just ask a clarifying question,
@@ -230,7 +230,7 @@ async def test_session_level_web_search_budget_caps_across_turns() -> None:
         state = {"n": 0}
 
         def converse_fn(*, messages, system, tools, force_tool_use, model_id):
-            handled, response = _no_dedicated_research_angles(tools)
+            handled, response = _no_dedicated_research_categories(tools)
             if handled:
                 return response
             state["n"] += 1
@@ -249,7 +249,7 @@ async def test_session_level_web_search_budget_caps_across_turns() -> None:
 
     fake_search = FakeWebSearchClient(search_fn=lambda q: [search_result("T", "https://x.example", "s")])
 
-    # First turn: research fan-out skipped (no angles), one ad hoc web_search happens, then
+    # First turn: research fan-out skipped (no categories), one ad hoc web_search happens, then
     # a plain conversational close — establishes web_search_calls_used > 0 in state.
     fake1 = FakeBedrockClient(converse_fn=make_converse_fn("q1", expect_search=True))
     turn1 = await sb.start_session(session_id, "Vendor risk scorecard.", fake1, web_search_client=fake_search)

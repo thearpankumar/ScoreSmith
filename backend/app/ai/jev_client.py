@@ -1,7 +1,7 @@
 """Client for TypeSafe AI's **Jev** ("System One" decision model), accessed via
 OpenRouter — used exclusively for the three quality-gate checkpoints added to
-`scorecard_builder.py` (research-angle planning, each research agent's finding, and the
-final per-turn answer). Every normal chat/judge LLM call in this project stays on AWS
+`scorecard_builder.py` (KPI-category planning, each category research agent's finding, and
+the final per-turn answer). Every normal chat/judge LLM call in this project stays on AWS
 Bedrock (GLM-5/GLM-4.7-Flash — see `bedrock_client.py`); this module is a completely
 separate, additive dependency.
 

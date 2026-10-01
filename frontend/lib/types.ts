@@ -160,9 +160,10 @@ export interface ChatSession {
  * One granular step of the AI pipeline's live trace for the CURRENT/most recent turn —
  * mirrors the backend's `ChatTurnEventRead` (see `backend/app/schemas/chat.py` and
  * `GET /chat/sessions/{id}/turn-events`). `actor` is `"master"` (the orchestrator —
- * `research_kpis`'s angle-deciding step, `propose_kpis`'s consolidate/propose/confirm
- * steps) or `"research_agent_{n}"` for one of up to `MAX_RESEARCH_ANGLES` concurrently
- * running research workers (see `backend/app/ai/scorecard_builder.py`). Replaces the old
+ * `research_kpis`'s category-deciding step, `propose_kpis`'s consolidate/propose/confirm
+ * steps) or `"research_agent_{n}"` for one of up to `MAX_CATEGORIES` concurrently running
+ * research workers, one per decided KPI category (see `backend/app/ai/scorecard_builder.py`).
+ * Replaces the old
  * generic "Assistant is thinking…" indicator — `message` is the real, human-readable text
  * rendered directly by `TurnTraceCard`.
  *

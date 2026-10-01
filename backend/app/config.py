@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     # (https://openrouter.ai/api/alpha/decisions — NOT the standard chat/completions
     # shape; see jev_client.py's module docstring for the live-confirmed request/response
     # contract). Used ONLY for the three quality-gate checkpoints added to
-    # scorecard_builder.py (research-angle planning, each research agent's finding, and
+    # scorecard_builder.py (KPI-category planning, each category research agent's finding, and
     # the final per-turn answer) — every normal chat/judge LLM call stays on Bedrock
     # GLM-5/GLM-4.7-Flash above. Left unset (empty string) by default; jev_client.py
     # treats that as "not configured" and the quality-gate degrades to "passed" rather

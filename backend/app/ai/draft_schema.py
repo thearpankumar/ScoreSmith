@@ -17,7 +17,14 @@ Field mapping to the existing CRUD schema (`app/models/scorecard.py` et al.), us
   documented, deliberate choice, not an oversight.
 - `KpiDraft.level` / `.parent_name` build the `ltree` hierarchy by *name* reference
   (the LLM never sees or invents UUIDs); `materialize_draft` resolves `parent_name` to a
-  real `kpi_nodes.id` as it creates nodes level-by-level.
+  real `kpi_nodes.id` as it creates nodes level-by-level. The chat builder's research
+  fan-out (`scorecard_builder.py::research_kpis`) uses exactly this mechanism to express
+  KPI CATEGORIES: a category is simply a `level=1` `KpiDraft` with `parent_name=None` and
+  its own `weight` (no guidelines of its own — see `missing_fields()` below, which treats
+  any KPI referenced as another KPI's `parent_name` as a grouping node that doesn't need
+  them), and each KPI researched under it is a `level=2` `KpiDraft` with
+  `parent_name=<category name>`. No schema addition was needed for this — `level`/
+  `parent_name` already supported it end to end.
 - `KpiDraft.guidelines` (keyed by `0`-`10` score level) map 1:1 to `kpi_guidelines` rows.
 """
 
@@ -118,10 +125,20 @@ class ScorecardDraft(BaseModel):
         if not self.kpis:
             missing.append("kpis")
         else:
+            # A KPI referenced as some OTHER KPI's `parent_name` is a grouping/CATEGORY
+            # node (see draft_schema.py module docstring) — it exists purely to group its
+            # children (exactly mirroring `app/ai/judge.py::leaf_nodes`'s "only leaf KPI
+            # nodes are judged directly; an internal node has no guidelines of its own to
+            # score against"), so it never needs guidelines itself. Every KPI still needs a
+            # weight regardless of level, since category weights (summing to 100 across
+            # categories) and leaf weights (summing to 100 within their parent group) are
+            # both required by the DB's generic per-parent-group sibling-weight-sum rule.
+            parent_names = {kpi.parent_name for kpi in self.kpis if kpi.parent_name}
             for kpi in self.kpis:
                 if kpi.weight is None:
                     missing.append(f"kpis[{kpi.name}].weight")
-                if not kpi.guidelines:
+                is_leaf = kpi.name not in parent_names
+                if is_leaf and not kpi.guidelines:
                     missing.append(f"kpis[{kpi.name}].guidelines")
             weight_issue = self._sibling_weight_issue()
             if weight_issue:

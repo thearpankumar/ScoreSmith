@@ -18,14 +18,14 @@
 ## Key features
 
 - **Chat-driven scorecard builder** — a [LangGraph](https://github.com/langchain-ai/langgraph) state machine, backed by AWS Bedrock (Z.ai GLM-5), asks clarifying questions, proposes KPIs "LLM first, human second," and checkpoints every step to Postgres so a session survives a server restart mid-question.
-- **Genuine multi-agent research fan-out** — before the first KPI is ever proposed, the graph decides 0–4 distinct research angles for the user's domain, then runs that many independent research agents *concurrently* (`asyncio.gather`, not sequentially), each with its own real web-search budget via an AWS Bedrock AgentCore Gateway MCP tool. Each agent proposes its **own** small batch of fully-specified, grounded KPIs (name, weight, full 11-level guidelines) — the total KPI count grows with research breadth instead of being capped by one giant end-of-pipeline call.
+- **Genuine multi-agent, CATEGORY-based research fan-out** — before the first KPI is ever proposed, the graph decides 0–5 named, business-recognizable KPI categories for the user's domain (e.g. "Schedule", "Budget", "Quality" for a project-milestone scorecard), then runs one independent research agent per category *concurrently* (`asyncio.gather`, not sequentially), each with its own real web-search budget via an AWS Bedrock AgentCore Gateway MCP tool. Each agent proposes its **own** small batch of fully-specified, grounded KPIs (name, weight, full 11-level guidelines) nested under its category — the total KPI count grows with research breadth instead of being capped by one giant end-of-pipeline call, and a final cross-category dedup/merge pass resolves any near-duplicate KPI concept that surfaced under two different categories before the result is shown to the user, grouped by category, both on screen and in the saved `kpi_nodes` hierarchy.
 - **Embedding-based reuse suggestions** — a new request is checked against existing scorecards (pgvector cosine similarity over Titan-embedded purpose text, threshold 0.75) and offered as "use as-is / adapt / start fresh" *before* generating from scratch.
 - **Ensemble LLM judge** — every leaf KPI is scored by **3 independent** Bedrock Converse calls (Z.ai GLM-4.7-Flash) with the guideline rungs presented in a different order each time (ascending / descending / deterministic shuffle) to counter position bias, aggregated by median, and flagged `needs_review` when the calls disagree.
 - **Reasoning-before-score judging** — the judge's tool schema forces `matched_level → evidence_quotes → reasoning → score`, so the model commits to a rubric level and cites verbatim evidence before it ever writes a number.
 - **Custom scoring-formula engine** — the default weighted average can be overridden with an arbitrary safe expression (`kpi["Name"] * 0.6 + min(kpi["A"], kpi["B"]) * 0.4`, `+ - * / **`, `min/max/avg/mean/sqrt/abs`), parsed via `simpleeval`'s AST whitelist (no `eval`), used identically by both the AI judge and manual scoring paths so they can never disagree about what a score means.
 - **Hierarchical KPI trees** — up to 4 levels deep, stored as Postgres `ltree` materialized paths, each leaf carrying a full 0–10 qualitative + quantitative guideline ladder.
 - **Live agent-execution trace** — every research agent and the orchestrator itself streams granular events (`started`, `searching`, `search_result`, `proposing_kpis`, `completed`, `quality_gate`/`quality_gate_retry`, ...) to a dedicated table, rendered live in the chat UI instead of a generic spinner.
-- **Quality-gate self-critique layer** — three checkpoints in the chat pipeline (the master's research-angle plan, each research agent's finding, and `propose_kpis`'s final per-turn answer) are rated 0–1 by [TypeSafe AI's **Jev**](https://openrouter.ai/docs/guides/community/jev) — a "System One" non-autoregressive decision model reached via OpenRouter's alpha Decisions API, **not** AWS Bedrock — against a 0.75 threshold. Below threshold, the relevant step revises itself (bounded at 2 retries, then proceeds with its best attempt); an unreachable Jev degrades the gate to "passed" rather than blocking the pipeline on a third-party dependency.
+- **Quality-gate self-critique layer** — three checkpoints in the chat pipeline (the master's KPI-category plan, each category research agent's finding, and `propose_kpis`'s final per-turn answer) are rated 0–1 by [TypeSafe AI's **Jev**](https://openrouter.ai/docs/guides/community/jev) — a "System One" non-autoregressive decision model reached via OpenRouter's alpha Decisions API, **not** AWS Bedrock — against a 0.75 threshold. Below threshold, the relevant step revises itself (bounded at 2 retries, then proceeds with its best attempt); an unreachable Jev degrades the gate to "passed" rather than blocking the pipeline on a third-party dependency.
 - **Manual and AI-driven evaluation**, converging on one shared scoring computation and 7-band RAG (Red/Amber/Green) result.
 - **Glassmorphism design system** (white + lemon yellow `#FFF700`), with an explicit glass-vs-solid rule: glass surfaces for chrome/cards/modals, solid panels for dense data (guideline matrices, KPI/weight tables).
 
@@ -95,7 +95,7 @@ sequenceDiagram
     participant Graph as LangGraph orchestrator
     participant Sim as check_similarity
     participant Research as research_kpis (master)
-    participant Agents as Research agents (N, parallel)
+    participant Agents as Category research agents (N, parallel)
     participant Search as AgentCore Gateway web_search
     participant Jev as Jev (OpenRouter quality gate)
     participant Propose as propose_kpis (GLM-5)
@@ -113,27 +113,27 @@ sequenceDiagram
         UI->>API: user's choice, resumes the graph
     end
     Graph->>Research: research_kpis — runs once per session
-    Research->>Research: decide_research_angles (GLM-5 picks 0-4 angles)
-    loop quality gate 1: plan vs. request, up to 2 revisions
-        Research->>Jev: rate_match(instruction=user request, answer=plan)
+    Research->>Research: decide_categories (GLM-5 picks 0-5 named KPI categories, e.g. Schedule/Budget/Quality)
+    loop quality gate 1: category plan vs. request, up to 2 revisions
+        Research->>Jev: rate_match(instruction=user request, answer=category plan)
         Jev-->>Research: 0-1 score
         Research->>DB: emit_turn_event (quality_gate / quality_gate_retry)
     end
-    par one branch per research angle
+    par one research agent per category
         Research->>Agents: spawn a research agent via asyncio.gather
         Agents->>Search: web_search(query), up to 2 calls
         Search-->>Agents: real titles / URLs / snippets
         Agents->>Agents: record_research_finding
-        loop quality gate 2: finding vs. assigned angle, up to 2 revisions
-            Agents->>Jev: rate_match(instruction=angle+focus, answer=finding)
+        loop quality gate 2: finding vs. assigned category, up to 2 revisions
+            Agents->>Jev: rate_match(instruction=category+focus, answer=finding)
             Jev-->>Agents: 0-1 score
         end
-        Agents->>Agents: propose_kpi_batch — 2-4 KPIs, each with full 11-level guidelines
-        Agents-->>Research: ResearchFinding + this agent's proposed KPIs
+        Agents->>Agents: propose_kpi_batch — KPIs for THIS category, each level=2/parent_name=category, full 11-level guidelines
+        Agents-->>Research: ResearchFinding + this category's proposed KPIs
     end
-    Research->>Research: dedupe near-duplicates, cap at 24, renormalize weights to 100
+    Research->>Research: dedupe near-duplicates ACROSS categories, cap at 30, renormalize weights to 100 per category AND across categories
     Research->>DB: emit_turn_event per actor (live trace UI)
-    Research-->>Graph: merged KPI batch written into draft.kpis
+    Research-->>Graph: merged category + KPI hierarchy written into draft.kpis
     Graph->>Propose: propose_kpis — reconcile the researched draft (force_tool_use)
     loop quality gate 3: final answer vs. request, up to 2 revisions
         Propose->>Jev: rate_match(instruction=conversation, answer=decision)
@@ -222,13 +222,13 @@ ScoreSmith/
 │   │   ├── schemas/            Pydantic request/response schemas
 │   │   └── scripts/            seed.py (idempotent Cycle 1 scenario catalogue), generate_scenarios.py
 │   ├── alembic/                Database migrations
-│   └── tests/                  pytest suite — 113 tests, run against a real Postgres instance
+│   └── tests/                  pytest suite — 119 tests, run against a real Postgres instance
 ├── frontend/                  Next.js 15 App Router + TypeScript
 │   ├── app/                    /chat, /charts, /evaluations, /settings routes ("/" redirects to /chat)
-│   ├── components/             chat/, chart-detail/, charts-library/, evaluation-result/, design-system/, layout/
+│   ├── components/             chat/, chart-detail/, charts-library/, evaluation-result/, evaluations/, design-system/, home/, layout/, settings/, ui/ (shadcn/ui primitives)
 │   └── lib/                    API client, hooks, shared utils
 ├── infra/                     docker-compose.yml, .env.example, db-init scripts
-├── docs/                      Initial product scope, data dictionary, Cycle 2/3 plan, cloud deployment plan
+├── docs/                      Initial product scope, data dictionary, Cycle 2/3 plan, cloud deployment plan, full product test specification
 └── References/                Source framework PDFs (RAG Quality Scorecard, Data-Driven Development)
 ```
 
@@ -284,7 +284,7 @@ cd backend
 uv venv --python 3.12 .venv && uv pip install --python .venv -e ".[dev]"   # or: python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 # one-time: create the test DB with the vector + ltree extensions (already done by
 # infra/db-init/02-create-test-db.sql on a fresh docker-compose volume)
-.venv/bin/python -m pytest        # 113 tests as of this writing
+.venv/bin/python -m pytest        # 119 tests as of this writing
 .venv/bin/python -m ruff check .  # lint
 ```
 

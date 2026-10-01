@@ -1205,15 +1205,27 @@ function draftKpiId(name: string): string {
 }
 
 function mapDraft(sessionId: string, be: BeScorecardDraft | null | undefined): ScorecardDraft {
-  const kpis: DraftKpi[] = (be?.kpis ?? []).map((k) => ({
-    id: draftKpiId(k.name),
-    name: k.name,
-    weight: k.weight ?? 0,
-    level: (k.level ?? 1) as 1 | 2 | 3 | 4,
-    parentId: k.parent_name ? draftKpiId(k.parent_name) : null,
-    includedInScoring: k.included_in_scoring ?? true,
-    status: k.weight != null && Object.keys(k.guidelines ?? {}).length > 0 ? "confirmed" : "proposed",
-  }));
+  // A KPI referenced as some OTHER KPI's `parent_name` is a grouping/CATEGORY node (see
+  // backend/app/ai/draft_schema.py's module docstring) — it never carries guidelines of
+  // its own (only leaf KPIs are judged/scored — mirrors app/ai/judge.py::leaf_nodes), so
+  // an empty `guidelines` object there does NOT mean "still just a rough proposal" the way
+  // it would for a leaf KPI. Without this, every category header would be stuck showing
+  // the "proposed" sparkle badge forever, even once it (and every KPI under it) is fully
+  // specified.
+  const categoryNames = new Set((be?.kpis ?? []).map((k) => k.parent_name).filter((p): p is string => !!p));
+  const kpis: DraftKpi[] = (be?.kpis ?? []).map((k) => {
+    const isCategory = categoryNames.has(k.name);
+    const hasGuidelines = Object.keys(k.guidelines ?? {}).length > 0;
+    return {
+      id: draftKpiId(k.name),
+      name: k.name,
+      weight: k.weight ?? 0,
+      level: (k.level ?? 1) as 1 | 2 | 3 | 4,
+      parentId: k.parent_name ? draftKpiId(k.parent_name) : null,
+      includedInScoring: k.included_in_scoring ?? true,
+      status: k.weight != null && (hasGuidelines || isCategory) ? "confirmed" : "proposed",
+    };
+  });
   return {
     sessionId,
     name: be?.name ?? null,

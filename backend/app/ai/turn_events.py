@@ -5,8 +5,9 @@ table this writes to, and `scorecard_builder.py`'s `research_kpis`/`_run_researc
 
 `emit_turn_event` opens its OWN short-lived `AsyncSession` per call rather than reusing the
 request-scoped session threaded through LangGraph's `config.configurable["db_session"]`.
-This matters specifically because of the multi-agent research fan-out: up to
-`MAX_RESEARCH_ANGLES` `_run_research_agent` invocations run truly concurrently via
+This matters specifically because of the multi-agent, per-category research fan-out: up to
+`MAX_CATEGORIES` `_run_research_agent` invocations (one per decided KPI category) run truly
+concurrently via
 `asyncio.gather`, and a single `AsyncSession` is NOT safe to use from multiple coroutines
 at once (SQLAlchemy raises `InvalidRequestError` on interleaved use of one session across
 concurrent tasks). A fresh session per event write, drawn from the existing app-wide

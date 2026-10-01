@@ -2,8 +2,8 @@
 the three checkpoints wired into `app/ai/scorecard_builder.py` — see the module comment
 above `MAX_QUALITY_GATE_RETRIES` in that file):
 
-1. research-angle planning (`_decide_research_angles_with_gate`, inside `research_kpis`)
-2. each research agent's finding (`_run_research_agent`, right after
+1. KPI-category planning (`_decide_categories_with_gate`, inside `research_kpis`)
+2. each category research agent's finding (`_run_research_agent`, right after
    `record_research_finding`)
 3. propose_kpis's final per-visit decision (ask_clarification/update_draft/
    update_scoring_formula/respond_conversationally)
@@ -35,11 +35,11 @@ from tests.fakes import FakeBedrockClient, FakeJevClient, FakeWebSearchClient, t
 
 pytestmark = pytest.mark.usefixtures("_migrated_db")
 
-_SINGLE_ANGLE = [{"angle": "Domain research", "query_focus": "What matters for this domain?"}]
+_SINGLE_CATEGORY = [{"name": "Domain research", "focus": "What matters for this domain?"}]
 
 _SUFFICIENT_COVERAGE = tool_use_result(
     "assess_research_coverage",
-    {"sufficient": True, "reasoning": "Coverage looks adequate.", "next_angles": []},
+    {"sufficient": True, "reasoning": "Coverage looks adequate.", "next_categories": []},
 )
 
 
@@ -68,12 +68,12 @@ def _tools_offered(tools) -> set[str]:
     return {t.name for t in (tools or [])}
 
 
-# --- Checkpoint 1: research-angle planning ------------------------------------------------
+# --- Checkpoint 1: KPI-category planning ------------------------------------------------
 
 
 async def test_checkpoint1_low_score_triggers_bounded_retry_then_proceeds() -> None:
-    """Jev always scores the decided research-angle plan low (0.3, below the 0.75
-    threshold). `_decide_research_angles_with_gate` must retry up to
+    """Jev always scores the decided KPI-category plan low (0.3, below the 0.75
+    threshold). `_decide_categories_with_gate` must retry up to
     `MAX_QUALITY_GATE_RETRIES` times (bounded — never hangs) and then proceed with its
     best attempt, and the retry system prompts must genuinely carry Jev's feedback."""
     session_id = str(uuid.uuid4())
@@ -81,9 +81,9 @@ async def test_checkpoint1_low_score_triggers_bounded_retry_then_proceeds() -> N
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
         names = _tools_offered(tools)
-        if "decide_research_angles" in names:
+        if "decide_categories" in names:
             decide_system_prompts.append(system or "")
-            return tool_use_result("decide_research_angles", {"angles": _SINGLE_ANGLE})
+            return tool_use_result("decide_categories", {"categories": _SINGLE_CATEGORY})
         if "assess_research_coverage" in names:
             return _SUFFICIENT_COVERAGE
         if "record_research_finding" in names:
@@ -96,7 +96,7 @@ async def test_checkpoint1_low_score_triggers_bounded_retry_then_proceeds() -> N
         return tool_use_result("update_draft", {"patch": _complete_patch(), "confirmed": True})
 
     def rate_fn(*, instruction, answer):
-        if answer.startswith("Planned research angles:"):
+        if answer.startswith("Planned KPI categories:"):
             return 0.3  # checkpoint 1 — always below threshold
         return 1.0  # every other checkpoint passes immediately, isolating this test
 
@@ -124,15 +124,15 @@ async def test_checkpoint1_low_score_triggers_bounded_retry_then_proceeds() -> N
 
 async def test_checkpoint1_high_score_passes_with_no_retry() -> None:
     """Jev scores the plan well above threshold on the first attempt — no retry happens
-    at all (exactly one `decide_research_angles` call)."""
+    at all (exactly one `decide_categories` call)."""
     session_id = str(uuid.uuid4())
     decide_calls: list[int] = []
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
         names = _tools_offered(tools)
-        if "decide_research_angles" in names:
+        if "decide_categories" in names:
             decide_calls.append(1)
-            return tool_use_result("decide_research_angles", {"angles": _SINGLE_ANGLE})
+            return tool_use_result("decide_categories", {"categories": _SINGLE_CATEGORY})
         if "assess_research_coverage" in names:
             return _SUFFICIENT_COVERAGE
         if "record_research_finding" in names:
@@ -166,14 +166,14 @@ async def test_checkpoint1_high_score_passes_with_no_retry() -> None:
 async def test_checkpoint2_low_score_triggers_bounded_retry_then_proceeds() -> None:
     """Jev always scores the research agent's recorded finding low. The agent must
     re-synthesize up to `MAX_QUALITY_GATE_RETRIES` times (bounded) before returning its
-    best attempt to the master for merging, rather than hanging or dropping the angle."""
+    best attempt to the master for merging, rather than hanging or dropping the category."""
     session_id = str(uuid.uuid4())
     record_calls: list[int] = []
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
         names = _tools_offered(tools)
-        if "decide_research_angles" in names:
-            return tool_use_result("decide_research_angles", {"angles": _SINGLE_ANGLE})
+        if "decide_categories" in names:
+            return tool_use_result("decide_categories", {"categories": _SINGLE_CATEGORY})
         if "assess_research_coverage" in names:
             return _SUFFICIENT_COVERAGE
         if "record_research_finding" in names:
@@ -210,12 +210,12 @@ async def test_checkpoint2_low_score_triggers_bounded_retry_then_proceeds() -> N
 
     assert turn.status == "confirmed"
     assert len(record_calls) == sb.MAX_QUALITY_GATE_RETRIES + 1
-    # The angle's finding was still consolidated (not silently dropped) despite never
+    # The category's finding was still consolidated (not silently dropped) despite never
     # clearing the threshold — see research_findings in the checkpointed state.
     compiled = await sb.get_graph_manager().get_compiled_graph()
     snapshot = await compiled.aget_state({"configurable": {"thread_id": session_id}})
     findings = snapshot.values.get("research_findings") or []
-    assert any(f["angle"] == _SINGLE_ANGLE[0]["angle"] and f["summary"] == "FINDING_MARKER" for f in findings)
+    assert any(f["category"] == _SINGLE_CATEGORY[0]["name"] and f["summary"] == "FINDING_MARKER" for f in findings)
 
 
 async def test_checkpoint2_high_score_passes_with_no_retry() -> None:
@@ -224,8 +224,8 @@ async def test_checkpoint2_high_score_passes_with_no_retry() -> None:
 
     def converse_fn(*, messages, system, tools, force_tool_use, model_id):
         names = _tools_offered(tools)
-        if "decide_research_angles" in names:
-            return tool_use_result("decide_research_angles", {"angles": _SINGLE_ANGLE})
+        if "decide_categories" in names:
+            return tool_use_result("decide_categories", {"categories": _SINGLE_CATEGORY})
         if "assess_research_coverage" in names:
             return _SUFFICIENT_COVERAGE
         if "record_research_finding" in names:
