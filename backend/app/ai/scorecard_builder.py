@@ -1124,6 +1124,7 @@ async def _decide_categories_with_gate(
     best_categories: list[dict[str, Any]] = []
     best_score = -1.0
     revision_feedback: str | None = None
+    latest_critique: str | None = None
     # Tracks the PREVIOUS attempt's rendered plan text, so a second-failure critique can see
     # what actually changed in response to the first critique (see
     # `_generate_quality_gate_critique`'s own docstring).
@@ -1165,15 +1166,19 @@ async def _decide_categories_with_gate(
             # a concrete, specific critique of THIS plan in place of a generic "try harder"
             # note — on the second failure, also carries what the first critique suggested
             # and what actually changed, so the critique is refined rather than repeated.
-            revision_feedback = await _generate_quality_gate_critique(
+            latest_critique = await _generate_quality_gate_critique(
                 bedrock, model_id,
                 task_context=instruction,
                 produced_output=categories_text,
                 gate_score=gate.score,
-                previous_critique=revision_feedback,
+                previous_critique=latest_critique,
                 previous_output=previous_categories_text,
             )
             previous_categories_text = categories_text
+            # The retried plan also sees the plan being critiqued, not just the critique.
+            revision_feedback = (
+                f"The category plan you produced last attempt was:\n{categories_text}\n\n{latest_critique}"
+            )
 
     await emit_turn_event(
         session_id, turn_started_at, "master", "quality_gate",
@@ -2814,7 +2819,12 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
                 )
                 previous_gate_answer = gate_answer
                 local_messages.append(
-                    {"role": "tool", "content": f"[quality gate] {revision_critique}"}
+                    {
+                        "role": "tool",
+                        "content": (
+                            f"[quality gate] Your previous response was:\n{gate_answer}\n\n{revision_critique}"
+                        ),
+                    }
                 )
                 continue
 

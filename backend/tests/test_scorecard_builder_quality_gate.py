@@ -509,3 +509,30 @@ async def test_critique_second_failure_includes_previous_critique_and_prior_outp
     assert "FIRST_CRITIQUE_MARKER" in prompt
     assert "First attempt — no X, no Y." in prompt
     assert "Second attempt — still no Y." in prompt
+
+
+async def test_checkpoint3_retry_sees_previous_response_and_critique() -> None:
+    """The retried decision must see the response being critiqued (not only the critique)."""
+    session_id = str(uuid.uuid4())
+    propose_messages: list[str] = []
+    scores = iter([0.2, 0.9])
+
+    def converse_fn(*, messages, system, tools, force_tool_use, model_id):
+        if "critique_response" in _tools_offered(tools):
+            return tool_use_result(
+                "critique_response", {"specific_problems": ["CRITIQUE_MARKER: off-topic."], "concrete_fix": "Fix it."}
+            )
+        propose_messages.append(str(messages))
+        return tool_use_result(
+            "ask_clarification",
+            {"question": f"ANSWER_MARKER_{len(propose_messages)}", "options": [], "missing_fields": ["name"]},
+        )
+
+    fake_jev = FakeJevClient(rate_fn=lambda *, instruction, answer: next(scores))
+    await sb.start_session(
+        session_id, "Build me a scorecard for X.", FakeBedrockClient(converse_fn=converse_fn), jev_client=fake_jev
+    )
+
+    assert len(propose_messages) == 2
+    assert "ANSWER_MARKER_1" in propose_messages[1]
+    assert "CRITIQUE_MARKER" in propose_messages[1]
