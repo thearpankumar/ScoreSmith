@@ -9,20 +9,20 @@ from __future__ import annotations
 import enum
 
 
-class ScorecardStatus(str, enum.Enum):
+class ScorecardStatus(enum.StrEnum):
     DRAFT = "draft"
     PUBLISHED = "published"
     ARCHIVED = "archived"
 
 
-class EvaluationStatus(str, enum.Enum):
+class EvaluationStatus(enum.StrEnum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
 
 
-class RagBand(str, enum.Enum):
+class RagBand(enum.StrEnum):
     """7-band RAG colour result. Value = the score-range label from the Quality
     Scorecard Framework's RAG palette (kept distinct from the app's brand palette)."""
 
@@ -52,20 +52,20 @@ def rag_band_for_score(score: float) -> RagBand:
     return RagBand.BAND_3_0
 
 
-class ChatSessionStatus(str, enum.Enum):
+class ChatSessionStatus(enum.StrEnum):
     ACTIVE = "active"
     COMPLETED = "completed"
     ABANDONED = "abandoned"
 
 
-class ChatMessageRole(str, enum.Enum):
+class ChatMessageRole(enum.StrEnum):
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM = "system"
     TOOL = "tool"
 
 
-class AuditAction(str, enum.Enum):
+class AuditAction(enum.StrEnum):
     CREATE = "create"
     UPDATE = "update"
     DELETE = "delete"
