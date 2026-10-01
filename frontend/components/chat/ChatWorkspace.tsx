@@ -89,14 +89,13 @@ export function ChatWorkspace({
       : null,
   );
   const isRefineSession = !!session.targetScorecardId && !initialSavedScorecardId;
-  const [refineTargetName] = useState(initialDraft.name);
+  const [refineTargetName, setRefineTargetName] = useState(initialDraft.name);
   // Issue 1 (see task notes): the sidebar session list now lives in ChatSessionsContext
-  // (see the root app/layout.tsx), not local state here — this component (rendered by
-  // app/chat/[sessionId]/page.tsx) is itself remounted on every session switch, so any
-  // state kept here wouldn't survive one anyway. `upsertSessionTitle` below is folded
-  // into the same polling this component already runs for turn_in_progress/turn-events
-  // (see the two poll effects below and runAssistantTurn's own success path), so a real,
-  // AI-generated (or just-changed) title appears in the sidebar without a page reload.
+  // (see the root app/layout.tsx), not local state here. `upsertSessionTitle` below is
+  // folded into the same polling this component already runs for turn_in_progress/
+  // turn-events (see the two poll effects below and runAssistantTurn's own success
+  // path), so a real, AI-generated (or just-changed) title appears in the sidebar
+  // without a page reload.
   const { upsertSessionTitle: upsertSessionTitleInContext, setDirty: setContextDirty } = useChatSessions();
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   // `serverDraft` is the last draft the (authoritative) backend returned; `draft` is what
@@ -116,6 +115,14 @@ export function ChatWorkspace({
   // session starts as the literal id "new"; the backend assigns a real id on the first
   // successful turn, which we then adopt (and reflect in the URL) for every turn after.
   const [activeSessionId, setActiveSessionId] = useState(session.id);
+  // Set (synchronously, in the SAME tick as `setActiveSessionId`) by `runAssistantTurn`
+  // the moment it self-adopts a brand-new session's client-generated id, BEFORE its own
+  // `router.replace` call — see the resync effect below, which uses this to tell "our own
+  // in-flight self-adoption is still catching up to a `session` prop that hasn't arrived
+  // yet" apart from "the user genuinely switched to a different session." Cleared back to
+  // null once `session.id` catches up (resolved) so a later, unrelated external switch is
+  // never mistaken for a still-pending self-adoption.
+  const selfAdoptedSessionIdRef = useRef<string | null>(null);
   const initialPromptSentRef = useRef(false);
 
   /** Reflects a real (or changed) title into the sidebar's session list, live — see the
@@ -135,6 +142,73 @@ export function ChatWorkspace({
   // by the two polling effects below (one for the refresh-recovery case, one for a turn
   // started locally in this tab).
   const [turnEvents, setTurnEvents] = useState<ChatTurnEvent[]>(initialTurnEvents ?? []);
+
+  // STATE-BLEED FIX (see this task's final report for how this was found): `ChatWorkspace`
+  // is rendered by `app/chat/[sessionId]/page.tsx` with NO `key` — deliberately, since
+  // `runAssistantTurn` below adopts a brand-new session's real id via its own
+  // `router.replace` WHILE that first turn is still in flight, and a `key` tied to the
+  // session id would force-remount this component mid-send, orphaning that in-flight
+  // turn's eventual response (its `setMessages`/`setDraft`/etc. calls would land on a
+  // detached, unmounted instance instead of the fresh one). Every field above is seeded
+  // via `useState(initial...)`, which only runs on a genuine mount — so without a `key`,
+  // React reuses this SAME instance (same type, same tree position) when the user clicks
+  // a DIFFERENT, already-existing chat session in the sidebar too, and none of those
+  // fields would ever refresh: the whole workspace would keep showing the PREVIOUS
+  // session's messages/draft/turn-in-progress status/composer text after the URL had
+  // already changed to the new session (confirmed: this component's `initial*` props DO
+  // change — `app/chat/[sessionId]/page.tsx` re-fetches per `sessionId` — but nothing
+  // here reset to match before this fix).
+  //
+  // This effect is what makes a GENUINELY external session switch reset everything,
+  // while leaving the self-triggered "new" -> real-id adoption alone: it compares the
+  // incoming `session.id` PROP against this component's own `activeSessionId` STATE.
+  //   - In sync (equal): either nothing has happened, or a pending self-adoption just
+  //     resolved (the prop caught up) — clear the tracking ref and do nothing else.
+  //   - Mismatched, but `activeSessionId` is the id WE just self-adopted
+  //     (`selfAdoptedSessionIdRef`): `session.id` simply hasn't caught up yet via
+  //     `runAssistantTurn`'s own `router.replace` — wait for it, don't reset anything
+  //     (resetting here would orphan that in-flight turn's eventual response, which is
+  //     the exact bug a blanket `key` on this component would reintroduce).
+  //   - Mismatched otherwise: a genuinely external switch (a sidebar Link to a different,
+  //     already-existing session) — reset every piece of per-session state to the fresh
+  //     `initial*` props the new page fetched (mirrors the one-prop-id version of this
+  //     same pattern already used by `EvaluationResultClientLoader`'s own
+  //     `useEffect([scorecardId, evaluationId])`).
+  // (Known, accepted edge case: clicking a different session within the same instant as
+  // sending a brand-new chat's very first message — before that message's own
+  // self-adoption round-trip resolves — can still race this; extremely narrow window,
+  // not worth the extra complexity to close given how rare it is to hit in practice.)
+  useEffect(() => {
+    if (session.id === activeSessionId) {
+      selfAdoptedSessionIdRef.current = null;
+      return;
+    }
+    if (activeSessionId === selfAdoptedSessionIdRef.current) {
+      return; // still waiting for the session prop to catch up to our own self-adoption
+    }
+    setActiveSessionId(session.id);
+    setMessages(initialMessages);
+    setServerDraft(initialDraft);
+    setDraft(initialDraft);
+    setRefineTargetName(initialDraft.name);
+    setSaved(
+      initialSavedScorecardId
+        ? { id: initialSavedScorecardId, name: initialDraft.name ?? "your scorecard", asNewVersion: false }
+        : null,
+    );
+    setTurnInProgress(!!initialTurnInProgress);
+    setTurnEvents(initialTurnEvents ?? []);
+    setComposer("");
+    setPendingSuggestion(null);
+    setChatError(null);
+    setLastFailedText(null);
+    setPending(false);
+    // Intentionally omits the initial* props/setters: this effect fires exactly on a
+    // session.id/activeSessionId mismatch, and the initial* props are read fresh from
+    // closure each run (they change together with session.id, since both come from the
+    // same page-props update — no separate dep needed).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.id, activeSessionId]);
 
   useEffect(() => {
     if (!turnInProgress) return;
@@ -323,6 +397,11 @@ export function ChatWorkspace({
     const isFirstTurnOfNewSession = activeSessionId === "new";
     const clientSessionId = isFirstTurnOfNewSession ? crypto.randomUUID() : undefined;
     if (isFirstTurnOfNewSession && clientSessionId) {
+      // Mark this as a SELF-adoption (see the resync effect above) before touching
+      // activeSessionId/the URL, so the effect never mistakes its own transient
+      // session.id/activeSessionId mismatch for an external session switch and resets
+      // this in-flight turn's state out from under it.
+      selfAdoptedSessionIdRef.current = clientSessionId;
       setActiveSessionId(clientSessionId);
       router.replace(`/chat/${clientSessionId}`, { scroll: false });
       // Real title lands within a second or two (see the poll above /
@@ -341,7 +420,9 @@ export function ChatWorkspace({
       if (result.sessionId !== activeSessionId && !isFirstTurnOfNewSession) {
         // Defensive fallback only — the "new" case above already adopted the real id
         // before this call started, so this branch is a no-op on that path (result.
-        // sessionId === clientSessionId === the already-adopted activeSessionId).
+        // sessionId === clientSessionId === the already-adopted activeSessionId). Also
+        // marked as a self-adoption (see the resync effect above) for the same reason.
+        selfAdoptedSessionIdRef.current = result.sessionId;
         setActiveSessionId(result.sessionId);
         router.replace(`/chat/${result.sessionId}`, { scroll: false });
       }
@@ -840,11 +921,17 @@ function describeDraftEdits(server: ScorecardDraft, local: ScorecardDraft): stri
   if (removed.length > 0) changes.push(`- Remove KPIs: ${removed.map((k) => `"${k.name}"`).join(", ")}`);
   if (kpiChanged) {
     const byId = new Map(local.kpis.map((k) => [k.id, k]));
+    // Only LEAF KPIs (nothing else nested under them) carry a weight — a category has
+    // none of its own (see backend migration 0008_category_nodes_no_weight), so it's
+    // described without a "%" that would otherwise misleadingly read as a real value.
+    const parentIds = new Set(local.kpis.map((k) => k.parentId).filter((id): id is string => id !== null));
     const list = local.kpis
       .map((k) => {
         const parent = k.parentId ? byId.get(k.parentId) : undefined;
         const excluded = k.includedInScoring === false ? " [excluded from the weighted score]" : "";
-        return `"${k.name}" ${k.weight}%${parent ? ` (under "${parent.name}")` : ""}${excluded}`;
+        const isLeaf = !parentIds.has(k.id);
+        const weightLabel = isLeaf ? ` ${k.weight ?? 0}%` : " (category, no weight)";
+        return `"${k.name}"${weightLabel}${parent ? ` (under "${parent.name}")` : ""}${excluded}`;
       })
       .join("; ");
     changes.push(`- KPI list should now be exactly: ${list || "(none)"} (use each KPI's included_in_scoring flag as noted)`);

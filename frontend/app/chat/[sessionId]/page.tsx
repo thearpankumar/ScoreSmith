@@ -53,6 +53,14 @@ export default async function ChatSessionPage({
   const result = await getChatSession(sessionId);
   if (!result) notFound();
 
+  // NOTE: deliberately NO `key={sessionId}` here (see ChatWorkspace's own docstring on
+  // its session-prop resync effect for why a blanket key would be wrong, not just
+  // unnecessary): `runAssistantTurn`'s own `router.replace` — adopting a brand-new
+  // session's real id while its first turn is still in flight — reaches this exact same
+  // route, and a `key` tied to `sessionId` would force-remount ChatWorkspace mid-send,
+  // orphaning that in-flight turn's eventual response. ChatWorkspace instead detects a
+  // genuinely EXTERNAL session switch itself (comparing this `session.id` prop against
+  // its own internally-tracked `activeSessionId`) and resyncs its state explicitly.
   return (
     <ChatWorkspace
       session={result.session}
