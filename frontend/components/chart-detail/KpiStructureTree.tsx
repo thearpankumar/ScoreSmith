@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   ApiError,
+  clearKpiNodeWeight,
   createKpiNode,
   deleteKpiNode,
   renameKpiNode,
@@ -193,7 +194,12 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
     // 0% otherwise (every leaf's weight is now a GLOBAL share of the whole scorecard, not
     // just relative to its immediate siblings — see migration 0008_category_nodes_no_weight
     // / lib/kpi-tree.ts), so the user rebalances afterwards either way.
-    const weight = kpiNodes.length === 0 ? 100 : 0;
+    // Exception: the first child under a currently-weighted LEAF turns that leaf into a
+    // category (weightless), so the child inherits its weight — otherwise the global leaf
+    // sum would drop and the DB trigger would reject the add.
+    const parentWasWeightedLeaf =
+      !!parent && siblings.length === 0 && parent.includedInScoring && (parent.weight ?? 0) > 0;
+    const weight = kpiNodes.length === 0 ? 100 : parentWasWeightedLeaf ? (parent.weight ?? 0) : 0;
     return run(
       async () => {
         await createKpiNode({
@@ -204,31 +210,32 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
           weight,
           displayOrder: siblings.reduce((m, s) => Math.max(m, s.displayOrder), -1) + 1,
         });
+        // The parent is a category now — drop its stale weight (the child carries it).
+        if (parent && parentWasWeightedLeaf) await clearKpiNodeWeight(parent.id);
         setAddingUnder(null);
         setNewName("");
         if (parent) setCollapsed((s) => new Set([...s].filter((id) => id !== parent.id)));
       },
-      weight === 0
+      parentWasWeightedLeaf
+        ? `Added “${name}” at ${weight}% (it took over “${parent?.name}”'s weight — “${parent?.name}” is now a category with no weight of its own).`
+        : weight === 0
         ? `Added “${name}” at 0%. Rebalance the leaf weights to give it a share, then add its guidelines.`
         : `Added “${name}” at 100% (it's the only KPI in the scorecard). Add its guidelines so it can be scored.`,
     );
   }
 
   function confirmDelete(node: KpiNode) {
-    const siblings = siblingsOf(node.parentId).filter((s) => s.id !== node.id);
-    const needsRebalance = (node.weight ?? 0) > 0 && siblings.length > 0;
-    const rebalanced = needsRebalance
-      ? redistributeWeight(
-          siblings.map((s) => ({ id: s.id, weight: s.weight ?? 0 })),
-          node.weight ?? 0,
-        )
-      : [];
+    const { doomedLeaves, pool, rebalanced } = planDeleteRebalance(node, kpiNodes);
+    const needsRebalance = rebalanced.length > 0;
     setDeleteTarget(null);
     return run(
       async () => {
         if (needsRebalance) {
-          // Step 1: move the doomed KPI's weight onto its siblings (group stays at 100).
-          await updateKpiWeights([...rebalanced, { id: node.id, weight: 0 }]);
+          // Step 1: move the doomed leaves' weight onto the remaining leaves in ONE atomic
+          // call (every leaf in the scorecard sums to 100 together — see migration
+          // 0008_category_nodes_no_weight), so the delete itself never trips the DB's
+          // leaf-weight-sum trigger.
+          await updateKpiWeights([...rebalanced, ...doomedLeaves.map((n) => ({ id: n.id, weight: 0 }))]);
         }
         try {
           await deleteKpiNode(node.id);
@@ -236,7 +243,7 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
           if (needsRebalance) {
             // Put the weights back exactly as they were, best-effort.
             try {
-              await updateKpiWeights([...siblings, node].map((n) => ({ id: n.id, weight: n.weight ?? 0 })));
+              await updateKpiWeights([...pool, ...doomedLeaves].map((n) => ({ id: n.id, weight: n.weight ?? 0 })));
             } catch {
               // ignore — the primary error below is what the user needs to see
             }
@@ -245,7 +252,7 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
         }
       },
       needsRebalance
-        ? `Deleted “${node.name}”; its ${node.weight ?? 0}% was spread across the remaining ${siblings.length} KPI${siblings.length === 1 ? "" : "s"} in its group.`
+        ? `Deleted “${node.name}”; its weight was spread across the remaining ${pool.length} leaf KPI${pool.length === 1 ? "" : "s"}.`
         : `Deleted “${node.name}”.`,
     );
   }
@@ -696,7 +703,7 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
               )}
               {deleteInfo.rebalanced.length > 0 ? (
                 <li>
-                  Its {deleteTarget?.weight ?? 0}% weight is spread across the rest of its group so it still adds up to 100%:{" "}
+                  The deleted weight is spread across the remaining leaf KPIs so they still add up to 100%:{" "}
                   {deleteInfo.rebalanced.map((r) => `${r.name} → ${r.weight}%`).join(", ")}. You can adjust these
                   afterwards.
                 </li>
@@ -720,7 +727,14 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
   );
 }
 
-function describeDelete(node: KpiNode, all: KpiNode[]) {
+/**
+ * Plans how a delete keeps every included leaf KPI summing to 100 together (the DB trigger
+ * is global over leaves — migration 0008_category_nodes_no_weight): the weight of every
+ * deleted leaf (the node itself, or all leaves under a deleted category) is spread
+ * proportionally over its remaining sibling leaves if it has any, else over every
+ * remaining included leaf in the scorecard.
+ */
+function planDeleteRebalance(node: KpiNode, all: KpiNode[]) {
   const doomed = new Set([node.id]);
   let grew = true;
   while (grew) {
@@ -732,16 +746,33 @@ function describeDelete(node: KpiNode, all: KpiNode[]) {
       }
     }
   }
-  const siblings = all.filter((n) => n.parentId === node.parentId && n.id !== node.id);
-  const byId = new Map(all.map((n) => [n.id, n]));
+  const isLeaf = (n: KpiNode) => !all.some((c) => c.parentId === n.id);
+  const doomedLeaves = all.filter((n) => doomed.has(n.id) && isLeaf(n) && n.includedInScoring);
+  const freed = doomedLeaves.reduce((sum, n) => sum + (n.weight ?? 0), 0);
+  const remainingLeaves = all.filter((n) => !doomed.has(n.id) && isLeaf(n) && n.includedInScoring);
+  const siblingLeaves = isLeaf(node)
+    ? remainingLeaves.filter((n) => n.parentId === node.parentId)
+    : [];
+  const pool = siblingLeaves.length > 0 ? siblingLeaves : remainingLeaves;
   const rebalanced =
-    (node.weight ?? 0) > 0 && siblings.length > 0
+    freed > 0 && pool.length > 0
       ? redistributeWeight(
-          siblings.map((s) => ({ id: s.id, weight: s.weight ?? 0 })),
-          node.weight ?? 0,
-        ).map((r) => ({ name: byId.get(r.id)?.name ?? "?", weight: r.weight }))
+          pool.map((s) => ({ id: s.id, weight: s.weight ?? 0 })),
+          freed,
+        )
       : [];
-  return { descendants: doomed.size - 1, rebalanced, lastInGroup: siblings.length === 0 };
+  return { doomed, doomedLeaves, pool, rebalanced };
+}
+
+function describeDelete(node: KpiNode, all: KpiNode[]) {
+  const { doomed, rebalanced } = planDeleteRebalance(node, all);
+  const byId = new Map(all.map((n) => [n.id, n]));
+  const siblings = all.filter((n) => n.parentId === node.parentId && n.id !== node.id);
+  return {
+    descendants: doomed.size - 1,
+    rebalanced: rebalanced.map((r) => ({ name: byId.get(r.id)?.name ?? "?", weight: r.weight })),
+    lastInGroup: siblings.length === 0,
+  };
 }
 
 /** Turns backend 409/404/422 details into something a business user can act on. */

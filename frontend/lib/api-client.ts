@@ -654,6 +654,12 @@ export async function updateKpiWeights(weights: Array<{ id: string; weight: numb
   await apiFetch("/api/v1/kpi-nodes/weights", { method: "PATCH", auth: true, body: { weights } });
 }
 
+/** Clears a node's stored weight (a node that now has children is a category and carries
+ * no weight of its own — see backend migration 0008_category_nodes_no_weight). */
+export async function clearKpiNodeWeight(nodeId: string): Promise<void> {
+  await apiFetch(`/api/v1/kpi-nodes/${nodeId}`, { method: "PATCH", auth: true, body: { weight: null } });
+}
+
 export async function createKpiNode(input: {
   versionId: string;
   parentId: string | null;
