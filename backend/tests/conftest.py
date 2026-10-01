@@ -100,9 +100,8 @@ def _require_database_url() -> None:
 
 @pytest.fixture(scope="session")
 def _migrated_db(_require_database_url: None):
-    from alembic.config import Config
-
     from alembic import command
+    from alembic.config import Config
 
     cfg = Config(str(BACKEND_DIR / "alembic.ini"))
     cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
