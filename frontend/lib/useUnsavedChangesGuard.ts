@@ -36,11 +36,9 @@ export function useUnsavedChangesGuard(shouldWarn: boolean) {
   );
 
   const confirmLeave = useCallback(() => {
-    setPendingHref((href) => {
-      if (href) router.push(href);
-      return null;
-    });
-  }, [router]);
+    if (pendingHref) router.push(pendingHref);
+    setPendingHref(null);
+  }, [router, pendingHref]);
 
   const cancelLeave = useCallback(() => setPendingHref(null), []);
 

@@ -23,9 +23,9 @@
 - **Ensemble LLM judge** — every leaf KPI is scored by **3 independent** Bedrock Converse calls (Z.ai GLM-4.7-Flash) with the guideline rungs presented in a different order each time (ascending / descending / deterministic shuffle) to counter position bias, aggregated by median, and flagged `needs_review` when the calls disagree.
 - **Reasoning-before-score judging** — the judge's tool schema forces `matched_level → evidence_quotes → reasoning → score`, so the model commits to a rubric level and cites verbatim evidence before it ever writes a number.
 - **Custom scoring-formula engine** — the default weighted average can be overridden with an arbitrary safe expression (`kpi["Name"] * 0.6 + min(kpi["A"], kpi["B"]) * 0.4`, `+ - * / **`, `min/max/avg/mean/sqrt/abs`), parsed via `simpleeval`'s AST whitelist (no `eval`), used identically by both the AI judge and manual scoring paths so they can never disagree about what a score means.
-- **Hierarchical KPI trees** — up to 4 levels deep, stored as Postgres `ltree` materialized paths, each leaf carrying a full 0–10 qualitative + quantitative guideline ladder.
+- **Hierarchical KPI trees** — up to 4 levels deep, with weights on leaf KPIs only (categories/sections are unweighted groupings), stored as Postgres `ltree` materialized paths, each leaf carrying a full 0–10 qualitative + quantitative guideline ladder.
 - **Live agent-execution trace** — every research agent and the orchestrator itself streams granular events (`started`, `searching`, `search_result`, `proposing_kpis`, `completed`, `quality_gate`/`quality_gate_retry`, ...) to a dedicated table, rendered live in the chat UI instead of a generic spinner.
-- **Quality-gate self-critique layer** — three checkpoints in the chat pipeline (the master's KPI-category plan, each category research agent's finding, and `propose_kpis`'s final per-turn answer) are rated 0–1 by [TypeSafe AI's **Jev**](https://openrouter.ai/docs/guides/community/jev) — a "System One" non-autoregressive decision model reached via OpenRouter's alpha Decisions API, **not** AWS Bedrock — against a 0.75 threshold. Below threshold, the relevant step revises itself (bounded at 2 retries, then proceeds with its best attempt); an unreachable Jev degrades the gate to "passed" rather than blocking the pipeline on a third-party dependency.
+- **Quality-gate self-critique layer** — three checkpoints in the chat pipeline (the master's KPI-category plan, each category research agent's finding, and `propose_kpis`'s final per-turn answer) are rated 0–1 by [TypeSafe AI's **Jev**](https://openrouter.ai/docs/guides/community/jev) — a "System One" non-autoregressive decision model reached via OpenRouter's alpha Decisions API, **not** AWS Bedrock — against a 0.75 threshold. Below threshold, a GLM-5 **advisor/critique** step first reads the task, the actual output and the Jev score and names the specific problems and a concrete fix; the step then retries with that critique (and, on a second failure, the previous critique plus the previous output) — bounded at 2 retries, then it proceeds with its best attempt; an unreachable Jev degrades the gate to "passed" rather than blocking the pipeline on a third-party dependency.
 - **Manual and AI-driven evaluation**, converging on one shared scoring computation and 7-band RAG (Red/Amber/Green) result.
 - **Glassmorphism design system** (white + lemon yellow `#FFF700`), with an explicit glass-vs-solid rule: glass surfaces for chrome/cards/modals, solid panels for dense data (guideline matrices, KPI/weight tables).
 
@@ -117,6 +117,7 @@ sequenceDiagram
     loop quality gate 1: category plan vs. request, up to 2 revisions
         Research->>Jev: rate_match(instruction=user request, answer=category plan)
         Jev-->>Research: 0-1 score
+        Research->>Research: if below 0.75, GLM-5 advisor critiques the plan, retry uses the critique
         Research->>DB: emit_turn_event (quality_gate / quality_gate_retry)
     end
     par one research agent per category
@@ -127,17 +128,19 @@ sequenceDiagram
         loop quality gate 2: finding vs. assigned category, up to 2 revisions
             Agents->>Jev: rate_match(instruction=category+focus, answer=finding)
             Jev-->>Agents: 0-1 score
+            Agents->>Agents: if below 0.75, GLM-5 advisor critique feeds the retry
         end
         Agents->>Agents: propose_kpi_batch — KPIs for THIS category, each level=2/parent_name=category, full 11-level guidelines
         Agents-->>Research: ResearchFinding + this category's proposed KPIs
     end
-    Research->>Research: dedupe near-duplicates ACROSS categories, cap at 30, renormalize weights to 100 per category AND across categories
+    Research->>Research: dedupe near-duplicates ACROSS categories, cap at 30, fold each category's relative importance into its KPIs' weights so leaf weights sum to 100 across the scorecard (categories themselves carry no weight)
     Research->>DB: emit_turn_event per actor (live trace UI)
     Research-->>Graph: merged category + KPI hierarchy written into draft.kpis
     Graph->>Propose: propose_kpis — reconcile the researched draft (force_tool_use)
     loop quality gate 3: final answer vs. request, up to 2 revisions
         Propose->>Jev: rate_match(instruction=conversation, answer=decision)
         Jev-->>Propose: 0-1 score
+        Propose->>Propose: if below 0.75, GLM-5 advisor critique plus previous response feed the retry
         Propose->>DB: emit_turn_event (quality_gate / quality_gate_retry)
     end
     alt clarification needed
@@ -222,7 +225,7 @@ ScoreSmith/
 │   │   ├── schemas/            Pydantic request/response schemas
 │   │   └── scripts/            seed.py (idempotent Cycle 1 scenario catalogue), generate_scenarios.py
 │   ├── alembic/                Database migrations
-│   └── tests/                  pytest suite — 119 tests, run against a real Postgres instance
+│   └── tests/                  pytest suite — 142 tests, run against a real Postgres instance
 ├── frontend/                  Next.js 15 App Router + TypeScript
 │   ├── app/                    /chat, /charts, /evaluations, /settings routes ("/" redirects to /chat)
 │   ├── components/             chat/, chart-detail/, charts-library/, evaluation-result/, evaluations/, design-system/, home/, layout/, settings/, ui/ (shadcn/ui primitives)
@@ -284,7 +287,7 @@ cd backend
 uv venv --python 3.12 .venv && uv pip install --python .venv -e ".[dev]"   # or: python3.12 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 # one-time: create the test DB with the vector + ltree extensions (already done by
 # infra/db-init/02-create-test-db.sql on a fresh docker-compose volume)
-.venv/bin/python -m pytest        # 119 tests as of this writing
+.venv/bin/python -m pytest        # 142 tests as of this writing
 .venv/bin/python -m ruff check .  # lint
 ```
 
@@ -317,6 +320,6 @@ Documented honestly rather than glossed over:
 
 - **Auth is a dev-only stub.** `app/deps.py::get_current_user` trusts a raw `X-User-Id` header or an unsigned `Authorization: Bearer <user-id>` token — there is no signature verification, no token expiry, and no password/identity check of any kind. Real OIDC/OAuth2 auth is explicitly deferred.
 - **No RBAC / multi-tenancy yet.** `users.org_id` and `users.role` exist as plain scalar columns with no enforcement; a `role` string is a documented convention, not a DB-enforced permission.
-- **The weight-sum-to-100 rule is DB-enforced but only at commit time** (a deferred trigger), which is why sibling KPI groups must be created via the bulk endpoints rather than one node at a time — see `backend/app/api/v1/kpi_nodes.py`'s module docstring.
+- **The weight-sum-to-100 rule is DB-enforced but only at commit time** (a deferred trigger over all leaf KPIs of a scorecard version; category nodes store a NULL weight and are excluded), which is why KPIs must be created via the bulk endpoints rather than one node at a time — see `backend/app/api/v1/kpi_nodes.py`'s module docstring.
 - **No automated regression coverage for the Cycle 2 failure scenarios yet** (concurrent edits, partial materialization failure, etc.) — they're scoped, not built.
 - **The frontend has no dedicated test framework** — `tsc`, ESLint, and a production build are the current gates.
