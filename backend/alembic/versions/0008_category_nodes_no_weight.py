@@ -38,10 +38,10 @@ never have to think about "how much does the Quality category weigh" at all.
      collectively sum to 100 rather than each category's leaves separately summing to 100.
    - `included_in_scoring = false` leaves are still excluded from the sum, same as before
      (migration 0005_scoring_formula_and_kpi_flags).
-3. No data backfill: at the time of this migration, this build's only Postgres instance
-   has zero materialized scorecards using the category restructure (confirmed live via
-   `SELECT COUNT(*) FROM kpi_nodes` — 0 rows), so there is no existing category-weighted
-   data to renormalize.
+3. Data backfill: legacy categorized rows (if any) are converted so every leaf keeps its
+   effective share (own weight x ancestors' weight/100) and category weights become NULL;
+   `downgrade()` converts back the same way, preserving effective shares. Both are no-ops
+   when no nested nodes exist.
 """
 
 from __future__ import annotations
@@ -58,7 +58,34 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # Drop the old trigger before any DML so no deferred events are pending when the
+    # ALTER below runs (Postgres refuses to ALTER a table with pending trigger events).
+    op.execute("DROP TRIGGER IF EXISTS trg_kpi_node_weight_sum ON kpi_nodes;")
     op.alter_column("kpi_nodes", "weight", nullable=True)
+
+    # Backfill legacy categorized data (a no-op on a DB with no nested nodes): a leaf's
+    # new weight is its effective share under the old multiplicative scheme (its own weight
+    # times each ancestor's weight/100), and every non-leaf node's weight becomes NULL.
+    op.execute(
+        """
+        WITH RECURSIVE eff AS (
+            SELECT id, weight::numeric AS w FROM kpi_nodes WHERE parent_id IS NULL
+            UNION ALL
+            SELECT k.id, e.w * k.weight / 100
+            FROM kpi_nodes k JOIN eff e ON k.parent_id = e.id
+        )
+        UPDATE kpi_nodes k
+        SET weight = ROUND(eff.w, 2)
+        FROM eff
+        WHERE k.id = eff.id
+          AND k.parent_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM kpi_nodes c WHERE c.parent_id = k.id);
+        """
+    )
+    op.execute(
+        "UPDATE kpi_nodes SET weight = NULL "
+        "WHERE EXISTS (SELECT 1 FROM kpi_nodes c WHERE c.parent_id = kpi_nodes.id);"
+    )
 
     op.execute(
         """
@@ -99,10 +126,7 @@ def upgrade() -> None:
         """
     )
 
-    # Same trigger definition as before (0005) — only the function body changed, and
-    # CREATE OR REPLACE FUNCTION above already updates it for the existing trigger. Still
-    # dropped/recreated here for clarity/idempotency, matching this repo's existing style.
-    op.execute("DROP TRIGGER IF EXISTS trg_kpi_node_weight_sum ON kpi_nodes;")
+    # Same trigger definition as before (0005); only the function body changed.
     op.execute(
         """
         CREATE CONSTRAINT TRIGGER trg_kpi_node_weight_sum
@@ -115,13 +139,51 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Any category node left with weight=NULL by the new behavior must get a real value
-    # before the column can go back to NOT NULL — 0 is the same "safety net" default
-    # app/ai/draft_materialize.py already used for a missing weight pre-this-feature.
+    # The weight-sum trigger MUST be dropped before any DML below: its deferred events from
+    # the UPDATE would otherwise still be pending when `ALTER COLUMN ... SET NOT NULL`
+    # runs, and Postgres refuses to ALTER a table with pending trigger events.
+    op.execute("DROP TRIGGER IF EXISTS trg_kpi_node_weight_sum ON kpi_nodes;")
+
+    # Convert back to the old two-level scheme while preserving every leaf's EFFECTIVE
+    # share: a non-leaf node's weight = the sum of its descendant leaves' weights, and every
+    # non-root node's weight = its share of its parent's subtree (so each sibling group
+    # sums to 100). Flat (root-only) scorecards are untouched. Values are rounded to the
+    # column's numeric(5,2), so a sibling group may be off by a few hundredths.
+    op.execute(
+        """
+        WITH subtree AS (
+            SELECT n.id,
+                   COALESCE(SUM(l.weight) FILTER (WHERE l.included_in_scoring), 0) AS s
+            FROM kpi_nodes n
+            JOIN kpi_nodes l
+              ON l.scorecard_version_id = n.scorecard_version_id
+             AND l.path <@ n.path
+             AND NOT EXISTS (SELECT 1 FROM kpi_nodes c WHERE c.parent_id = l.id)
+            GROUP BY n.id
+        ),
+        sib AS (
+            SELECT id, COUNT(*) OVER (PARTITION BY scorecard_version_id, parent_id) AS n_sib
+            FROM kpi_nodes
+        )
+        UPDATE kpi_nodes k
+        SET weight = ROUND(
+            CASE
+                WHEN k.parent_id IS NULL THEN st.s
+                WHEN pst.s > 0 THEN st.s / pst.s * 100
+                ELSE 100.0 / sib.n_sib
+            END, 2)
+        FROM subtree st
+        LEFT JOIN subtree pst ON pst.id = (SELECT parent_id FROM kpi_nodes WHERE id = st.id)
+        JOIN sib ON sib.id = st.id
+        WHERE k.id = st.id
+          AND k.included_in_scoring
+          AND (k.weight IS NULL OR k.parent_id IS NOT NULL);
+        """
+    )
+    # Anything still NULL (e.g. an excluded category) gets the old safety-net default.
     op.execute("UPDATE kpi_nodes SET weight = 0 WHERE weight IS NULL;")
     op.alter_column("kpi_nodes", "weight", nullable=False)
 
-    op.execute("DROP TRIGGER IF EXISTS trg_kpi_node_weight_sum ON kpi_nodes;")
     op.execute(
         """
         CREATE OR REPLACE FUNCTION check_kpi_node_weight_sum() RETURNS TRIGGER AS $$
