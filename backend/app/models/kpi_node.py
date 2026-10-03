@@ -71,8 +71,12 @@ class KpiNode(UUIDPKMixin, TimestampMixin, Base):
         "KpiGuideline", back_populates="kpi_node", cascade="all, delete-orphan",
         order_by="KpiGuideline.score_level",
     )
+    # passive_deletes="all": when a node is deleted the ORM must NOT try to set its results'
+    # kpi_node_id to NULL (the version-match trigger rejects that with a 500). The database's own
+    # ON DELETE RESTRICT stays in charge: a node with results cannot be deleted until the results
+    # (via their evaluation) are, which `delete_scorecard` does first.
     evaluation_results: Mapped[list[EvaluationKpiResult]] = relationship(
-        "EvaluationKpiResult", back_populates="kpi_node"
+        "EvaluationKpiResult", back_populates="kpi_node", passive_deletes="all"
     )
 
     def __repr__(self) -> str:  # pragma: no cover

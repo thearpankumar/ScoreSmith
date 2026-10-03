@@ -14,8 +14,10 @@ if sys.platform == "win32":
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 
 from app.ai.scorecard_builder import get_graph_manager
 from app.api.v1.chat import recover_interrupted_turns, shutdown_background_turns
@@ -71,6 +73,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(IntegrityError)
+async def _integrity_error_handler(_request: Request, exc: IntegrityError) -> JSONResponse:
+    """A database constraint violation that an endpoint did not translate itself.
+
+    Registered as a normal exception handler so it runs inside the CORS middleware: an UNHANDLED
+    exception is answered by Starlette's outermost error middleware, which carries no CORS
+    headers, and the browser then reports it as an opaque "NetworkError" instead of an API error.
+    """
+    logging.getLogger(__name__).warning("Unhandled database integrity error: %s", exc.orig)
+    return JSONResponse(
+        status_code=409,
+        content={"detail": f"The request conflicts with existing data: {exc.orig}"},
+    )
 
 
 @app.get("/health", tags=["health"])

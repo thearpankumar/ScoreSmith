@@ -14,6 +14,7 @@ from app.ai.scoring_formula import validate as validate_scoring_formula_expr
 from app.ai.similarity import SIMILARITY_THRESHOLD, SimilarScorecardResult, find_similar_scorecards
 from app.db import get_db
 from app.deps import get_bedrock_client, get_current_user
+from app.models.evaluation import Evaluation
 from app.models.kpi_node import KpiNode
 from app.models.scorecard import Scorecard
 from app.models.scorecard_version import ScorecardVersion
@@ -162,11 +163,27 @@ async def delete_scorecard(
     scorecard = await db.get(Scorecard, scorecard_id)
     if scorecard is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard not found.")
+    # Deleting a scorecard deletes "every version of it, and its evaluations" (the delete dialog's
+    # promise). Evaluations reference a version with ON DELETE RESTRICT, and their per-KPI results
+    # reference KPI nodes, so they have to go first; deleting an evaluation cascades to its results.
+    version_ids = select(ScorecardVersion.id).where(ScorecardVersion.scorecard_id == scorecard_id)
+    evaluations = (
+        await db.execute(select(Evaluation).where(Evaluation.scorecard_version_id.in_(version_ids)))
+    ).scalars().all()
+    for evaluation in evaluations:
+        await db.delete(evaluation)
+    await db.flush()
     # Break the current_version_id circular reference first so the version can cascade-delete.
     scorecard.current_version_id = None
     await db.flush()
     await db.delete(scorecard)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail=f"Cannot delete scorecard: still referenced elsewhere: {exc.orig}"
+        ) from exc
 
 
 # --- Scorecard versions, nested under a scorecard ---
