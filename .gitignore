@@ -37,3 +37,7 @@ npm-debug.log*
 ~$*.xls
 ~$*.docx
 ~$*.pptx
+
+# Local media / sample data downloads
+scripts/GdriveDownload/
+scripts/SampleFiles/
