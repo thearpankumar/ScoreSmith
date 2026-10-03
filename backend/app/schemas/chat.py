@@ -85,6 +85,12 @@ class ChatTurnRead(BaseModel):
     # POST /chat/sessions response already carries it — the frontend never needs a second
     # round-trip just to learn the title it was generated with (see ChatWorkspace).
     title: str | None = None
+    # Background turns (see app/api/v1/chat.py): why the LAST turn failed ("turn_error_code" is
+    # "bedrock_unavailable" | "timeout" | "interrupted" | "turn_failed"); None while a turn runs
+    # and after a successful one. The POST that starts a turn returns 202 right away with
+    # turn_in_progress=true; clients poll GET /chat/sessions/{id} until it clears.
+    turn_error: str | None = None
+    turn_error_code: str | None = None
 
 
 class ChatSessionRead(ORMBase):

@@ -18,7 +18,10 @@ RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
-# --reload is acceptable for dev; the compose file bind-mounts ../backend:/app so
-# edits on the host are picked up. PYTHONPATH=/app + WORKDIR /app ensure "app.main"
-# resolves to the live mounted source rather than the copy baked into the image.
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Applies pending Alembic migrations (idempotent; needs DATABASE_URL, which compose injects)
+# and then starts the API WITHOUT --reload: chat turns now run as long-lived background tasks
+# inside the server process, and an auto-reload (triggered by any edit under the bind-mounted
+# source) would kill them mid-run. After editing backend code, restart the container instead
+# (`docker compose restart backend`); startup recovery marks any interrupted turn as failed.
+# A failing migration is logged but does not stop the API from starting.
+CMD ["sh", "-c", "python -m alembic upgrade head || echo 'WARNING: alembic upgrade head failed - check DATABASE_URL/DB state'; exec python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"]

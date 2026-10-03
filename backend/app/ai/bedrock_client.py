@@ -48,6 +48,12 @@ class BedrockUnavailableError(RuntimeError):
     as a validation error."""
 
 
+class BedrockTimeoutError(BedrockUnavailableError):
+    """A Bedrock call exceeded the client's read/connect timeout. Subclass of
+    `BedrockUnavailableError` so existing handlers still apply; callers that can retry with a
+    SMALLER request (guideline fill) catch this specifically."""
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     """One `toolConfig` tool definition, in Bedrock Converse's `toolSpec` shape."""
@@ -81,6 +87,12 @@ class ConverseResult:
     @property
     def is_tool_use(self) -> bool:
         return self.tool_name is not None
+
+    @property
+    def truncated(self) -> bool:
+        """The model hit its output-token limit mid-response, so any tool input is
+        incomplete or empty — callers must retry with a smaller request, not trust it."""
+        return self.stop_reason == "max_tokens"
 
 
 class BedrockClientProtocol(Protocol):
@@ -171,7 +183,9 @@ class BedrockClient:
         if self._client is None:
             import boto3  # local import: keep boto3 off the app's import-time critical path
 
-            self._client = boto3.client("bedrock-runtime", region_name=self._region)
+            self._client = boto3.client(
+                "bedrock-runtime", region_name=self._region, config=build_botocore_config()
+            )
         return self._client
 
     def converse(
@@ -192,10 +206,24 @@ class BedrockClient:
             kwargs["system"] = [{"text": system}]
         if tools:
             kwargs["toolConfig"] = _build_tool_config(tools, force_tool_use)
+        max_tokens = effective_max_output_tokens(kwargs["modelId"])
+        if max_tokens > 0:
+            kwargs["inferenceConfig"] = {"maxTokens": max_tokens}
 
         try:
             response = client.converse(**kwargs)
         except Exception as exc:  # noqa: BLE001 — normalize every botocore failure mode
+            if "inferenceConfig" in kwargs and _looks_like_max_tokens_rejection(exc):
+                logger.warning(
+                    "Bedrock model %s rejected maxTokens=%s; retrying without inferenceConfig.",
+                    kwargs["modelId"],
+                    max_tokens,
+                )
+                kwargs.pop("inferenceConfig")
+                try:
+                    return _parse_converse_response(client.converse(**kwargs))
+                except Exception as retry_exc:  # noqa: BLE001
+                    exc = retry_exc
             if tools and force_tool_use and _looks_like_unsupported_tool_choice(exc):
                 logger.warning(
                     "Bedrock model %s rejected toolChoice; retrying without it "
@@ -264,9 +292,51 @@ class BedrockClient:
         return embedding
 
 
+def build_botocore_config() -> Any:
+    """botocore `Config` for the bedrock-runtime client: a read timeout long enough for large
+    structured outputs (default is 60s), a short connect timeout, bounded `standard` retries
+    (throttling/5xx), and a connection pool larger than the app's Bedrock concurrency."""
+    from botocore.config import Config
+
+    settings = get_settings()
+    pool = max(settings.bedrock_max_pool_connections, settings.bedrock_max_concurrency * 2 + 8)
+    return Config(
+        read_timeout=settings.bedrock_read_timeout_seconds,
+        connect_timeout=settings.bedrock_connect_timeout_seconds,
+        retries={"max_attempts": max(1, settings.bedrock_max_attempts), "mode": "standard"},
+        max_pool_connections=pool,
+    )
+
+
 def _looks_like_unsupported_tool_choice(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return "toolchoice" in message and ("not supported" in message or "unsupported" in message)
+    message = str(exc).lower().replace("_", "").replace(" ", "")
+    return "toolchoice" in message and (
+        "notsupported" in message or "unsupported" in message or "validationexception" in message
+    )
+
+
+# Documented max OUTPUT tokens per model on Bedrock (AWS model cards, checked 2026-10: GLM 5 =
+# 128K, GLM 4.7 Flash = 4K). Sending a larger `maxTokens` than the model supports can be
+# rejected with a ValidationException, so the configured ceiling is clamped per model.
+_MODEL_MAX_OUTPUT_TOKENS: dict[str, int] = {
+    "zai.glm-4.7-flash": 4096,
+    "zai.glm-5": 128000,
+}
+
+
+def effective_max_output_tokens(model_id: str) -> int:
+    """`settings.bedrock_max_output_tokens` clamped to the model's documented output limit
+    (0 = send no maxTokens at all)."""
+    configured = get_settings().bedrock_max_output_tokens
+    if configured <= 0:
+        return 0
+    limit = _MODEL_MAX_OUTPUT_TOKENS.get(model_id)
+    return min(configured, limit) if limit else configured
+
+
+def _looks_like_max_tokens_rejection(exc: Exception) -> bool:
+    message = str(exc).lower().replace("_", "").replace(" ", "")
+    return "maxtokens" in message and "validationexception" in message
 
 
 def _raise_unavailable(operation: str, exc: Exception) -> NoReturn:
@@ -298,4 +368,13 @@ def _raise_unavailable(operation: str, exc: Exception) -> NoReturn:
     except ImportError:
         logger.error("Bedrock %s failed: %s: %s", operation, type(exc).__name__, exc)
 
+    timed_out = False
+    try:
+        import botocore.exceptions as be
+
+        timed_out = isinstance(exc, be.ReadTimeoutError | be.ConnectTimeoutError)
+    except ImportError:
+        pass
+    if timed_out:
+        raise BedrockTimeoutError(f"Bedrock {operation} call timed out: {exc}") from exc
     raise BedrockUnavailableError(f"Bedrock {operation} call failed: {exc}") from exc

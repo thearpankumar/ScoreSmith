@@ -61,6 +61,10 @@ class KpiDraft(BaseModel):
     # (this is exactly the shape the model's `update_draft` tool call will send).
     guidelines: dict[str, GuidelineDraft] = Field(default_factory=dict)
 
+    def has_all_guideline_levels(self) -> bool:
+        """True iff this KPI carries a guideline for EVERY score level 0-10."""
+        return {int(k) for k in self.guidelines} == set(range(MIN_SCORE_LEVEL, MAX_SCORE_LEVEL + 1))
+
     @field_validator("guidelines")
     @classmethod
     def _validate_guideline_keys(cls, value: dict[str, GuidelineDraft]) -> dict[str, GuidelineDraft]:
@@ -142,6 +146,10 @@ class ScorecardDraft(BaseModel):
                     missing.append(f"kpis[{kpi.name}].weight")
                 if not kpi.guidelines:
                     missing.append(f"kpis[{kpi.name}].guidelines")
+                elif not kpi.has_all_guideline_levels():
+                    # A partial rubric (e.g. only levels 0/5/10, or a model that stopped writing
+                    # after level 6) is NOT a rubric: the judge scores against all 11 levels.
+                    missing.append(f"kpis[{kpi.name}].guidelines ({len(kpi.guidelines)}/11 levels)")
             weight_issue = self._sibling_weight_issue()
             if weight_issue:
                 missing.append(weight_issue)

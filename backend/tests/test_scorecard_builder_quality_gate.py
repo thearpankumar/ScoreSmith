@@ -31,7 +31,7 @@ import uuid
 import pytest
 
 from app.ai import scorecard_builder as sb
-from tests.fakes import FakeBedrockClient, FakeJevClient, FakeWebSearchClient, text_result, tool_use_result
+from tests.fakes import FakeBedrockClient, FakeJevClient, FakeWebSearchClient, full_rubric, text_result, tool_use_result
 
 pytestmark = pytest.mark.usefixtures("_migrated_db")
 
@@ -55,10 +55,7 @@ def _complete_patch() -> dict:
                 "name": "KPI A",
                 "weight": 100,
                 "level": 1,
-                "guidelines": {
-                    "10": {"qualitative_text": "Great."},
-                    "0": {"qualitative_text": "Bad."},
-                },
+                "guidelines": full_rubric(),
             }
         ],
     }
@@ -69,6 +66,14 @@ def _tools_offered(tools) -> set[str]:
 
 
 # --- Checkpoint 1: KPI-category planning ------------------------------------------------
+
+
+
+@pytest.fixture(autouse=True)
+def _two_gate_revisions(monkeypatch):
+    """Production default is 1 revision (cost control); these tests exercise the full
+    first-failure/second-failure critique chain, which needs 2."""
+    monkeypatch.setattr(sb, "MAX_QUALITY_GATE_RETRIES", 2)
 
 
 async def test_checkpoint1_low_score_triggers_bounded_retry_then_proceeds() -> None:

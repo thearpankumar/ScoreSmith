@@ -92,6 +92,8 @@ interface RequestOptions {
   body?: unknown;
   /** Attaches the dev-auth-stub X-User-Id header (see module docstring). */
   auth?: boolean;
+  /** Aborts the request (e.g. an unmounted poller) — surfaces as the native AbortError. */
+  signal?: AbortSignal;
 }
 
 async function apiFetch<T>(path: string, opts: RequestOptions = {}): Promise<T> {
@@ -107,8 +109,10 @@ async function apiFetch<T>(path: string, opts: RequestOptions = {}): Promise<T> 
       headers,
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
       cache: "no-store",
+      signal: opts.signal,
     });
   } catch (err) {
+    if (opts.signal?.aborted) throw err; // a deliberate abort is not a backend failure
     // Next.js throws its own internal sentinel error out of `fetch(..., { cache:
     // "no-store" })` during static generation, to signal "this route needs dynamic
     // rendering, retry it as a dynamic request" — it is not a real fetch failure. It's
@@ -264,6 +268,8 @@ interface BeChatSession {
   target_scorecard_id: string | null;
   created_at: string;
   last_activity_at: string;
+  /** True while a background turn runs for this session (sidebar "working" badge). */
+  turn_in_progress?: boolean;
 }
 
 interface BeChatMessage {
@@ -328,10 +334,13 @@ interface BeChatTurn {
    * backend/app/models/chat_session.py::ChatSession.turn_in_progress /
    * pending_turn_started_at) — the durable, refresh-surviving "still working" marker. */
   turn_in_progress?: boolean;
-  /** See BeChatSession.title — carried on every turn response (not just GET) so a
-   * brand-new session's own first, blocking POST already returns its real title, with no
-   * second round-trip needed. */
+  /** See BeChatSession.title — carried on every turn response (not just GET). */
   title?: string | null;
+  /** Why the LAST background turn failed (null while one runs / after a success) — see
+   * backend ChatTurnRead.turn_error. `turn_error_code` is "bedrock_unavailable" | "timeout" |
+   * "interrupted" | "turn_failed". */
+  turn_error?: string | null;
+  turn_error_code?: string | null;
 }
 
 interface BeSuggestSimilarResult {
@@ -1181,6 +1190,7 @@ function mapChatSession(be: BeChatSession): ChatSession {
     targetScorecardId: be.target_scorecard_id,
     createdAt: be.created_at,
     lastActivityAt: be.last_activity_at,
+    turnInProgress: !!be.turn_in_progress,
   };
 }
 
@@ -1239,6 +1249,7 @@ function mapDraft(sessionId: string, be: BeScorecardDraft | null | undefined): S
       parentId: k.parent_name ? draftKpiId(k.parent_name) : null,
       includedInScoring: k.included_in_scoring ?? true,
       status: k.weight != null && (hasGuidelines || isCategory) ? "confirmed" : "proposed",
+      guidelinesPending: !isCategory && !hasGuidelines,
     };
   });
   return {
@@ -1325,6 +1336,8 @@ export async function getChatSession(sessionId: string): Promise<
        * polling) so a page load/refresh shows the in-progress trace immediately instead
        * of starting blank. */
       turnEvents: ChatTurnEvent[];
+      /** Set when the last background turn failed or was interrupted (see ChatTurnFailure). */
+      turnError?: ChatTurnFailure;
     }
   | undefined
 > {
@@ -1349,11 +1362,13 @@ export async function getChatSession(sessionId: string): Promise<
   let draft: ScorecardDraft;
   let savedScorecardId: string | undefined;
   let turnInProgress = false;
+  let turnError: ChatTurnFailure | undefined;
   try {
     const turn = await apiFetch<BeChatTurn>(`/api/v1/chat/sessions/${sessionId}`);
     draft = mapDraft(sessionId, turn.draft);
     savedScorecardId = turn.materialized_scorecard_id ?? undefined;
     turnInProgress = !!turn.turn_in_progress;
+    turnError = turnFailureOf(turn);
   } catch {
     draft = mapDraft(sessionId, null);
   }
@@ -1367,20 +1382,28 @@ export async function getChatSession(sessionId: string): Promise<
     turnEvents = [];
   }
 
-  return { session, messages, draft, savedScorecardId, turnInProgress, turnEvents };
+  return { session, messages, draft, savedScorecardId, turnInProgress, turnEvents, turnError };
 }
 
-/**
- * Lightweight poll target for refresh-recovery (Part A): just the "is a turn still
- * running server-side" flag, without re-fetching the whole message log every few
- * seconds. Once this flips false, callers should re-fetch via `getChatSession` to pick
- * up whatever the turn produced while the page was gone.
- */
-export async function getChatTurnStatus(
-  sessionId: string,
-): Promise<{ turnInProgress: boolean; title: string | null }> {
-  const turn = await apiFetch<BeChatTurn>(`/api/v1/chat/sessions/${sessionId}`);
-  return { turnInProgress: !!turn.turn_in_progress, title: turn.title ?? null };
+/** Why a background chat turn failed (backend `ChatTurnRead.turn_error[_code]`). */
+export interface ChatTurnFailure {
+  code: string;
+  message: string;
+}
+
+function turnFailureOf(turn: BeChatTurn): ChatTurnFailure | undefined {
+  if (!turn.turn_error || turn.turn_in_progress) return undefined;
+  return { code: turn.turn_error_code ?? "turn_failed", message: turn.turn_error };
+}
+
+/** A background chat turn that itself failed (not the HTTP request) — see `ChatTurnFailure`. */
+export class ChatTurnFailedError extends ApiError {
+  readonly code: string;
+  constructor(failure: ChatTurnFailure) {
+    super(failure.message, 500);
+    this.name = "ChatTurnFailedError";
+    this.code = failure.code;
+  }
 }
 
 /** Drafts still in progress (active chat sessions). */
@@ -1389,81 +1412,190 @@ export async function listResumableDrafts(): Promise<ChatSession[]> {
   return sessions.filter((s) => s.status === "active");
 }
 
-export interface SendChatMessageResult {
-  /** The backend-assigned session id — differs from the request's `sessionId` the first
-   * time a "new" session's first turn succeeds (see module docstring / ChatWorkspace). */
+/**
+ * One poll's worth of a chat session's state (`GET /chat/sessions/{id}`), mapped to camelCase.
+ * While `turnInProgress` the `draft` is the backend's INTERIM draft (header fields within seconds,
+ * then the user's KPIs/weights, then guidelines as enrichment completes); once it is false the
+ * rest of the fields describe how the turn ended.
+ */
+export interface ChatTurnSnapshot {
   sessionId: string;
-  assistantMessage: ChatMessage;
-  draft: ScorecardDraft;
-  materializedScorecardId?: string;
-  /** Reuse-suggestion cards from the backend's own `check_similarity` graph node (see
-   * BeChatTurn.similar_suggestions) — present exactly when the graph paused with
-   * status "awaiting_similar_choice", i.e. before any KPIs were generated. */
-  similarSuggestions?: SimilarScorecardSuggestion[];
-  /** The session's real title (see BeChatSession.title) — on a brand-new session's first
-   * turn, this is generated fast, BEFORE the heavier graph work, and is already present
-   * on this very response (see app/api/v1/chat.py::_generate_and_persist_title). Null for
-   * a continuing turn's response too (the backend still echoes the unchanged title). */
+  turnInProgress: boolean;
+  status: string;
   title: string | null;
+  draft: ScorecardDraft;
+  /** The assistant's reply text (or its clarifying question's text) once the turn finished. */
+  assistantText: string;
+  clarifyingQuestion?: ClarifyingQuestion;
+  /** Present exactly when the graph paused with status "awaiting_similar_choice". */
+  similarSuggestions?: SimilarScorecardSuggestion[];
+  /** Set only when THIS turn ended in the confirmed state and saved a scorecard. */
+  materializedScorecardId?: string;
+  /** Why the last turn failed/was cancelled/interrupted (never set while a turn runs). */
+  turnError?: ChatTurnFailure;
+}
+
+function snapshotOf(turn: BeChatTurn): ChatTurnSnapshot {
+  const id = turn.session_id;
+  return {
+    sessionId: id,
+    turnInProgress: !!turn.turn_in_progress,
+    status: turn.status,
+    title: turn.title ?? null,
+    draft: mapDraft(id, turn.draft),
+    assistantText: turn.assistant_message ?? turn.question?.question ?? "",
+    clarifyingQuestion: mapClarifyingQuestion(`${id}-cq-${Date.now()}`, turn.question),
+    similarSuggestions:
+      turn.similar_suggestions && turn.similar_suggestions.length > 0
+        ? mapSimilarSuggestions(turn.similar_suggestions)
+        : undefined,
+    // GET reports a saved scorecard for any completed session; only a turn that ENDED in the
+    // confirmed state actually saved one this turn.
+    materializedScorecardId: turn.status === "confirmed" ? (turn.materialized_scorecard_id ?? undefined) : undefined,
+    turnError: turnFailureOf(turn),
+  };
 }
 
 /**
- * Sends one chat turn to the real LangGraph-backed builder.
+ * Starts one chat turn on the real LangGraph-backed builder. The backend runs it as a background
+ * task: POST returns 202 immediately with `turnInProgress: true` (an inline/legacy 200/201 already
+ * carries the finished result) — the caller then watches it with `watchChatTurn`. Throws an
+ * `ApiError` with status 409 when a turn is already running for the session.
  *
  * Signature change from the mock version (documented, not preserved as-is): the mock
  * took `{sessionId, turnIndex, currentDraft}` because it was a purely client-scripted
- * fake with no real state. The real backend is authoritative and stateful server-side
- * (a LangGraph checkpoint per session — see `scorecard_builder.py`), so it needs the
- * actual message text, not a turn counter, and returns the authoritative draft itself
- * rather than needing the caller's copy. `sessionId: "new"` triggers session creation
- * (`POST /chat/sessions`); any other value sends a follow-up turn
- * (`POST /chat/sessions/{id}/messages`). Both require the dev-auth header — see
- * `backend/app/deps.py::get_current_user`, applied uniformly to every mutating route.
+ * flow. The real backend is stateful per chat session (keyed by `sessionId`), so this
+ * takes `{sessionId, message}` instead. A brand-new session is started by passing
+ * `sessionId: "new"`; the response's `sessionId` is the real id to use afterwards.
  */
-export async function sendChatMessage(params: {
+export async function startChatTurn(params: {
+  /** The literal "new" starts a brand-new session (POST /chat/sessions) with `message` as its first turn. */
   sessionId: string;
   message: string;
-  /** Sidebar-live-update fix: for `sessionId === "new"` only — a client-generated UUID
-   * the caller has already optimistically adopted (URL, sidebar placeholder, turn-events
-   * poll — see ChatWorkspace.runAssistantTurn) before this request was even sent. Passed
-   * through as `session_id` so the backend uses it as the real row's id (see
-   * ChatSessionStart.session_id) instead of minting its own that the caller would have no
-   * way to learn about until this call returns. */
+  /** For `sessionId === "new"`: a client-generated UUID the backend adopts verbatim
+   * (ChatSessionStart.session_id), so the sidebar/URL/polling can use the real id at once. */
   clientSessionId?: string;
-}): Promise<SendChatMessageResult> {
+}): Promise<ChatTurnSnapshot> {
   const { sessionId, message, clientSessionId } = params;
   const turn =
     sessionId === "new"
       ? await apiFetch<BeChatTurn>("/api/v1/chat/sessions", {
           method: "POST",
-          auth: true,
+          auth: true, // dev auth stub is now applied uniformly to every mutating route — see app/deps.py
           body: { message, session_id: clientSessionId },
         })
       : await apiFetch<BeChatTurn>(`/api/v1/chat/sessions/${sessionId}/messages`, {
           method: "POST",
-          auth: true, // dev auth stub is now applied uniformly to every mutating route — see app/deps.py
+          auth: true,
           body: { message },
         });
+  return snapshotOf(turn);
+}
 
-  const realSessionId = turn.session_id;
-  const assistantMessage: ChatMessage = {
-    id: `${realSessionId}-a-${Date.now()}`,
-    sessionId: realSessionId,
-    role: "assistant",
-    content: turn.assistant_message ?? turn.question?.question ?? "",
-    createdAt: new Date().toISOString(),
-    clarifyingQuestion: mapClarifyingQuestion(`${realSessionId}-cq-${Date.now()}`, turn.question),
-  };
+/** `POST /chat/sessions/{id}/cancel` — stops the running background turn (a no-op if none runs).
+ * The turn then ends with `turn_error_code: "cancelled"`, which `watchChatTurn` reports. */
+export async function cancelChatTurn(sessionId: string): Promise<void> {
+  await apiFetch(`/api/v1/chat/sessions/${sessionId}/cancel`, { method: "POST", auth: true });
+}
 
-  return {
-    sessionId: realSessionId,
-    assistantMessage,
-    draft: mapDraft(realSessionId, turn.draft),
-    materializedScorecardId: turn.materialized_scorecard_id ?? undefined,
-    similarSuggestions:
-      turn.similar_suggestions && turn.similar_suggestions.length > 0
-        ? mapSimilarSuggestions(turn.similar_suggestions)
-        : undefined,
-    title: turn.title ?? null,
-  };
+const abortError = () => new DOMException("Stopped watching the assistant.", "AbortError");
+
+/** Resolves after `ms`, or EARLY when the tab becomes visible again (a hidden tab's timers are
+ * throttled, so the user returning gets an immediate refresh); rejects with AbortError on abort. */
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(abortError());
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+    const onAbort = () => {
+      done();
+      reject(abortError());
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        done();
+        resolve();
+      }
+    };
+    const timer = setTimeout(() => {
+      done();
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort);
+    document.addEventListener("visibilitychange", onVisible);
+  });
+}
+
+/** Poll cadence for a running turn: fast while the tab is visible (easing off after the first minute,
+ * when a long turn is mostly waiting on the model), slow while hidden, and capped exponential backoff
+ * with +-20% jitter after consecutive failed polls (network blips) so several tabs never retry in
+ * lockstep. `elapsedMs`/`rand` are optional (tests pass a fixed `rand`; default is no jitter on the
+ * steady cadence). */
+export function chatPollDelayMs(
+  consecutiveFailures: number,
+  tabHidden: boolean,
+  elapsedMs = 0,
+  rand: () => number = Math.random,
+): number {
+  if (consecutiveFailures > 0) {
+    const base = Math.min(2000 * 2 ** (consecutiveFailures - 1), 15000);
+    return Math.round(base * (0.8 + 0.4 * rand()));
+  }
+  if (tabHidden) return 5000;
+  return elapsedMs > 60_000 ? 2000 : 1200;
+}
+
+/**
+ * Watches a running background turn until it is no longer in progress and returns the final
+ * snapshot. Every in-progress poll (`GET /chat/sessions/{id}` + `/turn-events`, fetched together,
+ * sequentially — never two polls in flight, so responses cannot arrive out of order) calls
+ * `onUpdate` with the interim draft + trace so the UI fills in as the turn runs. State is durable
+ * server-side, so this survives reloads, other tabs and multi-minute turns without holding any
+ * connection open. Network errors never end the watch (it backs off and keeps trying, reporting
+ * through `onConnection`); a 404 (session deleted) rejects; aborting rejects with AbortError.
+ */
+export async function watchChatTurn(
+  sessionId: string,
+  opts: {
+    signal: AbortSignal;
+    onUpdate: (snapshot: ChatTurnSnapshot, events: ChatTurnEvent[] | null) => void;
+    onConnection?: (ok: boolean) => void;
+  },
+): Promise<ChatTurnSnapshot> {
+  const { signal, onUpdate, onConnection } = opts;
+  let failures = 0;
+  const startedAt = Date.now();
+  let delay = 0; // poll right away: the first state (interim draft, trace) is already available
+  for (;;) {
+    await abortableSleep(delay, signal);
+    try {
+      const [turn, events] = await Promise.all([
+        apiFetch<BeChatTurn>(`/api/v1/chat/sessions/${sessionId}`, { signal }),
+        // Best-effort alongside the authoritative state: a failed events fetch must never
+        // stop the "is it still running" poll from working.
+        apiFetch<BeChatTurnEvent[]>(`/api/v1/chat/sessions/${sessionId}/turn-events`, { signal })
+          .then((rows) => rows.map(mapTurnEvent))
+          .catch(() => null),
+      ]);
+      if (signal.aborted) throw abortError();
+      if (failures > 0) onConnection?.(true);
+      failures = 0;
+      const snapshot = snapshotOf(turn);
+      if (!snapshot.turnInProgress) return snapshot;
+      onUpdate(snapshot, events);
+    } catch (err) {
+      if (signal.aborted) throw abortError();
+      if (err instanceof ApiError && err.status === 404) throw err;
+      if (failures === 0) onConnection?.(false);
+      failures++;
+    }
+    delay = chatPollDelayMs(
+      failures,
+      typeof document !== "undefined" && document.visibilityState === "hidden",
+      Date.now() - startedAt,
+    );
+  }
 }

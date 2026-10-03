@@ -45,6 +45,63 @@ class Settings(BaseSettings):
     bedrock_chat_model_id: str = "zai.glm-5"
     bedrock_judge_model_id: str = "zai.glm-4.7-flash"
     bedrock_embedding_model_id: str = "amazon.titan-embed-text-v2:0"
+    # Output-token ceiling sent as Converse `inferenceConfig.maxTokens` on every call. The
+    # code used to send none, leaving a large single tool call (a 20+ KPI `update_draft`, or
+    # a batch of KPIs with 11-level rubrics each) at the mercy of the model's default output
+    # limit and silently truncated. 0 = omit the field (provider default). Verify against the
+    # model's documented max output before raising it.
+    bedrock_max_output_tokens: int = 16000
+    # Max Bedrock calls in flight at once from the research/enrichment fan-out (a process-wide
+    # semaphore, see scorecard_builder._run_bedrock) — bounds throttling when a 40+ KPI
+    # request fans out many agents and rubric chunks.
+    bedrock_max_concurrency: int = 8
+    # botocore transport settings for the bedrock-runtime client. botocore's DEFAULT read timeout
+    # is 60s, which a large structured output (several KPIs x 11 rubric levels on GLM-5) exceeds,
+    # and its default pool is 10 connections, which the concurrent fan-out overflows
+    # ("Connection pool is full"). The pool is sized to max(this, 2 x concurrency + 8).
+    bedrock_read_timeout_seconds: int = 240
+    bedrock_connect_timeout_seconds: int = 10
+    # Total attempts (1 = no botocore retry). botocore also retries read timeouts, and the app
+    # already splits-and-retries timed-out guideline calls itself, so keep this small.
+    bedrock_max_attempts: int = 2
+    bedrock_max_pool_connections: int = 32
+
+    # --- User-specified / hybrid KPI preparation (guideline fill + weighting) ---
+    # KPIs per guideline-writing call: small so each call (11 rubric levels per KPI) finishes
+    # well inside the read timeout.
+    user_kpis_per_fill_call: int = 5
+    # Wall-clock budget (seconds) for the bounded web-research stage over the user's KPIs
+    # (<= 3 agents, one search each); on expiry the guidelines are written from model knowledge.
+    user_research_timeout_seconds: int = 45
+    # Wall-clock budget for the whole enrichment phase; after it, remaining KPIs get
+    # best-effort model-knowledge guidelines in the smallest calls (see _enrich_user_kpis).
+    user_enrich_deadline_seconds: int = 170
+
+    # --- Open-ended pipeline: guideline writing + quality-gate cost control ---
+    # Wall-clock budget (seconds) for ONE category's guideline-writing fan-out (compact rubric
+    # chunks of `user_kpis_per_fill_call` KPIs); once passed, remaining KPIs use the smallest
+    # calls without research context and, as a last resort, the marked fallback rubric.
+    open_fill_deadline_seconds: int = 150
+    # Quality gate (Jev) cost control. Per-call hard timeout (a slow Jev call counts as
+    # "unreachable" = gate passed), and a per-turn budget: once a turn has been running longer
+    # than `quality_gate_budget_seconds`, no further gate rating / critique / revision starts.
+    quality_gate_call_timeout_seconds: float = 12.0
+    quality_gate_budget_seconds: int = 150
+
+    # Cheap intent router in front of the main-model request classification
+    # (app/ai/request_routing.py): auto = Jev `choice` then the small judge model;
+    # jev | small_model = only that step; off = always run the full extraction.
+    request_router: str = "auto"
+
+    # --- Background chat turns (app/api/v1/chat.py) ---
+    # Hard wall-clock limit for one background LangGraph turn; on expiry the turn is
+    # cancelled, marked failed and the "turn in progress" marker cleared.
+    chat_turn_timeout_seconds: int = 900
+    # false (default): POST /chat/sessions[/{id}/messages] returns 202 immediately and the turn
+    # runs as a background task. true: turns run inline in the request (the pre-background
+    # behaviour: 200/201 with the full result) — used by the test suite and for debugging. A
+    # per-request `?wait=true|false` overrides it.
+    chat_turns_inline: bool = False
 
     # --- AWS AgentCore Gateway web search (real-KPI-research tool for the chat scorecard
     # builder's propose_kpis node — see app/ai/web_search.py). A *separate* set of AWS

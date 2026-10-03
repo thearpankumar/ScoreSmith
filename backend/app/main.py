@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.ai.scorecard_builder import get_graph_manager
+from app.api.v1.chat import recover_interrupted_turns, shutdown_background_turns
 from app.api.v1.router import api_router
 from app.config import get_settings
 
@@ -35,8 +36,23 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Turns that were running when the previous process died (crash/--reload) can never finish:
+    # clear their "in progress" marker so the UI offers a retry (see app/api/v1/chat.py).
+    recovered = await recover_interrupted_turns()
+    if recovered:
+        logging.getLogger(__name__).warning("Recovered %d chat turn(s) interrupted by a restart.", recovered)
+    # Open the LangGraph checkpointer (and create its tables on a fresh database) BEFORE any request
+    # can run a turn. Lazily doing it on the first turn raced with that turn's own open DB
+    # transaction: the checkpointer's `CREATE INDEX CONCURRENTLY` waits for every older transaction
+    # to finish, including the one held by the very background task that triggered it (a hang).
+    try:
+        await get_graph_manager().get_compiled_graph()
+    except Exception:  # noqa: BLE001 — DB not reachable/migrated yet: fall back to lazy init per request
+        logging.getLogger(__name__).warning("Could not pre-initialize the chat graph at startup.", exc_info=True)
     yield
-    # Cleanly close the LangGraph AsyncPostgresSaver's pooled connection on shutdown.
+    # Cancel still-running background chat turns (each records "interrupted"), then cleanly close
+    # the LangGraph AsyncPostgresSaver's pooled connection on shutdown.
+    await shutdown_background_turns()
     await get_graph_manager().aclose()
 
 

@@ -48,6 +48,7 @@ not a hard dependency the product breaks without.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -95,6 +96,16 @@ class JevRatingResult:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class JevChoiceResult:
+    """One successful Jev `choice` answer: the picked option key, the per-option probability
+    distribution and Jev's own 0-1 confidence (how concentrated that distribution is)."""
+
+    choice: str
+    confidence: float
+    probabilities: dict[str, float] = field(default_factory=dict)
+
+
 class JevClientProtocol(Protocol):
     """Interface both the real OpenRouter-backed client and `tests/fakes.py::FakeJevClient`
     implement — mirrors `BedrockClientProtocol`/`WebSearchClientProtocol`'s own pattern
@@ -104,6 +115,10 @@ class JevClientProtocol(Protocol):
     this is built directly on `httpx.AsyncClient` with no synchronous SDK underneath."""
 
     async def rate_match(self, *, instruction: str, answer: str) -> JevRatingResult: ...
+
+    async def choose(
+        self, *, state: dict[str, Any], instructions: str, options: dict[str, str]
+    ) -> JevChoiceResult: ...
 
 
 class JevClient:
@@ -157,6 +172,40 @@ class JevClient:
 
         return JevRatingResult(score=max(0.0, min(1.0, score)), raw=data)
 
+    async def choose(
+        self, *, state: dict[str, Any], instructions: str, options: dict[str, str]
+    ) -> JevChoiceResult:
+        """Jev's native `choice` primitive ("pick 1 of N labeled options" — see the module
+        docstring; per OpenRouter's Jev docs the answer is `{"type": "choice", "choice": key,
+        "confidence": 0-1, "probabilities": {key: p}}`). Used as the cheap intent router in
+        `request_routing.route_request`. Raises `JevUnavailableError` on any failure or if the
+        returned choice is not one of `options` (never trust a label we did not offer)."""
+        if not self.is_configured:
+            raise JevUnavailableError("OPENROUTER_JEV_API is not configured; cannot call Jev choice.")
+        body = {
+            "model": self._model_id,
+            "state": state,
+            "questions": {"pick": {"type": "choice", "instructions": instructions, "criteria": options}},
+        }
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+                response = await client.post(
+                    _DECISIONS_URL,
+                    json=body,
+                    headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+                )
+                response.raise_for_status()
+                data = response.json()
+            answer = data["answers"]["pick"]
+            choice = str(answer["choice"])
+            confidence = float(answer.get("confidence", 0.0))
+            probabilities = {str(k): float(v) for k, v in (answer.get("probabilities") or {}).items()}
+        except Exception as exc:  # noqa: BLE001 — normalize every httpx/JSON/shape failure mode
+            raise JevUnavailableError(f"Jev choice call failed: {exc}") from exc
+        if choice not in options:
+            raise JevUnavailableError(f"Jev returned an unknown option {choice!r}.")
+        return JevChoiceResult(choice=choice, confidence=max(0.0, min(1.0, confidence)), probabilities=probabilities)
+
 
 # --- Graceful-degradation gate helper (the one chokepoint scorecard_builder.py uses) -----
 
@@ -195,10 +244,16 @@ async def quality_gate(
         logger.info("quality_gate: no Jev client configured for this call; treating gate as passed.")
         return QualityGateResult(passed=True, score=None, degraded=True)
     try:
-        result = await client.rate_match(instruction=instruction, answer=answer)
+        # Hard per-call ceiling: httpx's timeout is per phase (connect/write/read each), so a
+        # slow endpoint can still take far longer than `_TIMEOUT_SECONDS` end to end (observed
+        # 5-80s per call live). A call over the ceiling is treated exactly like an unreachable Jev.
+        result = await asyncio.wait_for(
+            client.rate_match(instruction=instruction, answer=answer),
+            timeout=get_settings().quality_gate_call_timeout_seconds,
+        )
     except Exception:  # noqa: BLE001 — see module docstring: a Jev failure must never crash a turn
         logger.warning(
-            "quality_gate: Jev call failed; treating gate as passed (graceful degradation).",
+            "quality_gate: Jev call failed or timed out; treating gate as passed (graceful degradation).",
             exc_info=True,
         )
         return QualityGateResult(passed=True, score=None, degraded=True)

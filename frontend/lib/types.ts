@@ -161,6 +161,8 @@ export interface ChatSession {
   targetScorecardId: string | null;
   createdAt: string;
   lastActivityAt: string;
+  /** A turn is running server-side right now (backend ChatSessionRead.turn_in_progress). */
+  turnInProgress?: boolean;
 }
 
 /**
@@ -251,6 +253,8 @@ export interface DraftKpi {
   status: DraftKpiStatus;
   /** Mirrors KpiNode.includedInScoring — see that field's docstring. Defaults true. */
   includedInScoring: boolean;
+  /** A scored leaf whose 0-10 guidelines are not written yet (live preview: "writing guidelines..."). */
+  guidelinesPending?: boolean;
 }
 
 /** Live, in-progress scorecard draft shown in the Chat live preview panel. */

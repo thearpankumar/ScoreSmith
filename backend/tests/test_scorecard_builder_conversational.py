@@ -29,7 +29,7 @@ import uuid
 import pytest
 
 from app.ai import scorecard_builder as sb
-from tests.fakes import FakeBedrockClient, FakeWebSearchClient, search_result, tool_use_result
+from tests.fakes import FakeBedrockClient, FakeWebSearchClient, full_rubric, search_result, tool_use_result
 
 pytestmark = pytest.mark.usefixtures("_migrated_db")
 
@@ -44,19 +44,13 @@ _COMPLETE_PATCH = {
             "name": "Compliance Coverage",
             "weight": 70,
             "level": 1,
-            "guidelines": {
-                "10": {"qualitative_text": "Fully covers required controls."},
-                "0": {"qualitative_text": "No coverage."},
-            },
+            "guidelines": full_rubric(),
         },
         {
             "name": "Turnaround Time",
             "weight": 30,
             "level": 1,
-            "guidelines": {
-                "10": {"qualitative_text": "Reviewed within SLA."},
-                "0": {"qualitative_text": "Far outside SLA."},
-            },
+            "guidelines": full_rubric(),
         },
     ],
 }

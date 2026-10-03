@@ -51,7 +51,7 @@ import uuid
 import pytest
 
 from app.ai import scorecard_builder as sb
-from tests.fakes import FakeBedrockClient, FakeWebSearchClient, tool_use_result
+from tests.fakes import FakeBedrockClient, FakeWebSearchClient, full_rubric, tool_use_result
 
 pytestmark = pytest.mark.usefixtures("_migrated_db")
 
@@ -71,10 +71,7 @@ _COMPLETE_PATCH = {
             "name": "Compliance Coverage",
             "weight": 100,
             "level": 1,
-            "guidelines": {
-                "10": {"qualitative_text": "Fully covers required controls."},
-                "0": {"qualitative_text": "No coverage."},
-            },
+            "guidelines": full_rubric(),
         },
     ],
 }
@@ -368,10 +365,7 @@ async def test_zero_categories_falls_back_to_plain_propose_kpis() -> None:
                             "name": "Completeness",
                             "weight": 100,
                             "level": 1,
-                            "guidelines": {
-                                "10": {"qualitative_text": "All items done."},
-                                "0": {"qualitative_text": "Nothing done."},
-                            },
+                            "guidelines": full_rubric(),
                         }
                     ],
                 },
@@ -476,7 +470,14 @@ async def test_kpi_batches_merge_from_multiple_categories() -> None:
             },
         )
 
-    fake_bedrock = FakeBedrockClient(converse_fn=converse_fn)
+    # "Response Time" vs "Response Time Speed" is a BORDERLINE pair (token subset): the small-model
+    # duplicate judge decides it, so script it to call that pair the same concept.
+    def judge_same_response_time(*, messages, **_):
+        text = messages[0]["content"][0]["text"]
+        ids = [int(line.split(".")[0]) for line in text.splitlines()[1:] if "response time" in line.lower()]
+        return tool_use_result("judge_duplicate_kpis", {"same_concept_ids": ids})
+
+    fake_bedrock = FakeBedrockClient(converse_fn=converse_fn, dedup_fn=judge_same_response_time)
     fake_search = FakeWebSearchClient(search_fn=lambda q: [])
 
     turn = await sb.start_session(

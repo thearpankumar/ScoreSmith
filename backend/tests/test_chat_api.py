@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.deps import get_bedrock_client, get_jev_client, get_web_search_client
 from app.main import app
-from tests.fakes import FakeBedrockClient, FakeJevClient, text_result, tool_use_result
+from tests.fakes import FakeBedrockClient, FakeJevClient, full_rubric, text_result, tool_use_result
 
 _COMPLETE_DRAFT_PATCH = {
     "name": "Support Ticket Quality",
@@ -23,13 +23,13 @@ _COMPLETE_DRAFT_PATCH = {
             "name": "Accuracy",
             "weight": 60,
             "level": 1,
-            "guidelines": {"10": {"qualitative_text": "Fully accurate."}, "0": {"qualitative_text": "Wrong."}},
+            "guidelines": full_rubric(),
         },
         {
             "name": "Tone",
             "weight": 40,
             "level": 1,
-            "guidelines": {"10": {"qualitative_text": "Perfectly polite."}, "0": {"qualitative_text": "Rude."}},
+            "guidelines": full_rubric(),
         },
     ],
 }
@@ -824,7 +824,7 @@ def test_update_scoring_formula_reachable_via_chat_applies_patch(
     # The turn's final visible message is the ask_clarification that followed (see
     # docstring above) — update_scoring_formula's own assistant_message is proven at the
     # node level instead.
-    assert r.json()["assistant_message"] == "Anything else to change?"
+    assert "Anything else to change?" not in r.json()["assistant_message"]  # the card carries the question
     assert r.json()["draft"]["scoring_formula"] == 'min(kpi["Accuracy"], kpi["Tone"])'
 
 

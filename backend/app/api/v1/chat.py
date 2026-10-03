@@ -15,7 +15,7 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +37,7 @@ from app.ai.scorecard_builder import (
 from app.ai.session_title import generate_session_title
 from app.ai.web_search import WebSearchClientProtocol
 from app.config import get_settings
-from app.db import get_db
+from app.db import AsyncSessionLocal, get_db
 from app.deps import get_bedrock_client, get_current_user, get_jev_client, get_web_search_client
 from app.models.chat_message import ChatMessage
 from app.models.chat_session import ChatSession
@@ -63,8 +63,9 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 # --- Persistent "turn in progress" marker (Part A: refresh-survives-mid-turn) -----------
 #
-# The chat-turn endpoints below block synchronously for the whole LangGraph run (no
-# background job queue) — see the module docstring. `ChatSession.pending_turn_started_at`
+# Chat turns run either INLINE in the request (`?wait=true`, or `settings.chat_turns_inline` —
+# the original behaviour, used by the test suite) or, by default, as a BACKGROUND task after a
+# 202 response (see "Background turns" below). `ChatSession.pending_turn_started_at`
 # (and its `turn_in_progress` computed property, which applies the staleness cutoff — see
 # `STALE_TURN_TIMEOUT_SECONDS` on that model) is the durable record a page refresh checks
 # via `GET /chat/sessions/{id}` to know "the assistant is still working on this" instead of
@@ -92,7 +93,7 @@ async def _mark_turn_in_progress(db: AsyncSession, session_id: uuid.UUID) -> dat
     await db.execute(
         update(ChatSession)
         .where(ChatSession.id == session_id)
-        .values(pending_turn_started_at=started_at)
+        .values(pending_turn_started_at=started_at, last_turn_error=None, last_turn_error_code=None)
     )
     await db.commit()
     return started_at
@@ -127,6 +128,230 @@ async def _generate_and_persist_title(
     session.title = title
     logger.info("Generated chat session title for session_id=%s: %r", session.id, title)
     return title
+
+
+# --- Background turns --------------------------------------------------------------------
+#
+# Why: a turn can run for minutes (research fan-out, enrichment, 30+ KPI requests), which as ONE
+# synchronous HTTP request is a hang/timeout risk (browser, proxy and server limits) and ties the
+# whole turn to a connection that may drop. Design (the long-running-operation pattern: accept,
+# return 202, poll a status resource):
+#   - POST marks the turn in progress (`pending_turn_started_at`, durable) and starts an
+#     `asyncio.Task` on the server's event loop, then returns 202 immediately.
+#   - The task opens its OWN `AsyncSession` (the request-scoped one is closed once the response
+#     is sent), runs the same LangGraph turn (`start_session`/`send_message`, whose
+#     `AsyncPostgresSaver` is a process-lifetime singleton on the same loop), persists the
+#     messages, and clears the marker. Live progress is the existing `chat_turn_events` rows.
+#   - The client polls `GET /chat/sessions/{id}` (state + `turn_in_progress` + `turn_error`) and
+#     `GET .../turn-events`. Polling over SSE: all state is already durable in Postgres, so a
+#     refresh/another tab/a server restart just resumes polling; SSE would add a held-open
+#     connection per tab (proxy buffering/idle timeouts, EventSource cannot send the dev-auth
+#     header) and a second progress channel for no gain at 1.5s granularity.
+#   - Failure is recorded in `chat_sessions.last_turn_error[_code]` (migration 0009) and the
+#     marker cleared. A hard wall-clock limit (`settings.chat_turn_timeout_seconds`) bounds the
+#     task. Server shutdown cancels running tasks (recording "interrupted"); a crash/--reload
+#     restart leaves orphaned markers that `recover_interrupted_turns` clears at startup
+#     (assumes ONE API process, as in infra/docker-compose.yml: with several workers a worker's
+#     startup would also clear markers of turns still running in the others — the staleness
+#     cutoff is then the only guard). Tasks are kept in a set so they are not garbage-collected
+#     mid-run (asyncio only holds weak references to tasks).
+#   - Windows: the task runs on the SAME event loop as the server (set to the selector policy in
+#     app/main.py before the loop exists); no thread/loop is created here.
+
+_background_turns: set[asyncio.Task[None]] = set()
+# session id -> its running background turn, so DELETE / cancel can stop an abandoned turn (a
+# killed client does not stop the server-side task; orphans would keep consuming Bedrock capacity).
+_turn_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
+_user_cancelled: set[uuid.UUID] = set()
+
+
+def _use_inline_turns(wait: bool | None) -> bool:
+    return get_settings().chat_turns_inline if wait is None else wait
+
+
+async def _record_turn_failure(session_id: uuid.UUID, turn_started_at: datetime, code: str, message: str) -> None:
+    """Clears the in-progress marker of THIS turn and stores why it failed (fresh session — the
+    caller's may be broken). Best-effort: never raises."""
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(ChatSession)
+                .where(ChatSession.id == session_id, ChatSession.pending_turn_started_at == turn_started_at)
+                .values(pending_turn_started_at=None, last_turn_error=message, last_turn_error_code=code)
+            )
+            await db.commit()
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.warning("Could not record turn failure for session_id=%s.", session_id, exc_info=True)
+
+
+async def _persist_turn_result(
+    db: AsyncSession,
+    session: ChatSession,
+    turn: BuilderTurnResult,
+    bedrock: BedrockClientProtocol,
+    *,
+    user_message: str | None,
+) -> None:
+    """Writes the turn's chat_messages rows (the user's message too when `user_message` is given —
+    first turns persist it only after success), materializes a confirmed draft and clears the
+    in-progress marker."""
+    if user_message is not None:
+        await _persist_message(db, session.id, ChatMessageRole.USER, user_message)
+    tool_calls = None
+    if turn.question:
+        tool_calls = {"question": turn.question}
+    elif turn.similar_suggestions:
+        tool_calls = {"similar_suggestions": turn.similar_suggestions}
+    await _persist_message(db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls)
+    await _maybe_materialize(db, session, turn, bedrock)
+    await _clear_turn_in_progress(db, session.id)
+    await db.commit()
+
+
+async def _background_turn(
+    *,
+    session_id: uuid.UUID,
+    message: str,
+    first_turn: bool,
+    persist_user_message: bool,
+    turn_started_at: datetime,
+    bedrock: BedrockClientProtocol,
+    web_search: WebSearchClientProtocol,
+    jev: JevClientProtocol,
+) -> None:
+    """The body of one background turn — see the "Background turns" comment above. Never raises
+    (except re-raising cancellation after recording it)."""
+    settings = get_settings()
+    try:
+        async with AsyncSessionLocal() as db:
+            session = await db.get(ChatSession, session_id)
+            if session is None:
+                return  # deleted before the task even started
+            if first_turn:
+                await _generate_and_persist_title(db, session, bedrock, message)
+            # Never carry an idle-in-transaction connection into the (minutes-long) graph run:
+            # it would block any schema DDL (e.g. the checkpointer's CREATE INDEX CONCURRENTLY).
+            await db.commit()
+            async with asyncio.timeout(settings.chat_turn_timeout_seconds):
+                run = start_session if first_turn else send_message
+                turn = await run(
+                    str(session_id),
+                    message,
+                    bedrock,
+                    chat_model_id=settings.bedrock_chat_model_id,
+                    db=db,
+                    web_search_client=web_search,
+                    turn_started_at=turn_started_at,
+                    jev_client=jev,
+                )
+            await _persist_turn_result(
+                db, session, turn, bedrock, user_message=message if persist_user_message else None
+            )
+    except asyncio.CancelledError:
+        if session_id in _user_cancelled:
+            _user_cancelled.discard(session_id)
+            await asyncio.shield(
+                _record_turn_failure(session_id, turn_started_at, "cancelled", "This turn was cancelled.")
+            )
+        else:
+            await asyncio.shield(
+                _record_turn_failure(
+                    session_id, turn_started_at, "interrupted", "The server restarted while working on your message."
+                )
+            )
+        raise
+    except BedrockUnavailableError as exc:
+        await _record_turn_failure(session_id, turn_started_at, "bedrock_unavailable", str(exc))
+    except TimeoutError:
+        await _record_turn_failure(
+            session_id, turn_started_at, "timeout",
+            f"The assistant took longer than {settings.chat_turn_timeout_seconds}s and was stopped.",
+        )
+    except IntegrityError:
+        logger.info("Chat session %s was deleted while its turn ran; dropping the result.", session_id)
+    except Exception:  # noqa: BLE001 — a background task has no caller to raise to
+        logger.exception("Background chat turn failed (session_id=%s).", session_id)
+        await _record_turn_failure(
+            session_id, turn_started_at, "turn_failed", "Something went wrong while processing your message."
+        )
+
+
+def _launch_background_turn(**kwargs) -> None:
+    task = asyncio.create_task(_background_turn(**kwargs), name=f"chat-turn-{kwargs['session_id']}")
+    _background_turns.add(task)
+    session_id = kwargs["session_id"]
+    _turn_tasks[session_id] = task
+
+    def _done(t: asyncio.Task[None]) -> None:
+        _background_turns.discard(t)
+        if _turn_tasks.get(session_id) is t:
+            del _turn_tasks[session_id]
+
+    task.add_done_callback(_done)
+
+
+async def cancel_background_turn(session_id: uuid.UUID) -> bool:
+    """Cancels the session's running background turn (if any) and waits for it to unwind, so its
+    in-flight Bedrock/search work stops being scheduled. Returns whether a turn was running."""
+    task = _turn_tasks.get(session_id)
+    if task is None or task.done():
+        return False
+    _user_cancelled.add(session_id)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    _user_cancelled.discard(session_id)
+    return True
+
+
+async def wait_for_background_turns() -> None:
+    """Awaits every running background turn (tests; graceful drain)."""
+    while _background_turns:
+        await asyncio.gather(*list(_background_turns), return_exceptions=True)
+
+
+async def shutdown_background_turns() -> None:
+    """Server shutdown: cancel running turns (each records "interrupted" and clears its marker)."""
+    tasks = list(_background_turns)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def recover_interrupted_turns() -> int:
+    """Startup recovery: any session still marked in-progress when this process starts belongs to
+    a turn that died with the previous process (crash, kill, --reload) — no task of THIS process
+    can own it yet. Clear the marker and record why, so the UI stops showing "still working" and
+    offers a retry instead of waiting out the staleness cutoff. Returns how many were recovered."""
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                update(ChatSession)
+                .where(ChatSession.pending_turn_started_at.is_not(None))
+                .values(
+                    pending_turn_started_at=None,
+                    last_turn_error="The server restarted while working on your message. Please send it again.",
+                    last_turn_error_code="interrupted",
+                )
+            )
+            await db.commit()
+            return result.rowcount or 0
+    except Exception:  # noqa: BLE001 — e.g. DB not reachable/migrated yet; never block startup
+        logger.warning("Could not recover interrupted chat turns at startup.", exc_info=True)
+        return 0
+
+
+async def _accepted_response(session: ChatSession) -> ChatTurnRead:
+    """The 202 body: the session's current state (best-effort) flagged as in progress."""
+    turn = await get_session_state(str(session.id))
+    response = (
+        _turn_to_response(session.id, turn)
+        if turn is not None
+        else ChatTurnRead(session_id=session.id, status="gathering", draft={})
+    )
+    response.turn_in_progress = True
+    response.title = session.title
+    return response
 
 
 def _turn_to_response(session_id: uuid.UUID, turn: BuilderTurnResult) -> ChatTurnRead:
@@ -240,6 +465,11 @@ async def list_chat_messages(session_id: uuid.UUID, db: AsyncSession = Depends(g
 @router.post("/sessions", response_model=ChatTurnRead, status_code=status.HTTP_201_CREATED)
 async def start_chat_session(
     payload: ChatSessionStart,
+    response: Response,
+    wait: bool | None = Query(
+        default=None,
+        description="true: run the turn inline and return the full result (200/201); false/omitted: 202 and poll.",
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
     bedrock: BedrockClientProtocol = Depends(get_bedrock_client),
@@ -255,7 +485,8 @@ async def start_chat_session(
 
     if payload.target_scorecard_id is not None:
         return await _start_refine_session(
-            db, current_user, bedrock, web_search, jev, payload.target_scorecard_id, message
+            db, current_user, bedrock, web_search, jev, payload.target_scorecard_id, message,
+            response=response, inline=_use_inline_turns(wait),
         )
 
     # Originally (see prior bug writeup): a brand-new "start fresh" session used to be
@@ -283,6 +514,21 @@ async def start_chat_session(
     session = ChatSession(id=session_id, user_id=current_user.id)
     db.add(session)
     await db.commit()
+    if not _use_inline_turns(wait):
+        # Background mode: the title call and the whole graph run happen in the task (see
+        # `_background_turn`); the client polls GET /chat/sessions/{id}. A failed first turn keeps the
+        # session row (so the error is readable); inline mode below still deletes it.
+        # The user's message is persisted in the SAME transaction that marks the turn in progress
+        # (`_mark_turn_in_progress` commits), so a reload / navigation right after the 202 — or a
+        # failed/cancelled first turn — still sees it; the success path must not write it again.
+        await _persist_message(db, session_id, ChatMessageRole.USER, payload.message)
+        turn_started_at = await _mark_turn_in_progress(db, session_id)
+        _launch_background_turn(
+            session_id=session_id, message=payload.message, first_turn=True, persist_user_message=False,
+            turn_started_at=turn_started_at, bedrock=bedrock, web_search=web_search, jev=jev,
+        )
+        response.status_code = status.HTTP_202_ACCEPTED
+        return await _accepted_response(session)
     # Issue 1 (see task notes): generate the session's real title as the VERY FIRST thing
     # on its first turn — one fast/cheap Bedrock call, well before the heavier LangGraph
     # work below (check_similarity/research_kpis/propose_kpis) even starts. Persisted
@@ -360,6 +606,9 @@ async def _start_refine_session(
     jev: JevClientProtocol,
     scorecard_id: uuid.UUID,
     message: str,
+    *,
+    response: Response,
+    inline: bool,
 ) -> ChatTurnRead:
     """"Refine with assistant": open a session whose draft is pre-populated from the
     scorecard's current version (see `draft_from_scorecard` / `seed_session`). Seeding
@@ -409,6 +658,20 @@ async def _start_refine_session(
     await db.commit()
 
     turn = await seed_session(str(session.id), draft, context_message, assistant_note)
+
+    if message and not inline:
+        await _persist_message(db, session.id, ChatMessageRole.USER, message)
+        await db.commit()
+        turn_started_at = await _mark_turn_in_progress(db, session.id)
+        _launch_background_turn(
+            session_id=session.id, message=message, first_turn=False, persist_user_message=False,
+            turn_started_at=turn_started_at, bedrock=bedrock, web_search=web_search, jev=jev,
+        )
+        response.status_code = status.HTTP_202_ACCEPTED
+        accepted = _turn_to_response(session.id, turn)
+        accepted.turn_in_progress = True
+        accepted.title = session.title
+        return accepted
 
     if message:
         await _persist_message(db, session.id, ChatMessageRole.USER, message)
@@ -466,6 +729,11 @@ async def _start_refine_session(
 async def send_chat_message(
     session_id: uuid.UUID,
     payload: ChatMessageCreate,
+    response: Response,
+    wait: bool | None = Query(
+        default=None,
+        description="true: run the turn inline and return the full result (200); false/omitted: 202 and poll.",
+    ),
     db: AsyncSession = Depends(get_db),
     bedrock: BedrockClientProtocol = Depends(get_bedrock_client),
     web_search: WebSearchClientProtocol = Depends(get_web_search_client),
@@ -476,9 +744,34 @@ async def send_chat_message(
     if session is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Chat session not found.")
 
-    await _persist_message(db, session.id, ChatMessageRole.USER, payload.message)
+    if session.turn_in_progress:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="The assistant is still working on your previous message."
+        )
+
+    # "Try again" after a failed/cancelled turn re-sends the SAME text: the original user message is
+    # already persisted (a first turn persists it up front), so don't write a duplicate.
+    last = await db.scalar(
+        select(ChatMessage).where(ChatMessage.session_id == session.id).order_by(ChatMessage.created_at.desc()).limit(1)
+    )
+    is_retry = (
+        session.last_turn_error_code is not None
+        and last is not None
+        and last.role == ChatMessageRole.USER
+        and last.content == payload.message
+    )
+    if not is_retry:
+        await _persist_message(db, session.id, ChatMessageRole.USER, payload.message)
     await db.commit()
     turn_started_at = await _mark_turn_in_progress(db, session.id)
+
+    if not _use_inline_turns(wait):
+        _launch_background_turn(
+            session_id=session.id, message=payload.message, first_turn=False, persist_user_message=False,
+            turn_started_at=turn_started_at, bedrock=bedrock, web_search=web_search, jev=jev,
+        )
+        response.status_code = status.HTTP_202_ACCEPTED
+        return await _accepted_response(session)
 
     settings = get_settings()
     try:
@@ -546,9 +839,11 @@ async def get_chat_session(session_id: uuid.UUID, db: AsyncSession = Depends(get
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Chat session not found.")
 
     in_progress = session.turn_in_progress
+    turn_error = None if in_progress else session.last_turn_error
+    turn_error_code = None if in_progress else session.last_turn_error_code
     turn = await get_session_state(str(session_id))
     if turn is None:
-        if in_progress:
+        if in_progress or turn_error:
             # A turn is running but has not produced its first LangGraph checkpoint yet
             # (e.g. still inside the initial research fan-out) — report "still working"
             # with an empty draft rather than 404ing, so a refreshed page can poll here
@@ -557,7 +852,9 @@ async def get_chat_session(session_id: uuid.UUID, db: AsyncSession = Depends(get
                 session_id=session_id,
                 status="gathering",
                 draft={},
-                turn_in_progress=True,
+                turn_in_progress=in_progress,
+                turn_error=turn_error,
+                turn_error_code=turn_error_code,
                 # The title-generation call (see start_chat_session) runs and persists
                 # BEFORE the graph call that produces the first checkpoint this branch is
                 # covering the absence of — so it's already reliably set here, even this
@@ -570,6 +867,8 @@ async def get_chat_session(session_id: uuid.UUID, db: AsyncSession = Depends(get
         )
     response = _turn_to_response(session_id, turn)
     response.turn_in_progress = in_progress
+    response.turn_error = turn_error
+    response.turn_error_code = turn_error_code
     response.title = session.title
     # Only report a materialized scorecard once something was actually saved: a
     # "Refine with assistant" session carries target_scorecard_id from the start, before
@@ -577,6 +876,19 @@ async def get_chat_session(session_id: uuid.UUID, db: AsyncSession = Depends(get
     if session.status == ChatSessionStatus.COMPLETED:
         response.materialized_scorecard_id = session.target_scorecard_id
     return response
+
+
+@router.post("/sessions/{session_id}/cancel", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+async def cancel_chat_turn(
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+) -> None:
+    """Stops the session's running background turn (no-op if none is running); the session is
+    kept and `turn_error_code` becomes "cancelled" so a client can offer a retry."""
+    if await db.get(ChatSession, session_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Chat session not found.")
+    await cancel_background_turn(session_id)
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
@@ -604,6 +916,9 @@ async def delete_chat_session(
     if session is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Chat session not found.")
 
+    # Stop an abandoned/still-running background turn first so it stops consuming Bedrock capacity.
+    await cancel_background_turn(session_id)
+    await db.refresh(session)
     await db.delete(session)
     await db.commit()
 

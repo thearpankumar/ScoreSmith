@@ -8,6 +8,7 @@ from sqlalchemy import DateTime, ForeignKey, Text, func
 from sqlalchemy.dialects.postgresql import ENUM, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.config import get_settings
 from app.models.base import Base, UUIDPKMixin
 from app.models.enums import ChatSessionStatus
 
@@ -20,11 +21,12 @@ chat_session_status_enum = ENUM(
 )
 
 # How long `pending_turn_started_at` (below) is trusted before being treated as stale —
-# see that column's docstring. Generous margin over the documented ~20-90s multi-agent
-# research fan-out ceiling, so a genuinely slow (but alive) turn is never mistaken for a
-# crashed one, while a process that died mid-turn (skipping the finally-block clear in
-# app/api/v1/chat.py) doesn't wedge the UI in "still working" forever.
-STALE_TURN_TIMEOUT_SECONDS = 300
+# see that column's docstring. Background turns are hard-limited by
+# `settings.chat_turn_timeout_seconds` (default 900s), so the marker outlives that limit by a
+# margin: a genuinely slow (but alive) turn is never mistaken for a crashed one, while a process
+# that died mid-turn (startup recovery in app/api/v1/chat.py clears those immediately; this is
+# the fallback) doesn't wedge the UI in "still working" forever.
+STALE_TURN_TIMEOUT_SECONDS = get_settings().chat_turn_timeout_seconds + 300
 
 
 class ChatSession(UUIDPKMixin, Base):
@@ -65,6 +67,13 @@ class ChatSession(UUIDPKMixin, Base):
     pending_turn_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )
+
+    # Why the last background turn failed (see migration 0009_chat_turn_error): a short
+    # human-readable reason + a machine code ("bedrock_unavailable" | "timeout" | "interrupted" |
+    # "turn_failed"). NULL while a turn runs and after a successful one; cleared when a new turn
+    # starts. Read back by the frontend through GET /chat/sessions/{id} (`turn_error`).
+    last_turn_error: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    last_turn_error_code: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
 
     messages: Mapped[list[ChatMessage]] = relationship(
         "ChatMessage", back_populates="session", cascade="all, delete-orphan",

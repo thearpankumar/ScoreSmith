@@ -15,7 +15,7 @@ import uuid
 import pytest
 
 from app.ai import scorecard_builder as sb
-from tests.fakes import FakeBedrockClient, tool_use_result
+from tests.fakes import FakeBedrockClient, full_rubric, tool_use_result
 
 pytestmark = pytest.mark.usefixtures("_migrated_db")
 
@@ -30,13 +30,13 @@ _COMPLETE_DRAFT_PATCH = {
             "name": "Accuracy",
             "weight": 60,
             "level": 1,
-            "guidelines": {"10": {"qualitative_text": "Fully accurate."}, "0": {"qualitative_text": "Wrong."}},
+            "guidelines": full_rubric(),
         },
         {
             "name": "Tone",
             "weight": 40,
             "level": 1,
-            "guidelines": {"10": {"qualitative_text": "Perfectly polite."}, "0": {"qualitative_text": "Rude."}},
+            "guidelines": full_rubric(),
         },
     ],
 }

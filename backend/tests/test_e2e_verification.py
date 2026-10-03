@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient
 
 from app.deps import get_bedrock_client, get_jev_client, get_web_search_client
 from app.main import app
-from tests.fakes import FakeBedrockClient, FakeJevClient, text_result, tool_use_result
+from tests.fakes import FakeBedrockClient, FakeJevClient, full_rubric, text_result, tool_use_result
 
 # --- Section 1: chat iteration genuinely updates the draft before it is saved ----------
 
@@ -43,50 +43,35 @@ _INITIAL_KPIS = [
         "weight": 25,
         "level": 1,
         "parent_name": None,
-        "guidelines": {
-            "10": {"qualitative_text": "Fully accurate uptime data, no discrepancies."},
-            "0": {"qualitative_text": "Completely inaccurate uptime data."},
-        },
+        "guidelines": full_rubric(),
     },
     {
         "name": "Timeliness",
         "weight": 25,
         "level": 1,
         "parent_name": None,
-        "guidelines": {
-            "10": {"qualitative_text": "Published within 5 minutes of the incident."},
-            "0": {"qualitative_text": "Never published or published days late."},
-        },
+        "guidelines": full_rubric(),
     },
     {
         "name": "Clarity",
         "weight": 20,
         "level": 1,
         "parent_name": None,
-        "guidelines": {
-            "10": {"qualitative_text": "Unambiguous, plain-language status."},
-            "0": {"qualitative_text": "Incomprehensible jargon."},
-        },
+        "guidelines": full_rubric(),
     },
     {
         "name": "Professionalism",
         "weight": 15,
         "level": 1,
         "parent_name": None,
-        "guidelines": {
-            "10": {"qualitative_text": "Consistently professional tone."},
-            "0": {"qualitative_text": "Unprofessional tone."},
-        },
+        "guidelines": full_rubric(),
     },
     {
         "name": "Completeness",
         "weight": 15,
         "level": 1,
         "parent_name": None,
-        "guidelines": {
-            "10": {"qualitative_text": "Covers impact, cause, ETA and next update."},
-            "0": {"qualitative_text": "Missing all required fields."},
-        },
+        "guidelines": full_rubric(),
     },
 ]
 

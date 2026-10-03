@@ -22,7 +22,7 @@ import uuid
 import pytest
 
 from app.ai import scorecard_builder as sb
-from tests.fakes import FakeBedrockClient, FakeWebSearchClient, search_result, tool_use_result
+from tests.fakes import FakeBedrockClient, FakeWebSearchClient, full_rubric, search_result, tool_use_result
 
 pytestmark = pytest.mark.usefixtures("_migrated_db")
 
@@ -37,13 +37,7 @@ _COMPLETE_PATCH = {
             "name": "Time to Detect",
             "weight": 100,
             "level": 1,
-            "guidelines": {
-                "10": {
-                    "qualitative_text": "Detected within industry-benchmark MTTD.",
-                    "quantitative_criteria": {"mttd_minutes_max": 5},
-                },
-                "0": {"qualitative_text": "Detected far too late."},
-            },
+            "guidelines": full_rubric(),
         },
     ],
 }

@@ -72,6 +72,11 @@ def _apply_test_database_url() -> None:
 
 _apply_test_database_url()
 
+# Chat turns default to BACKGROUND tasks (202 + polling) in production; the pre-existing API tests
+# assert on the inline 200/201 responses, so the suite runs inline by default and the background
+# tests (tests/test_chat_background_turns.py) opt in with `?wait=false`.
+os.environ.setdefault("CHAT_TURNS_INLINE", "true")
+
 APP_TABLES = [
     "audit_log",
     "chat_messages",

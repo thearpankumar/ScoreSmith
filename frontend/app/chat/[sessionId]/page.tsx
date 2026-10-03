@@ -69,6 +69,7 @@ export default async function ChatSessionPage({
       initialSavedScorecardId={result.savedScorecardId}
       initialTurnInProgress={result.turnInProgress}
       initialTurnEvents={result.turnEvents}
+      initialTurnError={result.turnError}
     />
   );
 }

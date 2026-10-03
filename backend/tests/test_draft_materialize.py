@@ -13,6 +13,7 @@ from app.ai.draft_materialize import materialize_draft
 from app.ai.draft_schema import ScorecardDraft
 from app.models.kpi_node import KpiNode
 from app.models.user import User
+from tests.fakes import full_rubric
 
 _VALID_DRAFT = {
     "name": "Support Ticket Quality",
@@ -32,7 +33,7 @@ _VALID_DRAFT = {
             "name": "Tone",
             "weight": 40,
             "level": 1,
-            "guidelines": {"10": {"qualitative_text": "Perfectly polite."}, "0": {"qualitative_text": "Rude."}},
+            "guidelines": full_rubric(),
         },
         {
             # Leaf KPIs are weighted GLOBALLY across the whole draft (not per category) —
@@ -41,7 +42,7 @@ _VALID_DRAFT = {
             "weight": 60,
             "level": 2,
             "parent_name": "Accuracy",
-            "guidelines": {"10": {"qualitative_text": "No errors."}},
+            "guidelines": full_rubric(),
         },
     ],
 }
@@ -111,8 +112,8 @@ async def test_materialize_surfaces_db_weight_sum_violation(async_db_session) ->
             "domain": "d",
             "target_score": 5,
             "kpis": [
-                {"name": "A", "weight": 50, "guidelines": {"10": {"qualitative_text": "x"}}},
-                {"name": "B", "weight": 40, "guidelines": {"10": {"qualitative_text": "x"}}},
+                {"name": "A", "weight": 50, "guidelines": full_rubric()},
+                {"name": "B", "weight": 40, "guidelines": full_rubric()},
             ],
         }
     )

@@ -18,7 +18,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.ai.bedrock_client import ConverseResult
-from app.ai.jev_client import JevRatingResult
+from app.ai.jev_client import JevChoiceResult, JevRatingResult
 from app.ai.web_search import SearchResult
 
 ConverseFn = Callable[..., ConverseResult]
@@ -38,6 +38,13 @@ class FakeBedrockClient:
       tests, where `asyncio.gather` fires several `.converse()` calls concurrently (via
       `asyncio.to_thread`) with no guaranteed ordering, so responses must be selected by
       inspecting the call's content instead of by position.
+
+    The request-classification call (`classify_request` — see `research_kpis` in
+    scorecard_builder.py) is handled OUT OF BAND: it is answered by `classify_fn` (default:
+    "open_ended", i.e. the pre-existing behaviour) and logged to `classify_calls`, never to
+    `calls` and never consuming `script`/`converse_fn`. That keeps every test written
+    before the classifier existed (FIFO scripts, exact `len(calls)` assertions) valid
+    unchanged, while tests of the user-specified mode script `classify_fn` explicitly.
     """
 
     def __init__(
@@ -45,11 +52,26 @@ class FakeBedrockClient:
         script: list[ConverseResult] | None = None,
         converse_fn: ConverseFn | None = None,
         embedding_dim: int = 1024,
+        classify_fn: ConverseFn | None = None,
+        route_fn: ConverseFn | None = None,
+        dedup_fn: ConverseFn | None = None,
+        header_fn: ConverseFn | None = None,
+        side_fn: ConverseFn | None = None,
     ) -> None:
+        self._side_fn = side_fn
+        self.side_calls: list[dict[str, Any]] = []
+        self._header_fn = header_fn
+        self.header_calls: list[dict[str, Any]] = []
         self._script = list(script or [])
         self._converse_fn = converse_fn
+        self._classify_fn = classify_fn
+        self._route_fn = route_fn
+        self._dedup_fn = dedup_fn
+        self.dedup_calls: list[dict[str, Any]] = []
+        self.route_calls: list[dict[str, Any]] = []
         self.embedding_dim = embedding_dim
         self.calls: list[dict[str, Any]] = []
+        self.classify_calls: list[dict[str, Any]] = []
         self._lock = threading.Lock()
 
     def converse(
@@ -69,6 +91,57 @@ class FakeBedrockClient:
         # deliberate `time.sleep`/barrier a concurrency-proof test uses inside it),
         # defeating the exact thing `converse_fn` mode exists to test. Only the bookkeeping
         # needs mutual exclusion.
+        if tools and any(getattr(t, "name", None) == "judge_duplicate_kpis" for t in tools):
+            # The borderline duplicate-KPI judge (scorecard_builder._judge_duplicate_pairs) — out of
+            # band like the router. Default: nothing is a duplicate (keep both).
+            with self._lock:
+                self.dedup_calls.append({"messages": messages, "system": system, "model_id": model_id})
+            if self._dedup_fn is not None:
+                return self._dedup_fn(
+                    messages=messages, system=system, tools=tools, force_tool_use=force_tool_use, model_id=model_id
+                )
+            return tool_use_result("judge_duplicate_kpis", {"same_concept_ids": []})
+        if tools and any(getattr(t, "name", None) == "set_scorecard_header" for t in tools):
+            # The early scorecard-header call (scorecard_builder._fill_header) — out of band. Default:
+            # an empty answer, so the deterministic derivation fills the header.
+            with self._lock:
+                self.header_calls.append({"messages": messages, "system": system, "model_id": model_id})
+            if self._header_fn is not None:
+                return self._header_fn(
+                    messages=messages, system=system, tools=tools, force_tool_use=force_tool_use, model_id=model_id
+                )
+            return tool_use_result("set_scorecard_header", {})
+        if tools and any(getattr(t, "name", None) == "answer_user_questions" for t in tools):
+            # The side-question answer call (scorecard_builder._answer_side_questions) — out of band;
+            # default: no answer, so tests written before it existed are unaffected.
+            with self._lock:
+                self.side_calls.append({"messages": messages, "system": system})
+            if self._side_fn is not None:
+                return self._side_fn(
+                    messages=messages, system=system, tools=tools, force_tool_use=force_tool_use, model_id=model_id
+                )
+            return tool_use_result("answer_user_questions", {"answer": ""})
+        if tools and any(getattr(t, "name", None) == "route_request" for t in tools):
+            # The cheap small-model intent router (request_routing.route_request) — also out of
+            # band. Default "unsure" makes every pre-router test fall through to the main-model
+            # classification exactly as before.
+            with self._lock:
+                self.route_calls.append({"messages": messages, "system": system, "tools": tools, "model_id": model_id})
+            if self._route_fn is not None:
+                return self._route_fn(
+                    messages=messages, system=system, tools=tools, force_tool_use=force_tool_use, model_id=model_id
+                )
+            return tool_use_result("route_request", {"mode": "unsure"})
+        if tools and any(getattr(t, "name", None) == "classify_request" for t in tools):
+            with self._lock:
+                self.classify_calls.append({"messages": messages, "system": system, "tools": tools})
+            if self._classify_fn is not None:
+                return self._classify_fn(
+                    messages=messages, system=system, tools=tools, force_tool_use=force_tool_use, model_id=model_id
+                )
+            return tool_use_result(
+                "classify_request", {"mode": "open_ended", "reasoning": "default fake classification", "kpis": []}
+            )
         with self._lock:
             self.calls.append(
                 {"messages": messages, "system": system, "tools": tools, "model_id": model_id}
@@ -163,10 +236,26 @@ class FakeJevClient:
     order, so tests can assert on exactly what was rated at each checkpoint.
     """
 
-    def __init__(self, script: list[float] | None = None, rate_fn: RateFn | None = None) -> None:
+    def __init__(
+        self,
+        script: list[float] | None = None,
+        rate_fn: RateFn | None = None,
+        choose_fn: Callable[..., JevChoiceResult] | None = None,
+    ) -> None:
         self._script = list(script or [])
         self._rate_fn = rate_fn
+        self._choose_fn = choose_fn
         self.calls: list[dict[str, str]] = []
+        self.choose_calls: list[dict[str, Any]] = []
+
+    async def choose(self, *, state: dict[str, Any], instructions: str, options: dict[str, str]) -> JevChoiceResult:
+        """`choose_fn` scripts the intent-router answer; by default this fake is "unsure"
+        (a low-confidence open_ended pick) so tests written before the router existed fall
+        through to the unchanged main-model classification."""
+        self.choose_calls.append({"state": state, "instructions": instructions, "options": options})
+        if self._choose_fn is not None:
+            return self._choose_fn(state=state, instructions=instructions, options=options)
+        return JevChoiceResult(choice="open_ended", confidence=0.0)
 
     async def rate_match(self, *, instruction: str, answer: str) -> JevRatingResult:
         self.calls.append({"instruction": instruction, "answer": answer})
@@ -177,3 +266,9 @@ class FakeJevClient:
         else:
             score = 1.0
         return JevRatingResult(score=score)
+
+
+def full_rubric(text: str = "Level") -> dict[str, dict[str, Any]]:
+    """A complete, distinct 11-level (0-10) guideline set — a leaf KPI is only complete (confirmable,
+    materializable) with every level present."""
+    return {str(i): {"qualitative_text": f"{text} {i}", "quantitative_criteria": None} for i in range(11)}

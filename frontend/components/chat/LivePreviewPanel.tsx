@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useState, type ReactNode } from "react";
+import { memo, useId, useMemo, useState, type ReactNode } from "react";
 import { ChevronDown, FileText, FolderKanban, Plus, Send, Sparkles, Trash2, Undo2 } from "lucide-react";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { ScoringFormulaPanel } from "@/components/chart-detail/ScoringFormulaPanel";
 import { validateScoringFormulaDraft } from "@/lib/api-client";
 import { siblingWeightSum } from "@/lib/kpi-tree";
+import { weightedLeafProgress } from "@/lib/chat-turn-state";
 import { cn } from "@/lib/utils";
 import type { DraftKpi, ScorecardDraft } from "@/lib/types";
 
@@ -29,7 +30,7 @@ import type { DraftKpi, ScorecardDraft } from "@/lib/types";
  * of truth. "Send edits" sends that turn immediately; "Discard" reverts to the server
  * draft.
  */
-export function LivePreviewPanel({
+export const LivePreviewPanel = memo(function LivePreviewPanel({
   draft,
   onChange,
   dirty,
@@ -52,10 +53,27 @@ export function LivePreviewPanel({
   // Leaf KPIs (the set a scoring formula may reference — see backend/app/ai/
   // scoring_formula.py) mirror `leafKpiNodes`'s definition for a saved scorecard: any KPI
   // that isn't itself a parent of another KPI in this draft.
-  const parentIds = new Set(draft.kpis.map((k) => k.parentId).filter((id): id is string => id !== null));
+  // Derived tree structure, memoized on the KPI list: with 35-100+ KPIs (and the draft re-rendering
+  // as the backend fills it in mid-turn) per-node `filter`s over the whole list would be O(n^2)
+  // work on every render.
+  const { parentIds, childrenByParent, topLevel } = useMemo(() => {
+    const parents = new Set(draft.kpis.map((k) => k.parentId).filter((id): id is string => id !== null));
+    const byParent = new Map<string, DraftKpi[]>();
+    const ids = new Set(draft.kpis.map((k) => k.id));
+    const top: DraftKpi[] = [];
+    for (const k of draft.kpis) {
+      if (k.parentId !== null && ids.has(k.parentId)) {
+        const list = byParent.get(k.parentId);
+        if (list) list.push(k);
+        else byParent.set(k.parentId, [k]);
+      } else {
+        top.push(k);
+      }
+    }
+    return { parentIds: parents, childrenByParent: byParent, topLevel: top };
+  }, [draft.kpis]);
   const leafKpiNames = draft.kpis.filter((k) => !parentIds.has(k.id)).map((k) => k.name);
 
-  const topLevel = draft.kpis.filter((k) => k.parentId === null || !draft.kpis.some((p) => p.id === k.parentId));
   // Only LEAF KPIs (ones nothing else is nested under) carry a weight — a category/
   // grouping node has none of its own (see backend migration
   // 0008_category_nodes_no_weight / draft_schema.py). Every included leaf across the
@@ -64,11 +82,15 @@ export function LivePreviewPanel({
   const globalCheck = siblingWeightSum(leafIncluded.map((k) => k.weight ?? 0));
   const globalSum = globalCheck.sum;
   const weightsOk = leafIncluded.length === 0 || globalCheck.ok;
+  // While the assistant is working (`disabled`) the weights are still being filled in, so a sum
+  // that isn't 100 yet is progress, not an error: show it neutral with a "weighting" hint.
+  const weighting = weightedLeafProgress(draft.kpis);
+  const stillWeighting = !!disabled && !weightsOk;
 
   /** Informational-only rollup of a category's own leaf descendants' weights (never a
    * pass/fail constraint — only the global leaf sum above is). */
   function leafDescendantsSum(kpi: DraftKpi): number {
-    const children = draft.kpis.filter((k) => k.parentId === kpi.id);
+    const children = childrenByParent.get(kpi.id) ?? [];
     if (children.length === 0) return kpi.weight ?? 0;
     return children.reduce((sum, c) => sum + leafDescendantsSum(c), 0);
   }
@@ -122,7 +144,7 @@ export function LivePreviewPanel({
    * removing it removes its nested KPIs too (see `removeKpi`).
    */
   function renderKpiNode(kpi: DraftKpi, depth: number): ReactNode {
-    const children = draft.kpis.filter((k) => k.parentId === kpi.id);
+    const children = childrenByParent.get(kpi.id) ?? [];
     const isCategory = depth === 0 && children.length > 0;
 
     if (isCategory) {
@@ -180,7 +202,13 @@ export function LivePreviewPanel({
               onChange={(e) => patchKpi(kpi.id, { name: e.target.value })}
               className={cn(INLINE_INPUT, "w-full text-xs")}
             />
-            {kpi.status === "proposed" && (
+            {disabled && kpi.guidelinesPending && (
+              <span className="ml-1.5 flex items-center gap-0.5 text-[10px] text-ink-muted" role="status">
+                <Sparkles className="size-2.5 animate-pulse" aria-hidden />
+                writing guidelines…
+              </span>
+            )}
+            {!(disabled && kpi.guidelinesPending) && kpi.status === "proposed" && (
               <span className="ml-1.5 flex items-center gap-0.5 text-[10px] text-lemon-ink">
                 <Sparkles className="size-2.5" aria-hidden />
                 proposed
@@ -355,11 +383,17 @@ export function LivePreviewPanel({
                 <span
                   className={cn(
                     "text-xs font-medium tabular-nums",
-                    weightsOk ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]",
+                    weightsOk
+                      ? "text-[var(--rag-excellent)]"
+                      : stillWeighting
+                        ? "text-ink-muted"
+                        : "text-[var(--rag-poor)]",
                   )}
                   title="Every leaf KPI's weight (categories have none of their own) should sum to 100%"
                 >
-                  Σ {globalSum}%
+                  {stillWeighting
+                    ? `weighting… ${weighting.weighted}/${weighting.total} · Σ ${globalSum}%`
+                    : `Σ ${globalSum}%`}
                 </span>
               )}
             </div>
@@ -428,7 +462,7 @@ export function LivePreviewPanel({
       )}
     </GlassCard>
   );
-}
+});
 
 const INLINE_INPUT =
   "rounded-md border border-transparent bg-transparent px-1.5 py-1 text-ink placeholder:italic placeholder:text-ink-muted transition-colors hover:border-hairline hover:bg-white/60 focus:border-hairline focus:bg-white focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--focus)] disabled:cursor-not-allowed disabled:opacity-60";

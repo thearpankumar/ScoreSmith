@@ -1,7 +1,8 @@
 "use client";
 
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 
+import { listChatSessions } from "@/lib/api-client";
 import type { ChatSession } from "@/lib/types";
 
 interface ChatSessionsContextValue {
@@ -27,6 +28,10 @@ interface ChatSessionsContextValue {
    * chat's draft-editing state. */
   dirty: boolean;
   setDirty: (dirty: boolean) => void;
+  /** Session ids the open chat knows are busy right now (its own turn, before/while the server
+   * reports it) — merged with the server's `turnInProgress` flag for the sidebar badge. */
+  busyIds: ReadonlySet<string>;
+  setSessionBusy: (id: string, busy: boolean) => void;
 }
 
 const ChatSessionsContext = createContext<ChatSessionsContextValue | null>(null);
@@ -58,6 +63,52 @@ export function ChatSessionsProvider({
 }) {
   const [sessions, setSessions] = useState<ChatSession[]>(initialSessions);
   const [dirty, setDirty] = useState(false);
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(() => new Set());
+
+  const setSessionBusy = useCallback((id: string, busy: boolean) => {
+    setBusyIds((prev) => {
+      if (prev.has(id) === busy) return prev;
+      const next = new Set(prev);
+      if (busy) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+
+  // While any listed session is working server-side (e.g. one the user navigated away from, or one
+  // started in another tab), refresh just the `turnInProgress` flags every few seconds so its sidebar
+  // badge clears by itself. Stops as soon as nothing is running; never touches titles/order.
+  const anyServerBusy = sessions.some((s) => s.turnInProgress);
+  useEffect(() => {
+    if (!anyServerBusy) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      try {
+        const fresh = await listChatSessions();
+        if (stopped) return;
+        const busyNow = new Map(fresh.map((f) => [f.id, !!f.turnInProgress]));
+        setSessions((prev) => {
+          let changed = false;
+          const next = prev.map((s) => {
+            const b = busyNow.get(s.id);
+            if (b === undefined || b === !!s.turnInProgress) return s;
+            changed = true;
+            return { ...s, turnInProgress: b };
+          });
+          return changed ? next : prev;
+        });
+      } catch {
+        // transient — try again on the next tick
+      }
+      if (!stopped) timer = setTimeout(tick, 4000);
+    };
+    timer = setTimeout(tick, 4000);
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [anyServerBusy]);
 
   const upsertSessionTitle = useCallback<ChatSessionsContextValue["upsertSessionTitle"]>((id, title, fallback) => {
     if (!title) return;
@@ -89,8 +140,8 @@ export function ChatSessionsProvider({
   }, []);
 
   const value = useMemo<ChatSessionsContextValue>(
-    () => ({ sessions, upsertSessionTitle, removeSession, dirty, setDirty }),
-    [sessions, upsertSessionTitle, removeSession, dirty],
+    () => ({ sessions, upsertSessionTitle, removeSession, dirty, setDirty, busyIds, setSessionBusy }),
+    [sessions, upsertSessionTitle, removeSession, dirty, busyIds, setSessionBusy],
   );
 
   return <ChatSessionsContext.Provider value={value}>{children}</ChatSessionsContext.Provider>;

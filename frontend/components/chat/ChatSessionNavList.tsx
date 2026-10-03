@@ -43,7 +43,7 @@ export function ChatSessionNavList({ activeSessionId }: { activeSessionId: strin
   // Live session list + "does the current chat have unsent edits" flag — both shared via
   // context (see ChatSessionsContext) so they survive session-switch/new-chat navigation
   // instead of resetting to a server-fetched prop on every click.
-  const { sessions, removeSession, dirty } = useChatSessions();
+  const { sessions, removeSession, dirty, busyIds } = useChatSessions();
   const { linkProps, isConfirmOpen, confirmLeave, cancelLeave } = useUnsavedChangesGuard(dirty);
   const router = useRouter();
 
@@ -108,6 +108,7 @@ export function ChatSessionNavList({ activeSessionId }: { activeSessionId: strin
       ) : (
         sessions.map((session) => {
           const active = session.id === activeSessionId;
+          const busy = busyIds.has(session.id) || !!session.turnInProgress;
           return (
             // `group relative` wraps the row's Link + its hover-reveal delete button as
             // SIBLINGS (not delete-button-inside-Link) — nesting a <button> inside the
@@ -124,9 +125,17 @@ export function ChatSessionNavList({ activeSessionId }: { activeSessionId: strin
               >
                 <p className="truncate text-sm font-medium text-ink">{session.title}</p>
                 <div className="mt-1 flex items-center justify-between gap-2">
-                  <Badge variant={STATUS_VARIANT[session.status]} className="text-[10px]">
-                    {session.status}
-                  </Badge>
+                  <span className="flex items-center gap-1.5">
+                    <Badge variant={STATUS_VARIANT[session.status]} className="text-[10px]">
+                      {session.status}
+                    </Badge>
+                    {busy && (
+                      <span className="flex items-center gap-1 text-[10px] text-lemon-ink" role="status">
+                        <Loader2 className="size-3 animate-spin" aria-hidden />
+                        working…
+                      </span>
+                    )}
+                  </span>
                   {/* Locale/timezone-dependent text: server and browser can legitimately
                       render different strings for the same instant. suppressHydrationWarning
                       is React's documented fix (see the hydration-mismatch error's own link)

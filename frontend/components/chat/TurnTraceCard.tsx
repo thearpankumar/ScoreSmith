@@ -1,6 +1,8 @@
-import { AlertTriangle, CheckCircle2, Loader2, Sparkles } from "lucide-react";
+import { memo, useEffect, useMemo, useState } from "react";
+import { AlertTriangle, CheckCircle2, Loader2, Sparkles, X } from "lucide-react";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { ChatTurnEvent } from "@/lib/types";
 
@@ -40,7 +42,21 @@ import type { ChatTurnEvent } from "@/lib/types";
  * Only the LATEST round is ever shown as still "live" (spinner-eligible) — every earlier
  * round necessarily already finished before the next one's angles were even decided.
  */
-export function TurnTraceCard({ events, active }: { events: ChatTurnEvent[]; active: boolean }) {
+export const TurnTraceCard = memo(function TurnTraceCard({
+  events,
+  active,
+  startedAt,
+  onCancel,
+  cancelling,
+}: {
+  events: ChatTurnEvent[];
+  active: boolean;
+  /** Epoch ms the running turn started — shows a live elapsed-time readout while `active`. */
+  startedAt?: number | null;
+  /** Stops the running turn (POST /cancel); the button is hidden when omitted. */
+  onCancel?: () => void;
+  cancelling?: boolean;
+}) {
   if (events.length === 0) {
     // No events have landed yet — e.g. the very first instant of a turn, before the
     // orchestrator's first write reaches the DB, or (for a brand-new chat's very first
@@ -52,6 +68,8 @@ export function TurnTraceCard({ events, active }: { events: ChatTurnEvent[]; act
       <div className="ml-9 flex items-center gap-2 text-xs text-ink-muted" role="status" aria-live="polite">
         <Loader2 className="size-3.5 animate-spin text-lemon-ink" aria-hidden />
         <span>Assistant is getting started…</span>
+        {active && <ElapsedTime startedAt={startedAt} />}
+        {active && onCancel && <CancelButton onCancel={onCancel} cancelling={cancelling} />}
       </div>
     );
   }
@@ -70,6 +88,12 @@ export function TurnTraceCard({ events, active }: { events: ChatTurnEvent[]; act
       <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-ink-muted">
         <Sparkles className="size-3.5 text-lemon-ink" aria-hidden />
         {active ? "Working on it" : "Last turn's activity"}
+        {active && <ElapsedTime startedAt={startedAt} />}
+        {active && onCancel && (
+          <span className="ml-auto normal-case tracking-normal">
+            <CancelButton onCancel={onCancel} cancelling={cancelling} />
+          </span>
+        )}
       </div>
 
       {rounds.map((round) => (
@@ -84,6 +108,32 @@ export function TurnTraceCard({ events, active }: { events: ChatTurnEvent[]; act
         />
       ))}
     </GlassCard>
+  );
+});
+
+/** "· 1m 05s" — ticks once a second, only while mounted (the card unmounts when the turn ends). */
+function ElapsedTime({ startedAt }: { startedAt?: number | null }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  if (!startedAt) return null;
+  const secs = Math.max(0, Math.floor((now - startedAt) / 1000));
+  const label = secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, "0")}s`;
+  return (
+    <span className="font-normal normal-case tracking-normal tabular-nums" aria-label={`Elapsed ${label}`}>
+      · {label}
+    </span>
+  );
+}
+
+function CancelButton({ onCancel, cancelling }: { onCancel: () => void; cancelling?: boolean }) {
+  return (
+    <Button type="button" size="sm" variant="ghost" onClick={onCancel} disabled={cancelling} className="h-6 px-2 text-xs">
+      <X className="size-3" aria-hidden />
+      {cancelling ? "Stopping…" : "Cancel"}
+    </Button>
   );
 }
 
@@ -152,13 +202,20 @@ function ActorTrace({
   active: boolean;
   compact?: boolean;
 }) {
-  const latest = events[events.length - 1];
+  // "timing" events ("Phase 'x' took 3.2s.") are bookkeeping: shown as one compact muted line
+  // instead of crowding out the live steps. Unknown event types fall through and render their
+  // `message` like any other step, so a new backend event type never breaks the card.
+  const timings = useMemo(() => events.filter((e) => e.eventType === "timing").map(compactTiming), [events]);
+  const steps = useMemo(() => events.filter((e) => e.eventType !== "timing"), [events]);
+  if (steps.length === 0) return null;
+  const latest = steps[steps.length - 1];
+  const progress = parseProgress(latest);
   const finished = TERMINAL_EVENT_TYPES.has(latest.eventType);
   const running = active && !finished;
   const errored = latest.eventType === "error";
   // Keep the visible history short — the point is a live, skimmable trace, not a full
   // transcript. Most recent last (rendered bottom-up like a normal log).
-  const visible = events.slice(-4);
+  const visible = steps.slice(-4);
 
   return (
     <div
@@ -194,6 +251,39 @@ function ActorTrace({
           );
         })}
       </ul>
+      {progress && (
+        <div
+          className="mt-1.5 h-1 overflow-hidden rounded-full bg-hairline"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={progress.total}
+          aria-valuenow={progress.done}
+        >
+          <div
+            className="h-full rounded-full bg-lemon-ink/70 transition-[width]"
+            style={{ width: `${Math.min(100, Math.round((progress.done / progress.total) * 100))}%` }}
+          />
+        </div>
+      )}
+      {timings.length > 0 && (
+        <p className="mt-1.5 text-[10px] leading-snug text-ink-muted/70">{timings.join(" · ")}</p>
+      )}
     </div>
   );
+}
+
+/** "Wrote guidelines for 12/35" -> {done: 12, total: 35}; null for any other (or malformed) message. */
+function parseProgress(e: ChatTurnEvent): { done: number; total: number } | null {
+  if (e.eventType !== "guidelines" && e.eventType !== "weighting") return null;
+  const m = /(\d+)\s*\/\s*(\d+)/.exec(e.message);
+  if (!m) return null;
+  const done = Number(m[1]);
+  const total = Number(m[2]);
+  return total > 0 && done <= total ? { done, total } : null;
+}
+
+/** "Phase 'weighting' took 3.2s." -> "weighting 3.2s" (raw message when it doesn't match). */
+function compactTiming(e: ChatTurnEvent): string {
+  const m = /Phase '([^']+)' took ([\d.]+s)/.exec(e.message);
+  return m ? `${m[1]} ${m[2]}` : e.message;
 }

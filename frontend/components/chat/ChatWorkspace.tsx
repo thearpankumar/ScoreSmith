@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -29,12 +29,23 @@ import { Textarea } from "@/components/ui/textarea";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import type { PanelImperativeHandle } from "@/components/ui/resizable";
 import {
+  ApiError,
   BedrockUnavailableError,
+  cancelChatTurn,
   getChatSession,
-  getChatTurnEvents,
-  getChatTurnStatus,
-  sendChatMessage,
+  startChatTurn,
+  watchChatTurn,
 } from "@/lib/api-client";
+import type { ChatTurnFailure, ChatTurnSnapshot } from "@/lib/api-client";
+import {
+  dedupeRetriedMessages,
+  describeDraftEdits,
+  draftSignature,
+  mergeInterimDraft,
+  sameEvents,
+  stripTrailingQuestion,
+  turnFailureMessage,
+} from "@/lib/chat-turn-state";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { useUnsavedChangesGuard } from "@/lib/useUnsavedChangesGuard";
 import { cn } from "@/lib/utils";
@@ -51,6 +62,23 @@ import type {
  * per-viewer UI preference, not app data, so it's persisted client-side only. */
 const PREVIEW_WIDTH_STORAGE_KEY = "qs.livePreviewPanelWidth";
 
+function describeTurnFailure(failure: ChatTurnFailure): string {
+  return turnFailureMessage(failure.code);
+}
+
+function lastIsAssistant(messages: ChatMessage[]): boolean {
+  return messages.length > 0 && messages[messages.length - 1].role === "assistant";
+}
+
+/** The user's last message when the transcript ends on it unanswered after a failed turn — what
+ * "Try again" re-sends (null when there is nothing to retry, e.g. a failed FIRST turn: the backend
+ * only persists a first message once its turn succeeds). */
+function unansweredUserText(messages: ChatMessage[], failure: ChatTurnFailure | undefined): string | null {
+  if (!failure || messages.length === 0) return null;
+  const last = messages[messages.length - 1];
+  return last.role === "user" ? last.content : null;
+}
+
 export function ChatWorkspace({
   session,
   initialMessages,
@@ -59,6 +87,7 @@ export function ChatWorkspace({
   initialSavedScorecardId,
   initialTurnInProgress,
   initialTurnEvents,
+  initialTurnError,
 }: {
   session: ChatSession;
   initialMessages: ChatMessage[];
@@ -78,6 +107,9 @@ export function ChatWorkspace({
    * event log at page-load time — see `getChatTurnEvents`/`TurnTraceCard`. Lets a
    * refreshed page show the in-progress trace immediately instead of starting blank. */
   initialTurnEvents?: ChatTurnEvent[];
+  /** Why the last background turn failed / was cancelled / interrupted (shown with a retry when
+   * the transcript ends on the user's own unanswered message). */
+  initialTurnError?: ChatTurnFailure;
 }) {
   const router = useRouter();
   // The most recent save from this chat — drives the persistent "Saved" banner. A
@@ -96,18 +128,28 @@ export function ChatWorkspace({
   // turn-events (see the two poll effects below and runAssistantTurn's own success
   // path), so a real, AI-generated (or just-changed) title appears in the sidebar
   // without a page reload.
-  const { upsertSessionTitle: upsertSessionTitleInContext, setDirty: setContextDirty } = useChatSessions();
+  const {
+    sessions,
+    upsertSessionTitle: upsertSessionTitleInContext,
+    removeSession,
+    setDirty: setContextDirty,
+    setSessionBusy,
+  } = useChatSessions();
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   // `serverDraft` is the last draft the (authoritative) backend returned; `draft` is what
   // the live preview shows and lets the user edit inline. They differ exactly when the
   // user has made local edits that haven't been sent to the assistant yet.
   const [serverDraft, setServerDraft] = useState<ScorecardDraft>(initialDraft);
   const [draft, setDraft] = useState<ScorecardDraft>(initialDraft);
-  const [lastFailedText, setLastFailedText] = useState<string | null>(null);
+  const [lastFailedText, setLastFailedText] = useState<string | null>(() => unansweredUserText(initialMessages, initialTurnError));
   const [pending, setPending] = useState(false);
   const [composer, setComposer] = useState("");
   const [pendingSuggestion, setPendingSuggestion] = useState<Suggestion | null>(null);
-  const [chatError, setChatError] = useState<string | null>(null);
+  const [chatError, setChatError] = useState<string | null>(() =>
+    initialTurnError && !initialTurnInProgress && !lastIsAssistant(initialMessages)
+      ? turnFailureMessage(initialTurnError.code)
+      : null,
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // The real chat backend is stateful server-side (a LangGraph session keyed by
@@ -124,6 +166,10 @@ export function ChatWorkspace({
   // never mistaken for a still-pending self-adoption.
   const selfAdoptedSessionIdRef = useRef<string | null>(null);
   const initialPromptSentRef = useRef(false);
+  // Always-current copy of `saved` for the (long-lived) turn watcher below, so a turn finishing
+  // never reads a stale "was something already saved?" from its effect closure.
+  const savedRef = useRef<SavedScorecardRef | null>(null);
+  const startingTurnRef = useRef(false);
 
   /** Reflects a real (or changed) title into the sidebar's session list, live — see the
    * context docstring above. Adds a not-yet-listed session (a brand-new chat whose first
@@ -142,6 +188,36 @@ export function ChatWorkspace({
   // by the two polling effects below (one for the refresh-recovery case, one for a turn
   // started locally in this tab).
   const [turnEvents, setTurnEvents] = useState<ChatTurnEvent[]>(initialTurnEvents ?? []);
+  // The backend's INTERIM draft for the running turn (header fields, then the user's KPIs/weights,
+  // then guidelines) — layered over the user's own draft for display only (see `displayDraft`), so
+  // it can never clobber unsent edits and is simply dropped when the turn ends.
+  const [interimDraft, setInterimDraft] = useState<ScorecardDraft | null>(null);
+  // Wall-clock start of the running turn (this tab's, or "now" for one recovered after a refresh)
+  // — drives the elapsed-time readout in the trace card.
+  const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null);
+  // The last status polls failed (network blip / backend restarting): the watcher keeps retrying.
+  const [connectionLost, setConnectionLost] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  // True only for a turn found already running at page load (started elsewhere / before a refresh)
+  // — gates the explanatory "still working" banner and the elapsed-time origin.
+  const [recoveredTurn, setRecoveredTurn] = useState(!!initialTurnInProgress);
+  // Latest-value mirrors for the long-lived turn watcher (see below), which must not read stale
+  // render closures.
+  const messagesRef = useRef<ChatMessage[]>(initialMessages);
+  const lastSentTextRef = useRef<string | null>(null);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+  useEffect(() => {
+    savedRef.current = saved;
+  }, [saved]);
+  // Sidebar "working…" badge for this chat while its turn runs (cleared when it ends or the chat is left).
+  const busy = pending || turnInProgress;
+  useEffect(() => {
+    if (!busy || activeSessionId === "new") return;
+    setSessionBusy(activeSessionId, true);
+    return () => setSessionBusy(activeSessionId, false);
+  }, [busy, activeSessionId, setSessionBusy]);
 
   // STATE-BLEED FIX (see this task's final report for how this was found): `ChatWorkspace`
   // is rendered by `app/chat/[sessionId]/page.tsx` with NO `key` — deliberately, since
@@ -198,10 +274,19 @@ export function ChatWorkspace({
     );
     setTurnInProgress(!!initialTurnInProgress);
     setTurnEvents(initialTurnEvents ?? []);
+    setInterimDraft(null);
+    setTurnStartedAt(null);
+    setRecoveredTurn(!!initialTurnInProgress);
+    setConnectionLost(false);
+    setCancelling(false);
     setComposer("");
     setPendingSuggestion(null);
-    setChatError(null);
-    setLastFailedText(null);
+    setChatError(
+      initialTurnError && !initialTurnInProgress && !lastIsAssistant(initialMessages)
+        ? turnFailureMessage(initialTurnError.code)
+        : null,
+    );
+    setLastFailedText(unansweredUserText(initialMessages, initialTurnError));
     setPending(false);
     // Intentionally omits the initial* props/setters: this effect fires exactly on a
     // session.id/activeSessionId mismatch, and the initial* props are read fresh from
@@ -210,117 +295,146 @@ export function ChatWorkspace({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.id, activeSessionId]);
 
+  // THE turn watcher — the only poller. While a background turn runs (this tab started it, or the
+  // page was loaded/refreshed mid-turn) it polls the session state + trace (see `watchChatTurn`:
+  // sequential, backoff on network errors, faster when the tab is visible) and:
+  //   - mirrors the backend's INTERIM draft into `interimDraft` (the Live preview layers it over
+  //     the user's own edits — see `mergeInterimDraft`), the trace into `turnEvents`, and the
+  //     title into the sidebar, WITHOUT a manual refresh;
+  //   - when the turn ends, reloads the authoritative transcript + draft and applies the outcome
+  //     (reply / clarifying question / similar-suggestion card / saved scorecard / failure).
+  // Aborted (cleanup) on unmount, session switch, or React StrictMode's dev double-invoke, so there
+  // is never more than one watcher; a stale response can't land after cleanup (`ac.signal`).
   useEffect(() => {
-    if (!turnInProgress) return;
-    let cancelled = false;
-    const poll = async () => {
+    if (!turnInProgress || activeSessionId === "new") return;
+    const ac = new AbortController();
+    const sessionId = activeSessionId;
+    let lastInterimSig = "";
+    let startAdjusted = !recoveredTurn;
+    setTurnStartedAt((t) => t ?? Date.now());
+    (async () => {
       try {
-        const [{ turnInProgress: stillRunning, title }, events] = await Promise.all([
-          getChatTurnStatus(activeSessionId),
-          // Best-effort alongside the authoritative turnInProgress flag — a failed
-          // events fetch must never stop the "is it still running" poll from working.
-          getChatTurnEvents(activeSessionId).catch(() => null),
-        ]);
-        if (cancelled) return;
-        if (events) setTurnEvents(events);
-        // Issue 1: the same poll that already watches turn_in_progress also carries the
-        // session's title (generated fast, well before this poll's turn even finishes —
-        // see backend app/api/v1/chat.py::_generate_and_persist_title) — reflect it into
-        // the sidebar live, no reload needed.
-        upsertSessionTitle(activeSessionId, title);
-        if (!stillRunning) {
-          // The turn finished (or its marker went stale) while we weren't watching —
-          // reload the real message log + draft it produced, rather than guessing.
-          const result = await getChatSession(activeSessionId);
-          if (cancelled) return;
-          if (result) {
-            setMessages(result.messages);
-            setServerDraft(result.draft);
-            setDraft(result.draft);
-            setTurnEvents(result.turnEvents);
-            if (result.savedScorecardId) {
-              setSaved({
-                id: result.savedScorecardId,
-                name: result.draft.name ?? "your scorecard",
-                asNewVersion: !!session.targetScorecardId,
-              });
+        const final = await watchChatTurn(sessionId, {
+          signal: ac.signal,
+          onConnection: (ok) => setConnectionLost(!ok),
+          onUpdate: (snap, events) => {
+            if (ac.signal.aborted) return;
+            if (events) setTurnEvents((prev) => (sameEvents(prev, events) ? prev : events));
+            if (!startAdjusted && events && events.length > 0) {
+              // A turn recovered after a refresh: measure elapsed time from its first trace event.
+              startAdjusted = true;
+              const first = Date.parse(events[0].createdAt);
+              if (Number.isFinite(first)) setTurnStartedAt(Math.min(first, Date.now()));
             }
-          }
-          setTurnInProgress(false);
-        }
-      } catch {
-        // Transient network hiccup while polling — keep trying on the next tick rather
-        // than dropping the "still working" indicator on one failed request.
+            upsertSessionTitle(sessionId, snap.title);
+            const sig = draftSignature(snap.draft);
+            if (sig !== lastInterimSig) {
+              lastInterimSig = sig;
+              setInterimDraft(snap.draft);
+            }
+          },
+        });
+        if (ac.signal.aborted) return;
+        await finishTurn(final, ac.signal);
+      } catch (err) {
+        if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
+        // Only a deleted session ends the watch with an error (network errors just retry).
+        setChatError(
+          err instanceof ApiError && err.status === 404
+            ? "This chat no longer exists."
+            : turnFailureMessage("turn_failed"),
+        );
+        endTurnState();
       }
-    };
-    // An immediate poll (not just the interval below) so a refreshed page's trace fills
-    // in as soon as possible, plus a tighter 1.5s cadence (down from the original 4s)
-    // for a genuinely live feel while a turn is actively in progress — this only runs at
-    // all while turnInProgress is true, so an idle session is never polled.
-    poll();
-    const interval = setInterval(poll, 1500);
-    // "Also fetch it on... returning to the tab" — a background tab's timers are
-    // throttled/paused by the browser, so re-poll immediately the moment the tab
-    // becomes visible again instead of waiting for the next throttled interval tick.
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") poll();
-    };
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    };
+    })();
+    return () => ac.abort();
+    // finishTurn/endTurnState/upsertSessionTitle are re-created every render but only read
+    // refs/stable setters (and the latest props via closure at call time) — re-subscribing the
+    // watcher on each render would restart the poll for nothing.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [turnInProgress, activeSessionId]);
 
-  // Second polling loop: a turn sent from THIS tab (`pending`) blocks the whole
-  // `sendChatMessage` call for the turn's full duration (see module docstring on the
-  // synchronous request/response model) — the browser can still fire concurrent
-  // requests alongside that outstanding one, so this polls the same turn-events endpoint
-  // to show live progress DURING that call, not just via the refresh-recovery path
-  // above. Guarded on `activeSessionId !== "new"` — which, for a brand-new chat's very
-  // first message, is now true almost immediately: `runAssistantTurn` generates the real
-  // session id client-side and adopts it (`setActiveSessionId`) before it even starts the
-  // blocking `sendChatMessage` call, rather than waiting for that call to return one (see
-  // its own comment). The very first tick or two of this poll can still 404 (the backend
-  // hasn't committed the session row yet) — swallowed below like any other transient
-  // hiccup, self-healing on the next 1.5s tick once it has.
-  //
-  // Also carries the session's title into the sidebar live (same mechanism as the
-  // turnInProgress poll above) — the ONLY poll running during a same-tab active send, so
-  // this is what makes a brand-new chat's real title (and the session itself) appear in
-  // the sidebar while its first turn is still in flight, not just once it finishes.
-  useEffect(() => {
-    if (!pending || activeSessionId === "new") return;
-    let cancelled = false;
-    const poll = async () => {
+  /** Clears every "a turn is running" flag/overlay (the turn ended one way or another). */
+  function endTurnState() {
+    setTurnInProgress(false);
+    setPending(false);
+    setInterimDraft(null);
+    setConnectionLost(false);
+    setCancelling(false);
+    setTurnStartedAt(null);
+    setRecoveredTurn(false);
+  }
+
+  /** Applies a finished turn's outcome to the screen. */
+  async function finishTurn(final: ChatTurnSnapshot, signal: AbortSignal) {
+    const sessionId = final.sessionId;
+    upsertSessionTitle(sessionId, final.title);
+    // The authoritative transcript + draft + trace (the persisted assistant message carries the
+    // clarifying question). Retried once; if the reload still fails, fall back to the final
+    // poll's own snapshot so the reply is never lost.
+    let loaded: Awaited<ReturnType<typeof getChatSession>> = undefined;
+    for (let attempt = 0; attempt < 2 && loaded === undefined; attempt++) {
       try {
-        const [events, statusResult] = await Promise.all([
-          getChatTurnEvents(activeSessionId).catch(() => null),
-          getChatTurnStatus(activeSessionId).catch(() => null),
-        ]);
-        if (cancelled) return;
-        if (events) setTurnEvents(events);
-        if (statusResult) upsertSessionTitle(activeSessionId, statusResult.title);
+        loaded = await getChatSession(sessionId);
       } catch {
-        // Transient hiccup — next tick (or the final fetch in runAssistantTurn's own
-        // success path) will catch it up.
+        // retry once
       }
-    };
-    poll();
-    const interval = setInterval(poll, 1500);
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") poll();
-    };
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pending, activeSessionId]);
+    }
+    if (signal.aborted) return;
+
+    const failure = final.turnError;
+    if (failure) {
+      // Keep the transcript as shown (a failed FIRST turn's message isn't persisted server-side, so
+      // a reload would drop it) and the user's unsent edits; just say what happened.
+      setTurnEvents(loaded?.turnEvents ?? []);
+      setChatError(describeTurnFailure(failure));
+      const lastUser = [...messagesRef.current].reverse().find((m) => m.role === "user");
+      setLastFailedText(lastSentTextRef.current ?? lastUser?.content ?? null);
+      endTurnState();
+      return;
+    }
+
+    let nextMessages = loaded?.messages;
+    if (nextMessages === undefined || !lastIsAssistant(nextMessages)) {
+      // Fallback (reload failed, or the reply wasn't visible in the reload): append the reply
+      // from the final poll's snapshot to what we already show.
+      const base = nextMessages ?? messagesRef.current;
+      nextMessages = [
+        ...base,
+        {
+          id: `${sessionId}-a-${Date.now()}`,
+          sessionId,
+          role: "assistant",
+          content: final.assistantText,
+          createdAt: new Date().toISOString(),
+          clarifyingQuestion: final.clarifyingQuestion,
+        },
+      ];
+    }
+    if (final.similarSuggestions && final.similarSuggestions.length > 0) {
+      // The graph's check_similarity node paused before generating KPIs — surface the card.
+      setPendingSuggestion(final.similarSuggestions[0]);
+    }
+    if (final.materializedScorecardId) {
+      // The draft was just confirmed AND saved as a real scorecard — attach an unmissable
+      // confirmation to this turn's reply (a distinct card in the transcript) and raise the
+      // persistent banner above the transcript.
+      const ref: SavedScorecardRef = {
+        id: final.materializedScorecardId,
+        name: final.draft.name ?? "Untitled scorecard",
+        asNewVersion: !!session.targetScorecardId || savedRef.current !== null,
+      };
+      const lastIdx = nextMessages.length - 1;
+      nextMessages = nextMessages.map((m, i) => (i === lastIdx ? { ...m, savedScorecard: ref } : m));
+      setSaved(ref);
+    }
+    const finalDraft = loaded?.draft ?? final.draft;
+    setMessages(nextMessages);
+    setServerDraft(finalDraft);
+    setDraft(finalDraft);
+    setTurnEvents(loaded?.turnEvents ?? []);
+    endTurnState();
+  }
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -348,12 +462,20 @@ export function ChatWorkspace({
   // Nothing to preview yet on a brand-new chat (no purpose, no KPIs, no target score) —
   // don't show an empty "Live preview" card as the default state; it appears once the
   // assistant has proposed something, or the user has made a local edit to show.
+  // What the preview shows: while a turn runs, the backend's interim draft (name/purpose/audience/
+  // target within seconds, then the KPIs + weights, then guidelines) layered over the user's own
+  // draft WITHOUT overwriting fields they edited; otherwise just the draft. Memoized so a poll that
+  // returns the same interim draft doesn't re-render the (potentially 100+ row) KPI tree.
+  const displayDraft = useMemo(
+    () => (turnInProgress ? mergeInterimDraft(draft, serverDraft, interimDraft) : draft),
+    [turnInProgress, draft, serverDraft, interimDraft],
+  );
   const hasDraftContent =
-    !!draft.name ||
-    !!draft.purposeStatement ||
-    !!draft.scope ||
-    draft.targetScore != null ||
-    draft.kpis.length > 0;
+    !!displayDraft.name ||
+    !!displayDraft.purposeStatement ||
+    !!displayDraft.scope ||
+    displayDraft.targetScore != null ||
+    displayDraft.kpis.length > 0;
   const showPreview = hasDraftContent || dirty;
 
   // Preview edits live only in this tab until a chat turn carries them to the server —
@@ -375,25 +497,30 @@ export function ChatWorkspace({
   const navGuard = useUnsavedChangesGuard(dirty);
 
   async function runAssistantTurn(text: string) {
+    // Double-submit guard (the composer/buttons are disabled too, but retry links, chips and the
+    // initial-prompt effect all call in here): one turn at a time per session, enforced
+    // synchronously via a ref since state updates are async.
+    if (startingTurnRef.current) return;
+    startingTurnRef.current = true;
     setPending(true);
     setChatError(null);
     setLastFailedText(null);
+    setPendingSuggestion(null);
+    lastSentTextRef.current = text;
     // A new turn starting server-side prunes the previous turn's chat_turn_events (see
     // `_mark_turn_in_progress` in app/api/v1/chat.py) — clear the client's copy too so a
     // stale trace from the last turn never lingers under the new "in progress" state.
     setTurnEvents([]);
+    setInterimDraft(null);
     // Fold any unsent inline preview edits into this turn so the assistant applies them
     // to the server-side draft via its own update_draft tool (see LivePreviewPanel).
     const outgoing = editSummary ? `${text}\n\n${editSummary}` : text;
 
-    // Sidebar-live-update fix: a brand-new chat's first turn used to have NO real session
-    // id to adopt/poll with until this whole (20-200+s) blocking call returned — so the
-    // sidebar never learned about it, and the turn-events poll above stayed off, until
-    // then. Generating the id ourselves (a plain random UUID — the backend accepts and
-    // uses it verbatim, see ChatSessionStart.session_id) and adopting it right now, before
-    // the request is even sent, means: the URL, the turn-events/title poll above (its
-    // `activeSessionId !== "new"` guard), and an optimistic sidebar placeholder are all
-    // live immediately, not just once the graph run finishes.
+    // Sidebar-live-update fix: a brand-new chat has no real session id until the backend creates
+    // one. Generating the id ourselves (a plain random UUID — the backend accepts and uses it
+    // verbatim, see ChatSessionStart.session_id) and adopting it right now, before the request is
+    // even sent, means the URL, the turn watcher and an optimistic sidebar placeholder are all
+    // live immediately.
     const isFirstTurnOfNewSession = activeSessionId === "new";
     const clientSessionId = isFirstTurnOfNewSession ? crypto.randomUUID() : undefined;
     if (isFirstTurnOfNewSession && clientSessionId) {
@@ -403,72 +530,86 @@ export function ChatWorkspace({
       // this in-flight turn's state out from under it.
       selfAdoptedSessionIdRef.current = clientSessionId;
       setActiveSessionId(clientSessionId);
-      router.replace(`/chat/${clientSessionId}`, { scroll: false });
-      // Real title lands within a second or two (see the poll above /
-      // _generate_and_persist_title) and upgrades this placeholder — upsertSessionTitle
-      // no-ops on a null/empty title, so this placeholder is never blanked out by a
-      // slow/failed title-generation call racing it.
+      // (The URL is switched only AFTER the POST below created the session row — replacing it
+      // first would let the page's server render race the row and 404 into notFound().)
+      // Real title lands within a second or two (the watcher carries it into the sidebar as
+      // soon as the backend has generated it) and upgrades this placeholder —
+      // upsertSessionTitle no-ops on a null/empty title, so this placeholder is never blanked
+      // out by a slow/failed title-generation call racing it.
       upsertSessionTitle(clientSessionId, "New chat");
     }
 
     try {
-      const result = await sendChatMessage({
+      // POST returns 202 at once with the turn running in the background; flipping
+      // `turnInProgress` hands over to the turn watcher effect (the single poller).
+      const started = await startChatTurn({
         sessionId: isFirstTurnOfNewSession ? "new" : activeSessionId,
         clientSessionId,
         message: outgoing,
       });
-      if (result.sessionId !== activeSessionId && !isFirstTurnOfNewSession) {
-        // Defensive fallback only — the "new" case above already adopted the real id
-        // before this call started, so this branch is a no-op on that path (result.
-        // sessionId === clientSessionId === the already-adopted activeSessionId). Also
-        // marked as a self-adoption (see the resync effect above) for the same reason.
-        selfAdoptedSessionIdRef.current = result.sessionId;
-        setActiveSessionId(result.sessionId);
-        router.replace(`/chat/${result.sessionId}`, { scroll: false });
+      upsertSessionTitle(started.sessionId, started.title);
+      if (isFirstTurnOfNewSession) {
+        router.replace(`/chat/${started.sessionId}`, { scroll: false });
+      } else if (started.sessionId !== activeSessionId) {
+        // Defensive fallback only (see the resync effect above).
+        selfAdoptedSessionIdRef.current = started.sessionId;
+        setActiveSessionId(started.sessionId);
+        router.replace(`/chat/${started.sessionId}`, { scroll: false });
       }
-      // Issue 1: a brand-new session's real title is already on THIS response (generated
-      // fast, before the graph even ran — see _generate_and_persist_title) — reflect it
-      // into the sidebar immediately, same mechanism as the poll above.
-      upsertSessionTitle(result.sessionId, result.title);
-      if (result.similarSuggestions && result.similarSuggestions.length > 0) {
-        // The chat graph's own check_similarity node (see
-        // backend/app/ai/scorecard_builder.py) paused *before* propose_kpis ran — "reuse
-        // suggestions before generating from scratch" per the plan. Surface the card;
-        // no assistant message/draft update happened on this turn.
-        setPendingSuggestion(result.similarSuggestions[0]);
+      if (started.turnInProgress) {
+        setTurnStartedAt(Date.now());
+        setTurnInProgress(true);
+        setPending(false);
       } else {
-        let assistantMessage = result.assistantMessage;
-        if (result.materializedScorecardId) {
-          // The draft was just confirmed AND saved as a real scorecard — attach an
-          // unmissable confirmation to this turn (rendered as a distinct card in the
-          // transcript) and raise the persistent banner above the transcript.
-          const ref: SavedScorecardRef = {
-            id: result.materializedScorecardId,
-            name: result.draft.name ?? "Untitled scorecard",
-            asNewVersion: !!session.targetScorecardId || saved !== null,
-          };
-          assistantMessage = { ...assistantMessage, savedScorecard: ref };
-          setSaved(ref);
-        }
-        setMessages((prev) => [...prev, assistantMessage]);
-        setServerDraft(result.draft);
-        setDraft(result.draft);
+        // Inline/legacy backend mode: the POST already carries the finished turn.
+        await finishTurn(started, new AbortController().signal);
       }
     } catch (err) {
-      // The chat builder calls AWS Bedrock (Converse / Titan embeddings) — an
-      // environment with no AWS credentials fails every such call. Show a clear,
-      // friendly reason instead of crashing or spinning forever; the user's own message
-      // above is kept in the transcript either way.
-      // Note: edits in the live preview only reach the saved scorecard through the
-      // assistant, so the message must not suggest "filling it in manually" saves anything.
-      setChatError(
-        err instanceof BedrockUnavailableError
-          ? "The AI assistant is temporarily unavailable, so nothing was changed or saved. Your draft and any unsent edits are kept here — try again in a few minutes."
-          : "Something went wrong reaching the assistant. Nothing was saved — please try again.",
-      );
-      setLastFailedText(text);
+      // The chat builder calls AWS Bedrock — an environment with no AWS credentials fails every
+      // such call. Show a clear, friendly reason instead of crashing or spinning forever; the
+      // user's own message above is kept in the transcript either way.
+      // Note: edits in the live preview only reach the saved scorecard through the assistant,
+      // so the message must not suggest "filling it in manually" saves anything.
+      if (err instanceof ApiError && err.status === 409) {
+        // Another turn is already running for this session (e.g. started from a second tab):
+        // don't fail — attach to it; the watcher takes over and the reply shows up by itself.
+        setTurnStartedAt(Date.now());
+        setTurnInProgress(true);
+        setPending(false);
+        setChatError(
+          "The assistant was still working on your previous message, so this one wasn't sent. Once it finishes, send it again.",
+        );
+        setLastFailedText(text);
+      } else {
+        if (isFirstTurnOfNewSession && clientSessionId) {
+          // The session was never created: undo the optimistic adoption (id + sidebar entry) so a
+          // retry starts a fresh "new" session instead of posting to a session that doesn't exist.
+          selfAdoptedSessionIdRef.current = null;
+          setActiveSessionId("new");
+          removeSession(clientSessionId);
+        }
+        setChatError(
+          err instanceof BedrockUnavailableError
+            ? turnFailureMessage("bedrock_unavailable")
+            : turnFailureMessage("turn_failed"),
+        );
+        setLastFailedText(text);
+        setPending(false);
+      }
     } finally {
-      setPending(false);
+      startingTurnRef.current = false;
+    }
+  }
+
+  /** Stops the running turn (POST /cancel); the watcher then reports it as "cancelled". */
+  async function handleCancelTurn() {
+    if (cancelling || activeSessionId === "new") return;
+    setCancelling(true);
+    try {
+      await cancelChatTurn(activeSessionId);
+    } catch {
+      // The turn may have finished by itself in the meantime — the watcher settles the state.
+      setCancelling(false);
     }
   }
 
@@ -549,6 +690,10 @@ export function ChatWorkspace({
     }
   }, [isDesktop, showPreview]);
 
+  // The session title is generated asynchronously by the backend and lands in the sidebar list
+  // (via the watcher); mirror it in this header too instead of the stale server-rendered prop.
+  const liveTitle = sessions.find((s) => s.id === activeSessionId)?.title ?? session.title;
+
   const chatCard = (
     <GlassCard
       elevation={1}
@@ -556,7 +701,7 @@ export function ChatWorkspace({
     >
         <div className="flex items-center justify-between gap-3 border-b border-hairline px-5 py-3.5">
           <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-ink">{session.title}</p>
+            <p className="truncate text-sm font-semibold text-ink">{liveTitle}</p>
             <p className="truncate text-xs text-ink-muted">{session.contextSummary}</p>
           </div>
           <div className="flex shrink-0 items-center gap-1.5 xl:hidden">
@@ -570,14 +715,25 @@ export function ChatWorkspace({
               <Button asChild variant="outline" size="sm">
                 <a href="#live-preview">
                   <FileText className="size-3.5" aria-hidden />
-                  Preview{draft.kpis.length > 0 ? ` (${draft.kpis.length})` : ""}
+                  Preview{displayDraft.kpis.length > 0 ? ` (${displayDraft.kpis.length})` : ""}
                 </a>
               </Button>
             )}
           </div>
         </div>
 
-        {turnInProgress && !pending && (
+        {connectionLost && turnInProgress && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-center gap-2 border-b border-hairline bg-[var(--rag-poor)]/5 px-5 py-2 text-xs text-ink"
+          >
+            <AlertTriangle className="size-3.5 shrink-0 text-[var(--rag-poor)]" aria-hidden />
+            <span>Lost contact with the server — retrying automatically. The assistant keeps working meanwhile.</span>
+          </div>
+        )}
+
+        {turnInProgress && recoveredTurn && (
           // Refresh-recovery indicator (Part A): a turn is still running server-side —
           // e.g. the page was reloaded mid multi-agent research fan-out, from a
           // *different* tab/request than this one. Persistent — stays up across
@@ -625,9 +781,15 @@ export function ChatWorkspace({
               propose KPIs. You can also fill in the live preview directly.
             </p>
           )}
-          {messages.map((message) => (
+          {dedupeRetriedMessages(messages).map((message) => (
             <div key={message.id} className="space-y-2">
-              <MessageBubble message={message} />
+              <MessageBubble
+                message={
+                  message.clarifyingQuestion
+                    ? { ...message, content: stripTrailingQuestion(message.content, message.clarifyingQuestion.question) }
+                    : message
+                }
+              />
               {message.savedScorecard && (
                 <SavedScorecardBanner saved={message.savedScorecard} variant="inline" linkProps={navGuard.linkProps} />
               )}
@@ -647,7 +809,15 @@ export function ChatWorkspace({
               disabled={pending || turnInProgress}
             />
           )}
-          {(pending || turnInProgress) && <TurnTraceCard events={turnEvents} active={pending || turnInProgress} />}
+          {(pending || turnInProgress) && (
+            <TurnTraceCard
+              events={turnEvents}
+              active={pending || turnInProgress}
+              startedAt={turnStartedAt}
+              onCancel={turnInProgress && activeSessionId !== "new" ? handleCancelTurn : undefined}
+              cancelling={cancelling}
+            />
+          )}
           {chatError && (
             // Rendered IN the transcript (where the assistant's reply would have
             // appeared), not as a small footer line, so a failed turn is never mistaken
@@ -672,7 +842,7 @@ export function ChatWorkspace({
                       size="sm"
                       variant="outline"
                       onClick={() => runAssistantTurn(lastFailedText)}
-                      disabled={pending}
+                      disabled={pending || turnInProgress}
                     >
                       <RotateCcw className="size-3.5" aria-hidden />
                       Try again
@@ -766,13 +936,26 @@ export function ChatWorkspace({
       </GlassCard>
   );
 
+  // Stable callbacks (reading the latest handler/draft through refs) so the memoized preview
+  // panel only re-renders when its draft/flags actually change — not on every trace/poll update.
+  const sendEditsRef = useRef(handleSendEdits);
+  const serverDraftRef = useRef(serverDraft);
+  useEffect(() => {
+    sendEditsRef.current = handleSendEdits;
+    serverDraftRef.current = serverDraft;
+  });
+  const onPreviewSendEdits = useCallback(() => {
+    void sendEditsRef.current();
+  }, []);
+  const onPreviewDiscardEdits = useCallback(() => setDraft(serverDraftRef.current), []);
+
   const previewPanel = showPreview && (
     <LivePreviewPanel
-      draft={draft}
+      draft={displayDraft}
       onChange={setDraft}
       dirty={dirty}
-      onSendEdits={handleSendEdits}
-      onDiscardEdits={() => setDraft(serverDraft)}
+      onSendEdits={onPreviewSendEdits}
+      onDiscardEdits={onPreviewDiscardEdits}
       disabled={pending || turnInProgress}
       className={isDesktop ? "h-full" : "w-full shrink-0 scroll-mt-4"}
     />
@@ -892,63 +1075,4 @@ function SavedScorecardBanner({
       </Button>
     </GlassCard>
   );
-}
-
-/**
- * Plain-language summary of how the locally-edited draft differs from the last
- * server draft, or null when there are no edits. Appended to the next chat message so
- * the assistant can apply the edits through its own update_draft tool.
- */
-function describeDraftEdits(server: ScorecardDraft, local: ScorecardDraft): string | null {
-  const changes: string[] = [];
-  const fmt = (v: string | number | null) => (v === null || v === "" ? "(cleared)" : `"${v}"`);
-  if ((server.name ?? "") !== (local.name ?? "")) changes.push(`- Scorecard name: ${fmt(local.name)}`);
-  if ((server.purposeStatement ?? "") !== (local.purposeStatement ?? ""))
-    changes.push(`- Purpose: ${fmt(local.purposeStatement)}`);
-  if ((server.scope ?? "") !== (local.scope ?? "")) changes.push(`- Scope / audience: ${fmt(local.scope)}`);
-  if (server.targetScore !== local.targetScore) changes.push(`- Target score: ${fmt(local.targetScore)}`);
-
-  const serverById = new Map(server.kpis.map((k) => [k.id, k]));
-  const localIds = new Set(local.kpis.map((k) => k.id));
-  const removed = server.kpis.filter((k) => !localIds.has(k.id));
-  const kpiChanged =
-    removed.length > 0 ||
-    local.kpis.some((k) => {
-      const before = serverById.get(k.id);
-      return !before || before.name !== k.name || before.weight !== k.weight || before.includedInScoring !== k.includedInScoring;
-    });
-
-  if (removed.length > 0) changes.push(`- Remove KPIs: ${removed.map((k) => `"${k.name}"`).join(", ")}`);
-  if (kpiChanged) {
-    const byId = new Map(local.kpis.map((k) => [k.id, k]));
-    // Only LEAF KPIs (nothing else nested under them) carry a weight — a category has
-    // none of its own (see backend migration 0008_category_nodes_no_weight), so it's
-    // described without a "%" that would otherwise misleadingly read as a real value.
-    const parentIds = new Set(local.kpis.map((k) => k.parentId).filter((id): id is string => id !== null));
-    const list = local.kpis
-      .map((k) => {
-        const parent = k.parentId ? byId.get(k.parentId) : undefined;
-        const excluded = k.includedInScoring === false ? " [excluded from the weighted score]" : "";
-        const isLeaf = !parentIds.has(k.id);
-        const weightLabel = isLeaf ? ` ${k.weight ?? 0}%` : " (category, no weight)";
-        return `"${k.name}"${weightLabel}${parent ? ` (under "${parent.name}")` : ""}${excluded}`;
-      })
-      .join("; ");
-    changes.push(`- KPI list should now be exactly: ${list || "(none)"} (use each KPI's included_in_scoring flag as noted)`);
-  }
-
-  // Issue 2 (see task notes): a scoring-formula edit made directly in the live preview
-  // panel (see LivePreviewPanel) is carried to the assistant the same way as every other
-  // field here — it applies it via its own `update_scoring_formula` tool, never a direct
-  // draft field write.
-  if ((server.scoringFormula ?? null) !== (local.scoringFormula ?? null)) {
-    changes.push(
-      local.scoringFormula
-        ? `- Scoring formula: set it to exactly ${JSON.stringify(local.scoringFormula)}`
-        : "- Scoring formula: clear the custom formula (revert to the default weighted average)",
-    );
-  }
-
-  if (changes.length === 0) return null;
-  return `[Edits I made directly in the live preview — please apply them to the draft:\n${changes.join("\n")}]`;
 }

@@ -32,7 +32,7 @@ from app.deps import get_bedrock_client, get_web_search_client
 from app.main import app
 from app.models.chat_session import ChatSession
 from app.models.chat_turn_event import ChatTurnEvent
-from tests.fakes import FakeBedrockClient, FakeWebSearchClient, search_result, tool_use_result
+from tests.fakes import FakeBedrockClient, FakeWebSearchClient, full_rubric, search_result, tool_use_result
 
 pytestmark = pytest.mark.usefixtures("_migrated_db")
 
@@ -52,10 +52,7 @@ _COMPLETE_PATCH = {
             "name": "Compliance Coverage",
             "weight": 100,
             "level": 1,
-            "guidelines": {
-                "10": {"qualitative_text": "Fully covers required controls."},
-                "0": {"qualitative_text": "No coverage."},
-            },
+            "guidelines": full_rubric(),
         },
     ],
 }

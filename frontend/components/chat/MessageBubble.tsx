@@ -1,5 +1,6 @@
 import { Bot, User } from "lucide-react";
 
+import { stripEditSummary } from "@/lib/chat-turn-state";
 import { cn } from "@/lib/utils";
 import type { ChatMessage } from "@/lib/types";
 
@@ -25,7 +26,7 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
           isUser ? "bg-lemon-soft text-ink" : "glass-elev-1 text-ink",
         )}
       >
-        <MarkdownContent content={message.content} />
+        <MarkdownContent content={isUser ? stripEditSummary(message.content) : message.content} />
       </div>
     </div>
   );
