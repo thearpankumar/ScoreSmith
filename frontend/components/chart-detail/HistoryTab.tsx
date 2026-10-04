@@ -5,13 +5,9 @@ import { SolidPanel } from "@/components/design-system/SolidPanel";
 import { RagBadge } from "@/components/design-system/RagBadge";
 import { Badge } from "@/components/ui/badge";
 import { formatDateTime } from "@/lib/utils";
-import type { Evaluation, EvaluationStatus } from "@/lib/types";
+import { EvaluationStatusBadge } from "@/components/evaluations/EvaluationStatusBadge";
+import type { Evaluation } from "@/lib/types";
 
-const UNSCORED_LABEL: Record<Exclude<EvaluationStatus, "completed">, string> = {
-  failed: "Not scored",
-  pending: "Pending",
-  in_progress: "In progress",
-};
 
 /**
  * Every evaluation of this scorecard, across ALL of its versions. When the scorecard has
@@ -74,7 +70,7 @@ export function HistoryTab({
               {evaluation.status === "completed" ? (
                 <RagBadge score={evaluation.finalWeightedScore} size="sm" />
               ) : (
-                <Badge variant="muted">{UNSCORED_LABEL[evaluation.status]}</Badge>
+                <EvaluationStatusBadge evaluation={evaluation} />
               )}
               <ChevronRight className="size-4 text-ink-muted" aria-hidden />
             </div>

@@ -36,6 +36,7 @@ class EvaluationKpiResultRead(ORMBase):
     needs_review: bool
     score_variance: float | None
     ensemble_raw_scores: dict | list | None
+    jev_raw: dict | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -70,6 +71,19 @@ class EvaluationRead(ORMBase):
     domain: str | None
     created_at: datetime
     updated_at: datetime
+    # AI evaluation pipeline fields (EvaluationSummary in docs/ai-eval-contract.md)
+    stage: str | None = None
+    subject_name: str | None = None
+    subject_email: str | None = None
+    batch_id: uuid.UUID | None = None
+    source_kind: str | None = None
+    direction_prompt: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    attempt: int = 1
+    queued_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
 
 class EvaluationReadWithResults(EvaluationRead):

@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { ScoringFormulaPanel } from "@/components/chart-detail/ScoringFormulaPanel";
 import { validateScoringFormulaDraft } from "@/lib/api-client";
 import { siblingWeightSum } from "@/lib/kpi-tree";
-import { weightedLeafProgress } from "@/lib/chat-turn-state";
+import { draftKpiCounts, weightedLeafProgress } from "@/lib/chat-turn-state";
 import { cn } from "@/lib/utils";
 import type { DraftKpi, ScorecardDraft } from "@/lib/types";
 
@@ -377,7 +377,16 @@ export const LivePreviewPanel = memo(function LivePreviewPanel({
           <div>
             <div className="mb-2 flex items-center justify-between gap-2">
               <p className="text-xs font-semibold uppercase tracking-wide text-ink-muted">
-                KPIs {draft.kpis.length > 0 && <span className="normal-case">({draft.kpis.length})</span>}
+                KPIs{" "}
+                {draft.kpis.length > 0 && (
+                  <span className="normal-case">
+                    ({draftKpiCounts(draft.kpis).kpis}
+                    {draftKpiCounts(draft.kpis).categories > 0
+                      ? ` in ${draftKpiCounts(draft.kpis).categories} categories`
+                      : ""}
+                    )
+                  </span>
+                )}
               </p>
               {topLevel.length > 0 && (
                 <span

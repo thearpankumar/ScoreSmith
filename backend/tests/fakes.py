@@ -82,6 +82,7 @@ class FakeBedrockClient:
         tools: list[Any] | None = None,
         force_tool_use: bool = False,
         model_id: str | None = None,
+        temperature: float | None = None,
     ) -> ConverseResult:
         # The lock only guards the shared `calls`/`script` list mutations, NOT the actual
         # `converse_fn` invocation. Concurrent callers (scorecard_builder.py's research
@@ -272,3 +273,221 @@ def full_rubric(text: str = "Level") -> dict[str, dict[str, Any]]:
     """A complete, distinct 11-level (0-10) guideline set — a leaf KPI is only complete (confirmable,
     materializable) with every level present."""
     return {str(i): {"qualitative_text": f"{text} {i}", "quantitative_criteria": None} for i in range(11)}
+
+
+# --- AI evaluation pipeline fakes ---------------------------------------------------------------------
+
+DEFAULT_QUOTE = "Our solution reduces fleet downtime by 30 percent"
+
+
+def default_corpus(evaluation_id: str, quote: str = DEFAULT_QUOTE) -> dict[str, Any]:
+    return {
+        "evaluation_id": evaluation_id,
+        "built_at": "2026-10-04T00:00:00Z",
+        "stats": {"docs": 1, "videos": 0, "images": 0, "words": 40},
+        "warnings": [],
+        "sections": [
+            {
+                "id": "s001",
+                "source_id": "src1",
+                "source_name": "report.pdf",
+                "kind": "doc",
+                "label": "DOC report.pdf p1",
+                "text": f"FleetPulse by Jane Doe (jane@example.com). {quote}. It uses telemetry and ML models.",
+            },
+            {
+                "id": "s002",
+                "source_id": "src1",
+                "source_name": "report.pdf",
+                "kind": "doc",
+                "label": "DOC report.pdf p2",
+                "text": "The architecture has an ingestion layer, a feature store and a dashboard for dispatchers.",
+            },
+        ],
+    }
+
+
+class FakeAwsJobs:
+    """In-memory `AwsJobsProtocol`. Executions stay RUNNING while `hold` is true (finish them with
+    `finish(evaluation_id, ...)`); otherwise they end immediately with `default_outcome`."""
+
+    def __init__(self, *, hold: bool = False, default_outcome: str = "SUCCEEDED") -> None:
+        self.hold = hold
+        self.default_outcome = default_outcome
+        self.objects: dict[str, bytes] = {}
+        self.json_objects: dict[str, dict[str, Any]] = {}
+        self.multiparts: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.aborted: list[tuple[str, str]] = []
+        self.deleted: list[str] = []
+        self.executions: dict[str, dict[str, Any]] = {}
+        self.start_names: list[str] = []
+        self.start_payloads: list[dict[str, Any]] = []
+        self.stopped: list[str] = []
+        self.corpus_text: str | None = None
+        self.fail_start: Exception | None = None
+        self._lock = threading.Lock()
+
+    # --- S3 ---
+    def create_multipart(self, key: str, content_type: str | None) -> str:
+        upload_id = f"up-{len(self.multiparts) + 1}"
+        self.multiparts[(key, upload_id)] = []
+        return upload_id
+
+    def presign_part(self, key: str, upload_id: str, part_number: int, expires: int) -> str:
+        return f"https://s3.fake/{key}?uploadId={upload_id}&partNumber={part_number}&expires={expires}"
+
+    def complete_multipart(self, key: str, upload_id: str, parts: list[dict[str, Any]]) -> None:
+        if (key, upload_id) not in self.multiparts:
+            from app.pipeline.aws_jobs import AwsJobsError
+
+            raise AwsJobsError("NoSuchUpload")
+        self.multiparts[(key, upload_id)] = parts
+        self.objects.setdefault(key, b"")
+
+    def abort_multipart(self, key: str, upload_id: str) -> None:
+        self.aborted.append((key, upload_id))
+        self.multiparts.pop((key, upload_id), None)
+
+    def put_object(self, key: str, data: bytes) -> None:
+        self.objects[key] = data
+
+    def head_object(self, key: str):
+        from app.pipeline.aws_jobs import ObjectHead
+
+        if key not in self.objects:
+            return None
+        return ObjectHead(size=len(self.objects[key]))
+
+    def read_range(self, key: str, start: int, length: int) -> bytes:
+        return self.objects[key][start : start + length]
+
+    def get_object_bytes(self, key: str, max_bytes: int) -> bytes:
+        return self.objects[key]
+
+    def delete_object(self, key: str) -> None:
+        self.deleted.append(key)
+        self.objects.pop(key, None)
+
+    def read_json(self, key: str) -> dict[str, Any] | None:
+        return self.json_objects.get(key)
+
+    # --- Step Functions ---
+    def start_execution(self, name: str, payload: dict[str, Any]) -> str:
+        if self.fail_start is not None:
+            raise self.fail_start
+        with self._lock:
+            self.start_names.append(name)
+            self.start_payloads.append(payload)
+            arn = f"arn:aws:states:us-east-1:123:execution:qs-eval-pipeline:{name}"
+            self.executions[arn] = {"status": "RUNNING", "payload": payload, "name": name}
+        if not self.hold:
+            self.finish(payload["evaluation_id"], self.default_outcome)
+        return arn
+
+    def describe_execution(self, arn: str):
+        from app.pipeline.aws_jobs import ExecutionInfo
+
+        ex = self.executions[arn]
+        return ExecutionInfo(status=ex["status"], error=ex.get("error"), cause=ex.get("cause"))
+
+    def stop_execution(self, arn: str, cause: str) -> None:
+        self.stopped.append(arn)
+        if arn in self.executions:
+            self.executions[arn]["status"] = "ABORTED"
+
+    # --- test controls ---
+    def finish(
+        self,
+        evaluation_id: str,
+        outcome: str = "SUCCEEDED",
+        *,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        corpus: dict[str, Any] | None = None,
+    ) -> None:
+        arn = next(
+            (a for a, e in reversed(list(self.executions.items())) if e["payload"]["evaluation_id"] == evaluation_id),
+            None,
+        )
+        assert arn is not None, f"no execution for {evaluation_id}"
+        base = f"derived/{evaluation_id}"
+        if outcome == "SUCCEEDED":
+            if corpus is not None:
+                self.json_objects[f"{base}/corpus.json"] = corpus
+            elif f"{base}/corpus.json" not in self.json_objects:
+                text = self.corpus_text or DEFAULT_QUOTE
+                self.json_objects[f"{base}/corpus.json"] = default_corpus(evaluation_id, text)
+        elif error_code:
+            self.json_objects[f"{base}/status.json"] = {
+                "error_code": error_code,
+                "error_message": error_message or error_code,
+            }
+        self.executions[arn]["status"] = outcome
+
+    def set_progress(self, evaluation_id: str, progress: dict[str, Any]) -> None:
+        self.json_objects[f"derived/{evaluation_id}/progress.json"] = progress
+
+
+class FakeJevScoreClient:
+    """Implements `JevScoreClientProtocol`. `position` is the 0-indexed criteria position returned."""
+
+    def __init__(self, position: float = 6.0, noul: float | None = 0.9, fail: bool = False) -> None:
+        self.position = position
+        self.noul = noul
+        self.fail = fail
+        self.calls: list[dict[str, Any]] = []
+
+    async def score(
+        self, *, state: dict[str, Any], instructions: str, criteria: list[str], relevance_instructions: str
+    ):
+        from app.ai.jev_client import JevUnavailableError
+        from app.pipeline.jev_scorer import JevScoreAnswer
+
+        self.calls.append({"state": state, "criteria": criteria})
+        if self.fail:
+            raise JevUnavailableError("jev down")
+        n = len(criteria)
+        probs = [0.0] * n
+        probs[min(n - 1, int(round(self.position)))] = 1.0
+        return JevScoreAnswer(position=self.position, probabilities=probs, confidence=0.8, noul=self.noul)
+
+
+def master_converse_fn(quote: str = DEFAULT_QUOTE, *, bad_quote: str | None = None, judge_score: int = 5):
+    """A `FakeBedrockClient.converse_fn` answering every master-model tool of the scoring pipeline."""
+
+    def fn(*, messages, system, tools, force_tool_use, model_id):
+        name = tools[0].name if tools else None
+        if name == "record_identity":
+            return tool_use_result("record_identity", {"name": "Jane Doe", "email": "jane@example.com"})
+        if name == "record_digest":
+            import re as _re
+
+            ids = _re.findall(r"^\[(s\d+)\]", messages[0]["content"][0]["text"], flags=_re.MULTILINE)
+            return tool_use_result("record_digest", {"items": [{"id": i, "summary": f"summary {i}"} for i in ids]})
+        if name == "pick_sections":
+            return tool_use_result("pick_sections", {"section_ids": ["s001"]})
+        if name == "record_evidence":
+            snippets = [{"section_id": "s001", "quote": quote}]
+            if bad_quote:
+                snippets.append({"section_id": "s001", "quote": bad_quote})
+            return tool_use_result("record_evidence", {"snippets": snippets})
+        if name == "record_reasoning":
+            return tool_use_result("record_reasoning", {"reasoning": "Because the evidence shows it."})
+        if name == "map_columns":
+            return tool_use_result(
+                "map_columns",
+                {"email": "Email Address", "name": "Name", "drive_url": "Google Drive URL", "timestamp": "Timestamp"},
+            )
+        if name == "record_kpi_judgment":
+            return tool_use_result(
+                "record_kpi_judgment",
+                {
+                    "matched_level": judge_score,
+                    "evidence_quotes": [quote],
+                    "reasoning": "GLM fallback.",
+                    "score": judge_score,
+                },
+            )
+        return text_result("ok")
+
+    return fn

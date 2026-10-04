@@ -7,7 +7,10 @@ from app.models.chat_message import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.chat_turn_event import ChatTurnEvent
 from app.models.evaluation import Evaluation
+from app.models.evaluation_batch import EvaluationBatch
+from app.models.evaluation_event import EvaluationEvent
 from app.models.evaluation_kpi_result import EvaluationKpiResult
+from app.models.evaluation_source import EvaluationSource
 from app.models.kpi_guideline import KpiGuideline
 from app.models.kpi_node import KpiNode
 from app.models.scorecard import Scorecard
@@ -25,6 +28,9 @@ __all__ = [
     "ScorecardEmbedding",
     "Evaluation",
     "EvaluationKpiResult",
+    "EvaluationBatch",
+    "EvaluationSource",
+    "EvaluationEvent",
     "ChatSession",
     "ChatMessage",
     "ChatTurnEvent",

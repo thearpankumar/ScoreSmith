@@ -75,7 +75,18 @@ export function OverviewTab({
                 <RagBadge score={scorecard.targetScore} size="sm" />
               </dd>
             </div>
-            <Row label="KPIs (total / scored leaves)" value={`${nodes.length} / ${leaves.length}`} />
+            <Row
+              label="KPIs"
+              value={[
+                `${leaves.length}`,
+                leaves.some((l) => !l.includedInScoring)
+                  ? `(${leaves.filter((l) => l.includedInScoring).length} scored, ${leaves.filter((l) => !l.includedInScoring).length} unscored)`
+                  : null,
+                nodes.length > leaves.length ? `in ${nodes.length - leaves.length} categories` : null,
+              ]
+                .filter(Boolean)
+                .join(" ")}
+            />
             <Row
               label="Hierarchy depth"
               value={`${maxDepth} level${maxDepth === 1 ? "" : "s"} (${levelCounts

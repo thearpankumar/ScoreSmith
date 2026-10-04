@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Numeric, String
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -52,6 +52,24 @@ class Evaluation(UUIDPKMixin, TimestampMixin, Base):
     # Denormalized from scorecards.domain (via scorecard_version -> scorecard) for
     # fast filtering/reporting without a join.
     domain: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+
+    # --- AI evaluation pipeline (migration 0010_ai_eval_pipeline) ---
+    batch_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("evaluation_batches.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)  # upload | drive | mixed
+    direction_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    subject_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    subject_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    stage: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    progress: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sfn_execution_arn: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
 
     scorecard_version: Mapped[ScorecardVersion] = relationship("ScorecardVersion")
     evaluator: Mapped[User] = relationship("User")

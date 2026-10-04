@@ -20,6 +20,8 @@ from app.ai.jev_client import JevClient, JevClientProtocol
 from app.ai.web_search import AgentCoreWebSearchClient, WebSearchClientProtocol
 from app.db import get_db
 from app.models.user import User
+from app.pipeline.aws_jobs import AwsJobsProtocol, Boto3AwsJobs
+from app.pipeline.jev_scorer import JevScoreClient, JevScoreClientProtocol
 
 # Single process-lifetime BedrockClient. Construction is cheap/lazy (see
 # app/ai/bedrock_client.py — the boto3 client itself is only created on first real call),
@@ -39,6 +41,21 @@ _web_search_client: WebSearchClientProtocol = AgentCoreWebSearchClient()
 # construct even when OPENROUTER_JEV_API is unset: `quality_gate()` then just degrades
 # every checkpoint to "passed" rather than failing a chat turn.
 _jev_client: JevClientProtocol = JevClient()
+
+
+# AI evaluation pipeline singletons (cheap/lazy: boto3 clients are only built on first real call, and
+# always with the dedicated APP access keys - see app/pipeline/aws_jobs.py).
+_aws_jobs: AwsJobsProtocol = Boto3AwsJobs()
+_jev_score_client: JevScoreClientProtocol = JevScoreClient()
+
+
+def get_aws_jobs() -> AwsJobsProtocol:
+    """FastAPI dependency for the AI-evaluation upload endpoints; overridden in tests with `FakeAwsJobs`."""
+    return _aws_jobs
+
+
+def get_jev_score_client() -> JevScoreClientProtocol:
+    return _jev_score_client
 
 
 def get_bedrock_client() -> BedrockClientProtocol:

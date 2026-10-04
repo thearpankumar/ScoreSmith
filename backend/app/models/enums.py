@@ -20,6 +20,18 @@ class EvaluationStatus(enum.StrEnum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
+    # AI evaluation pipeline (migration 0010_ai_eval_pipeline)
+    QUEUED = "queued"
+    INGESTING = "ingesting"  # Drive fetch + extraction + transcription on AWS
+    PROCESSING = "processing"  # unused alias kept in the enum
+    SCORING = "scoring"  # local LangGraph scoring
+
+
+ACTIVE_EVALUATION_STATUSES = (
+    EvaluationStatus.INGESTING,
+    EvaluationStatus.PROCESSING,
+    EvaluationStatus.SCORING,
+)
 
 
 class RagBand(enum.StrEnum):

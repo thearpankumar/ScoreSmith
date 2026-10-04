@@ -75,6 +75,16 @@ export function mergeInterimDraft(
   return draftSignature(merged) === draftSignature(local) ? local : merged;
 }
 
+/** How many real KPIs and how many categories a draft holds. A node that other nodes hang under is a
+ * category (a grouping header with no weight or guidelines); only leaves are KPIs, i.e. what gets weighted
+ * and scored. Counting every node as a "KPI" over-reports a categorised scorecard (114 nodes = 97 KPIs +
+ * 17 categories). */
+export function draftKpiCounts(kpis: ScorecardDraft["kpis"]): { kpis: number; categories: number } {
+  const parents = new Set(kpis.map((k) => k.parentId).filter((p): p is string => p !== null));
+  const categories = kpis.filter((k) => parents.has(k.id)).length;
+  return { kpis: kpis.length - categories, categories };
+}
+
 /** Number of KPIs (leaf rows) that already have a weight vs the total — drives the "weighting…"
  * hint in the preview while the backend is still filling weights in. */
 export function weightedLeafProgress(kpis: ScorecardDraft["kpis"]): { weighted: number; total: number } {

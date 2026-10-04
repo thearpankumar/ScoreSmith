@@ -39,6 +39,8 @@ class EvaluationKpiResult(UUIDPKMixin, TimestampMixin, Base):
     needs_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     score_variance: Mapped[float | None] = mapped_column(Numeric(4, 2), nullable=True)
     ensemble_raw_scores: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)
+    # AI evaluation pipeline: raw Jev answer {position, probabilities, confidence, noul}.
+    jev_raw: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     evaluation: Mapped[Evaluation] = relationship("Evaluation", back_populates="kpi_results")
     kpi_node: Mapped[KpiNode] = relationship("KpiNode", back_populates="evaluation_results")

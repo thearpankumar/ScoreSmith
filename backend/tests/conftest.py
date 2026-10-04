@@ -76,6 +76,8 @@ _apply_test_database_url()
 # assert on the inline 200/201 responses, so the suite runs inline by default and the background
 # tests (tests/test_chat_background_turns.py) opt in with `?wait=false`.
 os.environ.setdefault("CHAT_TURNS_INLINE", "true")
+# No background AI-evaluation dispatcher loop in tests: they drive `Dispatcher.run_until_idle()` themselves.
+os.environ.setdefault("AI_EVAL_INLINE", "true")
 
 APP_TABLES = [
     "audit_log",
@@ -83,7 +85,10 @@ APP_TABLES = [
     "chat_turn_events",
     "chat_sessions",
     "evaluation_kpi_results",
+    "evaluation_events",
+    "evaluation_sources",
     "evaluations",
+    "evaluation_batches",
     "scorecard_embeddings",
     "kpi_guidelines",
     "kpi_nodes",

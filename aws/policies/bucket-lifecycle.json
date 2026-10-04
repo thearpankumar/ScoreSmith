@@ -1,0 +1,9 @@
+{
+  "Rules": [
+    { "ID": "expire-uploads-14d", "Status": "Enabled", "Filter": { "Prefix": "uploads/" }, "Expiration": { "Days": 14 } },
+    { "ID": "expire-raw-14d", "Status": "Enabled", "Filter": { "Prefix": "raw/" }, "Expiration": { "Days": 14 } },
+    { "ID": "expire-batches-14d", "Status": "Enabled", "Filter": { "Prefix": "batches/" }, "Expiration": { "Days": 14 } },
+    { "ID": "expire-derived-90d", "Status": "Enabled", "Filter": { "Prefix": "derived/" }, "Expiration": { "Days": 90 } },
+    { "ID": "abort-incomplete-multipart-1d", "Status": "Enabled", "Filter": { "Prefix": "" }, "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 } }
+  ]
+}

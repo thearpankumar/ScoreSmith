@@ -89,7 +89,15 @@ export interface Guideline {
   quantitativeCriteria?: string;
 }
 
-export type EvaluationStatus = "pending" | "in_progress" | "completed" | "failed";
+export type EvaluationStatus =
+  | "pending"
+  | "in_progress"
+  | "queued"
+  | "ingesting"
+  | "processing"
+  | "scoring"
+  | "completed"
+  | "failed";
 
 export interface Evaluation {
   id: string;
@@ -107,6 +115,16 @@ export interface Evaluation {
   ragBand: RagBandKey;
   submittedAt: string;
   kpiResults: EvaluationKpiResult[];
+  // --- AI pipeline fields (docs/ai-eval-contract.md); absent/null for manual + legacy rows ---
+  stage?: string | null;
+  subjectName?: string | null;
+  subjectEmail?: string | null;
+  batchId?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  queuedAt?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
   /**
    * Set by the api-client mapping layer when `POST /evaluations/{id}/run` fails with a
    * `BedrockUnavailableError` (502) — the evaluation row itself is still created and
@@ -294,4 +312,153 @@ export interface CreateEvaluationInput {
   name: string;
   inputSummary: string;
   inputText: string;
+}
+
+// ---------------------------------------------------------------------------
+// AI evaluation pipeline (docs/ai-eval-contract.md)
+// ---------------------------------------------------------------------------
+
+export type AiUploadPurpose = "submission" | "batch_sheet";
+
+export interface AiUploadFileRequest {
+  name: string;
+  size: number;
+  contentType: string;
+}
+
+export interface AiUploadPart {
+  partNumber: number;
+  url: string;
+}
+
+export interface AiUploadFilePlan {
+  clientIndex: number;
+  uploadId: string;
+  s3Key: string;
+  parts: AiUploadPart[];
+}
+
+export interface AiUploadPlan {
+  uploadGroupId: string;
+  partSize: number;
+  files: AiUploadFilePlan[];
+}
+
+export interface AiCompletedPart {
+  partNumber: number;
+  etag: string;
+}
+
+export interface AiCompleteFile {
+  uploadId: string;
+  s3Key: string;
+  parts: AiCompletedPart[];
+}
+
+export interface AiCompleteResult {
+  s3Key: string;
+  size: number;
+  ok: boolean;
+  error: string | null;
+}
+
+export interface BatchSheetRow {
+  rowIndex: number;
+  email: string | null;
+  name: string | null;
+  driveUrl: string | null;
+  timestamp: string | null;
+  warnings: string[];
+}
+
+export interface BatchSheetParse {
+  rows: BatchSheetRow[];
+  skipped: Array<{ rowIndex: number; reason: string }>;
+  columns: Record<string, string | null>;
+}
+
+export type AiJobSource =
+  | { kind: "upload"; s3Key: string; originalName: string; size: number }
+  | { kind: "drive"; driveUrl: string };
+
+export interface AiJobItem {
+  name?: string | null;
+  subjectEmail?: string | null;
+  subjectName?: string | null;
+  sources: AiJobSource[];
+}
+
+export interface CreateAiJobsInput {
+  scorecardId: string;
+  directionPrompt?: string | null;
+  items: AiJobItem[];
+}
+
+export interface CreateAiJobsResult {
+  batchId: string | null;
+  evaluations: Evaluation[];
+}
+
+export type ProgressFileState = "pending" | "running" | "done" | "skipped" | "failed";
+
+export interface EvaluationProgressFile {
+  sourceId: string;
+  name: string;
+  state: ProgressFileState;
+  detail: string;
+}
+
+export interface EvaluationProgressCounters {
+  filesTotal: number;
+  filesDone: number;
+  imagesTotal: number;
+  imagesDone: number;
+  chunksTotal: number;
+  chunksDone: number;
+}
+
+export interface EvaluationProgressDoc {
+  stage: string;
+  updatedAt: string | null;
+  message: string;
+  files: EvaluationProgressFile[];
+  counters: EvaluationProgressCounters;
+}
+
+export interface EvaluationProgressSource {
+  id: string;
+  kind: string;
+  originalName: string | null;
+  driveUrl: string | null;
+  size: number | null;
+  status: string;
+  warnings: string[];
+}
+
+export interface EvaluationProgressEvent {
+  id: string;
+  createdAt: string;
+  eventType: string;
+  message: string;
+}
+
+export interface EvaluationProgress {
+  evaluationId: string;
+  status: EvaluationStatus;
+  stage: string | null;
+  queuePosition: number | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  progress: EvaluationProgressDoc | null;
+  sources: EvaluationProgressSource[];
+  events: EvaluationProgressEvent[];
+}
+
+export interface AiBatch {
+  id: string;
+  scorecardId: string;
+  status: string;
+  total: number;
+  counts: { queued: number; running: number; completed: number; failed: number };
+  evaluations: Evaluation[];
 }

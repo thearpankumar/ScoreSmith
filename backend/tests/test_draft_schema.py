@@ -128,3 +128,48 @@ def test_weight_out_of_bounds_rejected() -> None:
 def test_hierarchy_level_out_of_bounds_rejected() -> None:
     with pytest.raises(ValidationError):
         ScorecardDraft.model_validate({"kpis": [{"name": "A", "level": 5}]})
+
+
+# --- an unscored (informational) leaf needs no weight: found when a 114-KPI chat could not be saved ---
+
+
+def _draft_with_unscored_leaves() -> dict:
+    return {
+        "name": "Hackathon Solution Scoring",
+        "purpose": "Score solution documents.",
+        "domain": "Hackathon",
+        "target_score": 9,
+        "kpis": [
+            {"name": "Quality", "level": 1},
+            {"name": "Clarity", "level": 2, "parent_name": "Quality", "weight": 60, "guidelines": full_rubric()},
+            {"name": "Depth", "level": 2, "parent_name": "Quality", "weight": 40, "guidelines": full_rubric()},
+            {"name": "Declarations", "level": 1},
+            {
+                # informational: tracked and judged, but not part of the weighted score
+                "name": "DC-1: AI tools are declared",
+                "level": 2,
+                "parent_name": "Declarations",
+                "included_in_scoring": False,
+                "guidelines": full_rubric(),
+            },
+            {"name": "Appendix", "level": 1, "included_in_scoring": False, "guidelines": full_rubric()},
+        ],
+    }
+
+
+def test_unscored_leaves_do_not_need_a_weight_to_complete_the_draft() -> None:
+    draft = ScorecardDraft.model_validate(_draft_with_unscored_leaves())
+    assert draft.missing_fields() == []
+    assert draft.is_complete()
+
+
+def test_scored_leaf_without_a_weight_is_still_missing_one() -> None:
+    raw = _draft_with_unscored_leaves()
+    raw["kpis"][1].pop("weight")
+    raw["kpis"][2]["weight"] = 100
+    draft = ScorecardDraft.model_validate(raw)
+    assert draft.missing_fields() == ["kpis[Clarity].weight"]
+    # ...and an unscored leaf WITH guidelines missing is still reported
+    raw = _draft_with_unscored_leaves()
+    raw["kpis"][4]["guidelines"] = {}
+    assert "kpis[DC-1: AI tools are declared].guidelines" in ScorecardDraft.model_validate(raw).missing_fields()

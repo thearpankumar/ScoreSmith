@@ -525,6 +525,8 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
   }
 
   const leafCount = Object.keys(effective).length;
+  // A node that other nodes hang under is a category (a grouping header), not a KPI.
+  const categoryCount = new Set(kpiNodes.map((n) => n.parentId).filter((p): p is string => !!p)).size;
   const deleteInfo = deleteTarget ? describeDelete(deleteTarget, kpiNodes) : null;
 
   return (
@@ -535,7 +537,8 @@ export function KpiStructureTree({ kpiNodes, editing }: { kpiNodes: KpiNode[]; e
           KPI structure
           {isEditing && <Badge variant="lemon">Editing</Badge>}
           <span className="font-normal text-ink-muted">
-            · {kpiNodes.length} KPIs, {leafCount} scored leaves · all leaf KPIs sum to{" "}
+            · {kpiNodes.length - categoryCount} KPIs
+            {categoryCount > 0 ? ` in ${categoryCount} categories` : ""}, {leafCount} scored · all scored KPIs sum to{" "}
             <span className={globalLeafCheck.ok ? "text-[var(--rag-excellent)]" : "text-[var(--rag-poor)]"}>
               {globalLeafCheck.sum}%
             </span>

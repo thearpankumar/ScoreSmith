@@ -108,6 +108,7 @@ class BedrockClientProtocol(Protocol):
         tools: list[ToolSpec] | None = None,
         force_tool_use: bool = False,
         model_id: str | None = None,
+        temperature: float | None = None,
     ) -> ConverseResult: ...
 
     def converse_stream(
@@ -196,6 +197,7 @@ class BedrockClient:
         tools: list[ToolSpec] | None = None,
         force_tool_use: bool = False,
         model_id: str | None = None,
+        temperature: float | None = None,
     ) -> ConverseResult:
         client = self._get_client()
         kwargs: dict[str, Any] = {
@@ -205,10 +207,18 @@ class BedrockClient:
         if system:
             kwargs["system"] = [{"text": system}]
         if tools:
+            # A model that already rejected forced toolChoice is remembered, so only its first
+            # call pays for the failed attempt.
+            if kwargs["modelId"] in _NO_FORCED_TOOL_CHOICE:
+                force_tool_use = False
             kwargs["toolConfig"] = _build_tool_config(tools, force_tool_use)
         max_tokens = effective_max_output_tokens(kwargs["modelId"])
         if max_tokens > 0:
             kwargs["inferenceConfig"] = {"maxTokens": max_tokens}
+        if temperature is not None:
+            # 0 makes judging repeatable: with the default sampling the same document scored differently on
+            # every run (mean 0.6 points per KPI, some 3-4 points apart).
+            kwargs.setdefault("inferenceConfig", {})["temperature"] = temperature
 
         try:
             response = client.converse(**kwargs)
@@ -230,6 +240,7 @@ class BedrockClient:
                     "(relying on system-prompt instruction instead).",
                     kwargs["modelId"],
                 )
+                _NO_FORCED_TOOL_CHOICE.add(kwargs["modelId"])
                 kwargs["toolConfig"] = _build_tool_config(tools, force_tool_use=False)
                 try:
                     response = client.converse(**kwargs)
@@ -318,9 +329,13 @@ def _looks_like_unsupported_tool_choice(exc: Exception) -> bool:
 # Documented max OUTPUT tokens per model on Bedrock (AWS model cards, checked 2026-10: GLM 5 =
 # 128K, GLM 4.7 Flash = 4K). Sending a larger `maxTokens` than the model supports can be
 # rejected with a ValidationException, so the configured ceiling is clamped per model.
+_NO_FORCED_TOOL_CHOICE: set[str] = set()
+
 _MODEL_MAX_OUTPUT_TOKENS: dict[str, int] = {
     "zai.glm-4.7-flash": 4096,
     "zai.glm-5": 128000,
+    # Llama 4 Maverick (the AI-evaluation master agent) rejects maxTokens above 8192.
+    "us.meta.llama4-maverick-17b-instruct-v1:0": 8192,
 }
 
 

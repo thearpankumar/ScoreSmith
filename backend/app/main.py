@@ -23,6 +23,7 @@ from app.ai.scorecard_builder import get_graph_manager
 from app.api.v1.chat import recover_interrupted_turns, shutdown_background_turns
 from app.api.v1.router import api_router
 from app.config import get_settings
+from app.pipeline.dispatcher import get_dispatcher
 
 # Without this, every module-level `logging.getLogger(__name__)` in app/ai/* (Bedrock
 # unavailability, web_search query/result counts, similarity-search failures, ...) is
@@ -51,7 +52,11 @@ async def lifespan(_: FastAPI):
         await get_graph_manager().get_compiled_graph()
     except Exception:  # noqa: BLE001 — DB not reachable/migrated yet: fall back to lazy init per request
         logging.getLogger(__name__).warning("Could not pre-initialize the chat graph at startup.", exc_info=True)
+    # AI-evaluation queue: resumes interrupted evaluations, then claims queued ones (no-op when AI_EVAL_INLINE).
+    dispatcher = get_dispatcher()
+    await dispatcher.start()
     yield
+    await dispatcher.stop()
     # Cancel still-running background chat turns (each records "interrupted"), then cleanly close
     # the LangGraph AsyncPostgresSaver's pooled connection on shutdown.
     await shutdown_background_turns()

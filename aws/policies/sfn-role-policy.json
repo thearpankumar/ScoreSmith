@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": [
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-ingest",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-ingest:*",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-extract-doc",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-extract-doc:*",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-plan-audio",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-plan-audio:*",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-transcribe-chunk",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-transcribe-chunk:*",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-analyze-image",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-analyze-image:*",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-assemble",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-assemble:*"
+      ]
+    }
+  ]
+}

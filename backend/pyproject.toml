@@ -29,6 +29,8 @@ dependencies = [
   # Gateway). Kept pinned to the same version the dev extra already used.
   "httpx==0.27.2",
   "simpleeval>=1.0.8",
+  # --- AI evaluation pipeline: batch spreadsheet parsing (app/pipeline/batch_parser.py) ---
+  "openpyxl>=3.1.5",
 ]
 
 [project.optional-dependencies]

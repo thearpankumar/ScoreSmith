@@ -1,4 +1,15 @@
 import type {
+  AiBatch,
+  AiCompleteFile,
+  AiCompleteResult,
+  AiUploadFileRequest,
+  AiUploadPlan,
+  AiUploadPurpose,
+  BatchSheetParse,
+  CreateAiJobsInput,
+  CreateAiJobsResult,
+  EvaluationProgress,
+  ProgressFileState,
   ChatMessage,
   ChatRole,
   ChatSession,
@@ -96,6 +107,26 @@ interface RequestOptions {
   signal?: AbortSignal;
 }
 
+/** FastAPI `detail` is a string, or (422) a list of `{loc,msg}` / per-item objects. */
+function formatErrorDetail(detail: unknown): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((d) => {
+        if (d && typeof d === "object") {
+          const o = d as Record<string, unknown>;
+          const where = Array.isArray(o.loc) ? o.loc.filter((x) => x !== "body").join(".") : "";
+          const msg = typeof o.msg === "string" ? o.msg : typeof o.message === "string" ? o.message : JSON.stringify(o);
+          return where ? `${where}: ${msg}` : msg;
+        }
+        return String(d);
+      })
+      .join("; ");
+  }
+  if (detail && typeof detail === "object") return JSON.stringify(detail);
+  return String(detail);
+}
+
 async function apiFetch<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (opts.auth) {
@@ -152,7 +183,7 @@ async function apiFetch<T>(path: string, opts: RequestOptions = {}): Promise<T> 
   if (!res.ok) {
     const detail =
       payload && typeof payload === "object" && "detail" in (payload as Record<string, unknown>)
-        ? String((payload as Record<string, unknown>).detail)
+        ? formatErrorDetail((payload as Record<string, unknown>).detail)
         : typeof payload === "string" && payload
           ? payload
           : res.statusText || `Request failed (${res.status})`;
@@ -253,6 +284,16 @@ interface BeEvaluation {
   domain: string | null;
   created_at: string;
   kpi_results?: BeEvaluationKpiResult[];
+  // AI pipeline fields (docs/ai-eval-contract.md)
+  stage?: string | null;
+  subject_name?: string | null;
+  subject_email?: string | null;
+  batch_id?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  queued_at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
 }
 
 interface BeChatSession {
@@ -955,6 +996,15 @@ function mapEvaluation(be: BeEvaluation, ctx: EnrichmentContext): Evaluation {
     ragBand: mapRagBand(be.rag_band),
     submittedAt: be.submitted_at ?? be.created_at,
     kpiResults,
+    stage: be.stage ?? null,
+    subjectName: be.subject_name ?? null,
+    subjectEmail: be.subject_email ?? null,
+    batchId: be.batch_id ?? null,
+    errorCode: be.error_code ?? null,
+    errorMessage: be.error_message ?? null,
+    queuedAt: be.queued_at ?? null,
+    startedAt: be.started_at ?? null,
+    finishedAt: be.finished_at ?? null,
   };
 }
 
@@ -1128,6 +1178,251 @@ export async function createManualEvaluation(input: {
   return evaluation;
 }
 
+// ---------------------------------------------------------------------------
+// AI evaluation pipeline (docs/ai-eval-contract.md)
+// ---------------------------------------------------------------------------
+
+/** `POST /evaluations/ai/uploads`: presigned multipart plan, one entry per requested file (in order). */
+export async function initAiUploads(
+  purpose: AiUploadPurpose,
+  files: AiUploadFileRequest[],
+  signal?: AbortSignal,
+): Promise<AiUploadPlan> {
+  const be = await apiFetch<{
+    upload_group_id: string;
+    part_size: number;
+    files: Array<{
+      client_index: number;
+      upload_id: string;
+      s3_key: string;
+      parts: Array<{ part_number: number; url: string }>;
+    }>;
+  }>("/api/v1/evaluations/ai/uploads", {
+    method: "POST",
+    auth: true,
+    signal,
+    body: { purpose, files: files.map((f) => ({ name: f.name, size: f.size, content_type: f.contentType })) },
+  });
+  return {
+    uploadGroupId: be.upload_group_id,
+    partSize: be.part_size,
+    files: be.files.map((f) => ({
+      clientIndex: f.client_index,
+      uploadId: f.upload_id,
+      s3Key: f.s3_key,
+      parts: f.parts.map((p) => ({ partNumber: p.part_number, url: p.url })),
+    })),
+  };
+}
+
+/** `POST /evaluations/ai/uploads/complete`: finalises multipart uploads (size + magic-byte check). */
+export async function completeAiUploads(files: AiCompleteFile[]): Promise<AiCompleteResult[]> {
+  const be = await apiFetch<{ files: Array<{ s3_key: string; size: number; ok: boolean; error: string | null }> }>(
+    "/api/v1/evaluations/ai/uploads/complete",
+    {
+      method: "POST",
+      auth: true,
+      body: {
+        files: files.map((f) => ({
+          upload_id: f.uploadId,
+          s3_key: f.s3Key,
+          parts: f.parts.map((p) => ({ part_number: p.partNumber, etag: p.etag })),
+        })),
+      },
+    },
+  );
+  return be.files.map((f) => ({ s3Key: f.s3_key, size: f.size, ok: f.ok, error: f.error ?? null }));
+}
+
+/** `POST /evaluations/ai/uploads/abort` (204): discards an in-flight multipart upload. */
+export async function abortAiUploads(files: Array<{ uploadId: string; s3Key: string }>): Promise<void> {
+  await apiFetch("/api/v1/evaluations/ai/uploads/abort", {
+    method: "POST",
+    auth: true,
+    body: { files: files.map((f) => ({ upload_id: f.uploadId, s3_key: f.s3Key })) },
+  });
+}
+
+/** `POST /evaluations/ai/batches/parse`: AI-mapped preview of an uploaded xlsx/csv sheet. */
+export async function parseBatchSheet(s3Key: string, signal?: AbortSignal): Promise<BatchSheetParse> {
+  const be = await apiFetch<{
+    rows: Array<{
+      row_index: number;
+      email: string | null;
+      name: string | null;
+      drive_url: string | null;
+      timestamp: string | null;
+      warnings?: string[];
+    }>;
+    skipped?: Array<{ row_index: number; reason: string }>;
+    columns?: Record<string, string | null>;
+  }>("/api/v1/evaluations/ai/batches/parse", { method: "POST", auth: true, signal, body: { s3_key: s3Key } });
+  return {
+    rows: be.rows.map((r) => ({
+      rowIndex: r.row_index,
+      email: r.email ?? null,
+      name: r.name ?? null,
+      driveUrl: r.drive_url ?? null,
+      timestamp: r.timestamp ?? null,
+      warnings: r.warnings ?? [],
+    })),
+    skipped: (be.skipped ?? []).map((s) => ({ rowIndex: s.row_index, reason: s.reason })),
+    columns: be.columns ?? {},
+  };
+}
+
+/** `POST /evaluations/ai/jobs` (202): one item = one evaluation; more than one item creates a batch. */
+export async function createAiJobs(input: CreateAiJobsInput): Promise<CreateAiJobsResult> {
+  const be = await apiFetch<{ batch_id: string | null; evaluations: BeEvaluation[] }>("/api/v1/evaluations/ai/jobs", {
+    method: "POST",
+    auth: true,
+    body: {
+      scorecard_id: input.scorecardId,
+      direction_prompt: input.directionPrompt?.trim() ? input.directionPrompt.trim() : null,
+      items: input.items.map((it) => ({
+        name: it.name ?? null,
+        subject_email: it.subjectEmail ?? null,
+        subject_name: it.subjectName ?? null,
+        sources: it.sources.map((src) =>
+          src.kind === "upload"
+            ? { kind: "upload", s3_key: src.s3Key, original_name: src.originalName, size: src.size }
+            : { kind: "drive", drive_url: src.driveUrl },
+        ),
+      })),
+    },
+  });
+  // The creation response is a lightweight summary: map without enrichment lookups.
+  const ctx: EnrichmentContext = { versionById: new Map(), scorecardById: new Map(), userNameById: new Map() };
+  return {
+    batchId: be.batch_id ?? null,
+    evaluations: be.evaluations.map((e) => ({ ...mapEvaluation(e, ctx), scorecardId: input.scorecardId })),
+  };
+}
+
+interface BeProgress {
+  evaluation_id: string;
+  status: string;
+  stage?: string | null;
+  queue_position?: number | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  progress?: {
+    stage?: string;
+    updated_at?: string | null;
+    message?: string;
+    files?: Array<{ source_id: string; name: string; state: string; detail?: string }>;
+    counters?: Partial<Record<string, number>>;
+  } | null;
+  sources?: Array<{
+    id: string;
+    kind: string;
+    original_name?: string | null;
+    drive_url?: string | null;
+    size?: number | null;
+    status: string;
+    warnings?: string[] | null;
+  }>;
+  events?: Array<{ id: string; created_at: string; event_type: string; message: string }>;
+}
+
+export function mapProgress(be: BeProgress): EvaluationProgress {
+  const c = be.progress?.counters ?? {};
+  return {
+    evaluationId: be.evaluation_id,
+    status: be.status as EvaluationStatus,
+    stage: be.stage ?? null,
+    queuePosition: be.queue_position ?? null,
+    errorCode: be.error_code ?? null,
+    errorMessage: be.error_message ?? null,
+    progress: be.progress
+      ? {
+          stage: be.progress.stage ?? "",
+          updatedAt: be.progress.updated_at ?? null,
+          message: be.progress.message ?? "",
+          files: (be.progress.files ?? []).map((f) => ({
+            sourceId: f.source_id,
+            name: f.name,
+            state: f.state as ProgressFileState,
+            detail: f.detail ?? "",
+          })),
+          counters: {
+            filesTotal: c.files_total ?? 0,
+            filesDone: c.files_done ?? 0,
+            imagesTotal: c.images_total ?? 0,
+            imagesDone: c.images_done ?? 0,
+            chunksTotal: c.chunks_total ?? 0,
+            chunksDone: c.chunks_done ?? 0,
+          },
+        }
+      : null,
+    sources: (be.sources ?? []).map((s) => ({
+      id: s.id,
+      kind: s.kind,
+      originalName: s.original_name ?? null,
+      driveUrl: s.drive_url ?? null,
+      size: s.size ?? null,
+      status: s.status,
+      warnings: s.warnings ?? [],
+    })),
+    events: (be.events ?? []).map((e) => ({
+      id: e.id,
+      createdAt: e.created_at,
+      eventType: e.event_type,
+      message: e.message,
+    })),
+  };
+}
+
+/** `GET /evaluations/{id}/progress`. */
+export async function getEvaluationProgress(id: string, signal?: AbortSignal): Promise<EvaluationProgress> {
+  // `auth: true`: the route requires the current user (X-User-Id). Without it every browser poll got a 401, which the
+  // watcher shows as "Connection lost" forever.
+  return mapProgress(await apiFetch<BeProgress>(`/api/v1/evaluations/${id}/progress`, { signal, auth: true }));
+}
+
+/** `POST /evaluations/{id}/cancel` (202): ends as `failed` with error_code `cancelled`. */
+export async function cancelEvaluation(id: string): Promise<void> {
+  await apiFetch(`/api/v1/evaluations/${id}/cancel`, { method: "POST", auth: true });
+}
+
+/** `POST /evaluations/{id}/retry` (202): only valid from `failed`. */
+export async function retryEvaluation(id: string): Promise<void> {
+  await apiFetch(`/api/v1/evaluations/${id}/retry`, { method: "POST", auth: true });
+}
+
+/** `GET /evaluations/ai/batches/{id}`. */
+export async function getAiBatch(id: string, signal?: AbortSignal): Promise<AiBatch | undefined> {
+  let be: {
+    id: string;
+    scorecard_id: string;
+    status: string;
+    total: number;
+    counts?: Partial<Record<string, number>>;
+    evaluations?: BeEvaluation[];
+  };
+  try {
+    be = await apiFetch(`/api/v1/evaluations/ai/batches/${id}`, { signal, auth: true });
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return undefined;
+    throw err;
+  }
+  const rows = be.evaluations ?? [];
+  const ctx = await buildEnrichmentContext(rows);
+  return {
+    id: be.id,
+    scorecardId: be.scorecard_id,
+    status: be.status,
+    total: be.total,
+    counts: {
+      queued: be.counts?.queued ?? 0,
+      running: be.counts?.running ?? 0,
+      completed: be.counts?.completed ?? 0,
+      failed: be.counts?.failed ?? 0,
+    },
+    evaluations: rows.map((r) => mapEvaluation(r, ctx)),
+  };
+}
+
 /**
  * Browser-only legacy fallback for evaluations that fail to load from the real backend
  * (e.g. transient network issue in the browser tab). Normal operation never needs this
@@ -1248,7 +1543,11 @@ function mapDraft(sessionId: string, be: BeScorecardDraft | null | undefined): S
       level: (k.level ?? 1) as 1 | 2 | 3 | 4,
       parentId: k.parent_name ? draftKpiId(k.parent_name) : null,
       includedInScoring: k.included_in_scoring ?? true,
-      status: k.weight != null && (hasGuidelines || isCategory) ? "confirmed" : "proposed",
+      // An unscored (informational) KPI never gets a weight, so a missing weight must not keep it "proposed".
+      status:
+        (k.weight != null || k.included_in_scoring === false) && (hasGuidelines || isCategory)
+          ? "confirmed"
+          : "proposed",
       guidelinesPending: !isCategory && !hasGuidelines,
     };
   });
@@ -1586,6 +1885,48 @@ export async function watchChatTurn(
       const snapshot = snapshotOf(turn);
       if (!snapshot.turnInProgress) return snapshot;
       onUpdate(snapshot, events);
+    } catch (err) {
+      if (signal.aborted) throw abortError();
+      if (err instanceof ApiError && err.status === 404) throw err;
+      if (failures === 0) onConnection?.(false);
+      failures++;
+    }
+    delay = chatPollDelayMs(
+      failures,
+      typeof document !== "undefined" && document.visibilityState === "hidden",
+      Date.now() - startedAt,
+    );
+  }
+}
+
+/**
+ * Watches an AI evaluation until it reaches a terminal status (`completed` or `failed`; a cancelled
+ * run is `failed` + `error_code: "cancelled"`) and returns the final progress snapshot. Same polling
+ * pattern as `watchChatTurn`: one poll in flight at a time, `chatPollDelayMs` cadence, network errors
+ * back off and keep trying (reported via `onConnection`), a 404 rejects, aborting rejects with
+ * AbortError. `onUpdate` receives every successful poll, including the terminal one.
+ */
+export async function watchEvaluation(
+  evaluationId: string,
+  opts: {
+    signal: AbortSignal;
+    onUpdate: (progress: EvaluationProgress) => void;
+    onConnection?: (ok: boolean) => void;
+  },
+): Promise<EvaluationProgress> {
+  const { signal, onUpdate, onConnection } = opts;
+  let failures = 0;
+  const startedAt = Date.now();
+  let delay = 0;
+  for (;;) {
+    await abortableSleep(delay, signal);
+    try {
+      const progress = await getEvaluationProgress(evaluationId, signal);
+      if (signal.aborted) throw abortError();
+      if (failures > 0) onConnection?.(true);
+      failures = 0;
+      onUpdate(progress);
+      if (progress.status === "completed" || progress.status === "failed") return progress;
     } catch (err) {
       if (signal.aborted) throw abortError();
       if (err instanceof ApiError && err.status === 404) throw err;

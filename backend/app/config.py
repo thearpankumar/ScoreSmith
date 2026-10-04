@@ -132,6 +132,34 @@ class Settings(BaseSettings):
     # against this account's OpenRouter access on 2026-09-30 (see jev_client.py).
     openrouter_jev_model_id: str = "typesafe/jev-1.13"
 
+    # --- AI evaluation pipeline (file / Google Drive evaluations; see docs/ai-eval-contract.md) ---
+    # Master model for identify / digest / evidence selection / reasoning (Llama 4 Maverick profile).
+    bedrock_master_model_id: str = "us.meta.llama4-maverick-17b-instruct-v1:0"
+    # S3 bucket + Step Functions state machine written by aws/bootstrap into infra/.env. The APP keys
+    # are a dedicated IAM user (S3 + states:* on one machine); they are NOT the Bedrock bearer token
+    # and boto3 clients for S3/SFN are always built with them explicitly.
+    s3_bucket: str = ""
+    sfn_state_machine_arn: str = ""
+    aws_app_access_key_id: str = ""
+    aws_app_secret_access_key: str = ""
+    # Max evaluations in ingesting/processing/scoring at once (clamped 1-5, see ai_eval_concurrency).
+    ai_eval_max_concurrent: int = 3
+    # true: no background dispatcher loop is started (tests / debugging); drive it with
+    # `Dispatcher.run_until_idle()`. false (default): an asyncio loop runs inside the app lifespan.
+    ai_eval_inline: bool = False
+    ai_eval_poll_seconds: float = 4.0
+    # Hard wall-clock ceiling for one evaluation (AWS stage + scoring), after which it fails `timeout`.
+    ai_eval_timeout_seconds: int = 4 * 3600
+    # Upload limits (browser -> S3 multipart). 2 GiB per file, 10 files per submission.
+    upload_max_bytes: int = 2 * 1024**3
+    upload_max_files: int = 10
+    upload_part_size: int = 32 * 1024 * 1024
+    upload_url_ttl_seconds: int = 900
+
+    @property
+    def ai_eval_concurrency(self) -> int:
+        return max(1, min(5, int(self.ai_eval_max_concurrent)))
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

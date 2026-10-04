@@ -142,7 +142,10 @@ class ScorecardDraft(BaseModel):
                 is_leaf = kpi.name not in parent_names
                 if not is_leaf:
                     continue  # category/grouping node: no weight, no guidelines required
-                if kpi.weight is None:
+                # An informational leaf (`included_in_scoring=False`) is excluded from the weight sum and
+                # from the weighted average, so it has nothing to be weighted against and needs no weight
+                # (requiring one made such a draft impossible to complete, and so impossible to save).
+                if kpi.weight is None and kpi.included_in_scoring:
                     missing.append(f"kpis[{kpi.name}].weight")
                 if not kpi.guidelines:
                     missing.append(f"kpis[{kpi.name}].guidelines")

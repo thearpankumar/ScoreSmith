@@ -40,6 +40,7 @@ import type { ChatTurnFailure, ChatTurnSnapshot } from "@/lib/api-client";
 import {
   dedupeRetriedMessages,
   describeDraftEdits,
+  draftKpiCounts,
   draftSignature,
   mergeInterimDraft,
   sameEvents,
@@ -715,7 +716,7 @@ export function ChatWorkspace({
               <Button asChild variant="outline" size="sm">
                 <a href="#live-preview">
                   <FileText className="size-3.5" aria-hidden />
-                  Preview{displayDraft.kpis.length > 0 ? ` (${displayDraft.kpis.length})` : ""}
+                  Preview{displayDraft.kpis.length > 0 ? ` (${draftKpiCounts(displayDraft.kpis).kpis})` : ""}
                 </a>
               </Button>
             )}

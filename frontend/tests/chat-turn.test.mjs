@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  draftKpiCounts,
   draftSignature,
   mergeInterimDraft,
   sameEvents,
@@ -59,4 +60,19 @@ test("sameEvents / weightedLeafProgress / stripEditSummary / failure messages", 
     assert.ok(turnFailureMessage(c).length > 10);
   }
   assert.notEqual(turnFailureMessage("cancelled"), turnFailureMessage("turn_failed"));
+});
+
+test("draftKpiCounts: categories are grouping headers, not KPIs (114 nodes = 97 KPIs + 17 categories)", () => {
+  const nodes = [];
+  for (let c = 0; c < 17; c++) nodes.push(kpi(`Category ${c}`, null));
+  let leaf = 0;
+  for (let c = 0; c < 17; c++) {
+    const n = c < 12 ? 6 : 5; // 12*6 + 5*5 = 97 leaves
+    for (let i = 0; i < n; i++) nodes.push(kpi(`KPI ${leaf++}`, 1, `draft-Category ${c}`));
+  }
+  assert.equal(nodes.length, 114);
+  assert.deepEqual(draftKpiCounts(nodes), { kpis: 97, categories: 17 });
+  // a flat scorecard has no categories
+  assert.deepEqual(draftKpiCounts([kpi("A", 50), kpi("B", 50)]), { kpis: 2, categories: 0 });
+  assert.deepEqual(draftKpiCounts([]), { kpis: 0, categories: 0 });
 });

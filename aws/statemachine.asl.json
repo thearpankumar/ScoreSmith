@@ -1,0 +1,520 @@
+{
+  "Comment": "qs-eval-pipeline: one execution per evaluation. Ingest -> per-file fan-out (docs: ExtractDoc -> AnalyzeImage per image; video: PlanAudio -> TranscribeChunk per chunk -> merge) -> Assemble. Only S3 keys travel between states (256 KB payload limit). Placeholders like ${IngestFnArn} are substituted by aws/bootstrap.",
+  "StartAt": "Ingest",
+  "TimeoutSeconds": 14400,
+  "States": {
+    "Ingest": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${IngestFnArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "manifest_key.$": "$.Payload.manifest_key",
+        "files.$": "$.Payload.files"
+      },
+      "ResultPath": "$.ingest",
+      "TimeoutSeconds": 930,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 25,
+          "BackoffRate": 1.3,
+          "MaxDelaySeconds": 30,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "TransientError"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "HandleFailure"
+        }
+      ],
+      "Next": "ProcessFiles"
+    },
+    "ProcessFiles": {
+      "Type": "Map",
+      "ItemsPath": "$.ingest.files",
+      "MaxConcurrency": 2,
+      "ItemSelector": {
+        "evaluation_id.$": "$.evaluation_id",
+        "bucket.$": "$.bucket",
+        "file.$": "$$.Map.Item.Value"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "HandleFailure"
+        }
+      ],
+      "Next": "Assemble",
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "RouteFile",
+        "States": {
+          "RouteFile": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.file.kind",
+                "StringEquals": "pdf",
+                "Next": "ExtractDoc"
+              },
+              {
+                "Variable": "$.file.kind",
+                "StringEquals": "docx",
+                "Next": "ExtractDoc"
+              },
+              {
+                "Variable": "$.file.kind",
+                "StringEquals": "text",
+                "Next": "ExtractDoc"
+              },
+              {
+                "Variable": "$.file.kind",
+                "StringEquals": "video",
+                "Next": "PlanAudio"
+              }
+            ],
+            "Default": "SkipFile"
+          },
+          "SkipFile": {
+            "Type": "Succeed"
+          },
+          "ExtractDoc": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${ExtractDocFnArn}",
+              "Payload.$": "$"
+            },
+            "ResultSelector": {
+              "source_id.$": "$.Payload.source_id",
+              "images.$": "$.Payload.images"
+            },
+            "ResultPath": "$.extract",
+            "TimeoutSeconds": 930,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 3,
+                "MaxAttempts": 25,
+                "BackoffRate": 1.3,
+                "MaxDelaySeconds": 30,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "ResultPath": "$.file_error",
+                "Next": "SkipFile"
+              }
+            ],
+            "Next": "AnalyzeImages"
+          },
+          "AnalyzeImages": {
+            "Type": "Map",
+            "ItemsPath": "$.extract.images",
+            "MaxConcurrency": 3,
+            "ItemSelector": {
+              "evaluation_id.$": "$.evaluation_id",
+              "bucket.$": "$.bucket",
+              "source_id.$": "$.extract.source_id",
+              "image_key.$": "$$.Map.Item.Value"
+            },
+            "ResultPath": null,
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "ResultPath": "$.file_error",
+                "Next": "SkipFile"
+              }
+            ],
+            "End": true,
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "AnalyzeImage",
+              "States": {
+                "AnalyzeImage": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${AnalyzeImageFnArn}",
+                    "Payload.$": "$"
+                  },
+                  "ResultSelector": {
+                    "ok.$": "$.Payload.ok"
+                  },
+                  "TimeoutSeconds": 930,
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "Lambda.TooManyRequestsException"
+                      ],
+                      "IntervalSeconds": 3,
+                      "MaxAttempts": 25,
+                      "BackoffRate": 1.3,
+                      "MaxDelaySeconds": 30,
+                      "JitterStrategy": "FULL"
+                    },
+                    {
+                      "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException"
+                      ],
+                      "IntervalSeconds": 2,
+                      "MaxAttempts": 6,
+                      "BackoffRate": 2,
+                      "JitterStrategy": "FULL"
+                    },
+                    {
+                      "ErrorEquals": [
+                        "TransientError"
+                      ],
+                      "IntervalSeconds": 10,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2,
+                      "JitterStrategy": "FULL"
+                    }
+                  ],
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "ResultPath": "$.image_error",
+                      "Next": "ImageGaveUp"
+                    }
+                  ],
+                  "End": true
+                },
+                "ImageGaveUp": {
+                  "Type": "Pass",
+                  "End": true
+                }
+              }
+            }
+          },
+          "PlanAudio": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${PlanAudioFnArn}",
+              "Payload.$": "$"
+            },
+            "ResultSelector": {
+              "source_id.$": "$.Payload.source_id",
+              "chunks.$": "$.Payload.chunks"
+            },
+            "ResultPath": "$.plan",
+            "TimeoutSeconds": 930,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 3,
+                "MaxAttempts": 25,
+                "BackoffRate": 1.3,
+                "MaxDelaySeconds": 30,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "ResultPath": "$.file_error",
+                "Next": "SkipFile"
+              }
+            ],
+            "Next": "TranscribeChunks"
+          },
+          "TranscribeChunks": {
+            "Type": "Map",
+            "ItemsPath": "$.plan.chunks",
+            "MaxConcurrency": 3,
+            "ItemSelector": {
+              "evaluation_id.$": "$.evaluation_id",
+              "bucket.$": "$.bucket",
+              "source_id.$": "$.plan.source_id",
+              "chunk.$": "$$.Map.Item.Value"
+            },
+            "ResultPath": null,
+            "Next": "MergeTranscript",
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "TranscribeChunk",
+              "States": {
+                "TranscribeChunk": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${TranscribeChunkFnArn}",
+                    "Payload.$": "$"
+                  },
+                  "ResultSelector": {
+                    "index.$": "$.Payload.index"
+                  },
+                  "TimeoutSeconds": 930,
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "Lambda.TooManyRequestsException"
+                      ],
+                      "IntervalSeconds": 3,
+                      "MaxAttempts": 25,
+                      "BackoffRate": 1.3,
+                      "MaxDelaySeconds": 30,
+                      "JitterStrategy": "FULL"
+                    },
+                    {
+                      "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException"
+                      ],
+                      "IntervalSeconds": 2,
+                      "MaxAttempts": 6,
+                      "BackoffRate": 2,
+                      "JitterStrategy": "FULL"
+                    },
+                    {
+                      "ErrorEquals": [
+                        "TransientError"
+                      ],
+                      "IntervalSeconds": 10,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2,
+                      "JitterStrategy": "FULL"
+                    }
+                  ],
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.ALL"
+                      ],
+                      "ResultPath": "$.chunk_error",
+                      "Next": "ChunkGaveUp"
+                    }
+                  ],
+                  "End": true
+                },
+                "ChunkGaveUp": {
+                  "Type": "Pass",
+                  "End": true
+                }
+              }
+            }
+          },
+          "MergeTranscript": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${AssembleFnArn}",
+              "Payload": {
+                "mode": "merge_video",
+                "evaluation_id.$": "$.evaluation_id",
+                "bucket.$": "$.bucket",
+                "file.$": "$.file"
+              }
+            },
+            "ResultPath": null,
+            "TimeoutSeconds": 300,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 3,
+                "MaxAttempts": 25,
+                "BackoffRate": 1.3,
+                "MaxDelaySeconds": 30,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "ResultPath": "$.file_error",
+                "Next": "SkipFile"
+              }
+            ],
+            "End": true
+          }
+        }
+      }
+    },
+    "Assemble": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AssembleFnArn}",
+        "Payload": {
+          "mode": "assemble",
+          "evaluation_id.$": "$.evaluation_id",
+          "bucket.$": "$.bucket"
+        }
+      },
+      "ResultSelector": {
+        "corpus_key.$": "$.Payload.corpus_key"
+      },
+      "ResultPath": "$.assemble",
+      "TimeoutSeconds": 930,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 25,
+          "BackoffRate": 1.3,
+          "MaxDelaySeconds": 30,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "HandleFailure"
+        }
+      ],
+      "End": true
+    },
+    "HandleFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AssembleFnArn}",
+        "Payload": {
+          "mode": "fail",
+          "evaluation_id.$": "$.evaluation_id",
+          "bucket.$": "$.bucket",
+          "error.$": "$.error"
+        }
+      },
+      "ResultPath": null,
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "PipelineFailed"
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineFailed",
+      "Cause": "See derived/{evaluation_id}/status.json for the error code."
+    }
+  }
+}

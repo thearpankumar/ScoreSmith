@@ -122,3 +122,49 @@ async def test_materialize_surfaces_db_weight_sum_violation(async_db_session) ->
     assert not draft.is_complete()
     with pytest.raises(ValueError, match="incomplete"):
         await materialize_draft(db, draft, owner_id=owner.id)
+
+
+async def test_materialize_saves_a_draft_with_unscored_weightless_leaves(async_db_session) -> None:
+    """A draft whose informational leaves carry no weight (like the 114-KPI hackathon chat) must save: the
+    weight-sum trigger only counts scored leaves, so 60 + 40 = 100 passes."""
+    db = async_db_session
+    owner = User(email=f"unscored-{uuid.uuid4().hex[:8]}@example.com", name="Unscored Owner")
+    db.add(owner)
+    await db.flush()
+    await db.commit()
+
+    draft = ScorecardDraft.model_validate(
+        {
+            "name": "Hackathon Solution Scoring",
+            "purpose": "Score solution documents.",
+            "domain": "Hackathon",
+            "target_score": 9,
+            "kpis": [
+                {"name": "Quality", "level": 1},
+                {"name": "Clarity", "level": 2, "parent_name": "Quality", "weight": 60, "guidelines": full_rubric()},
+                {"name": "Depth", "level": 2, "parent_name": "Quality", "weight": 40, "guidelines": full_rubric()},
+                {"name": "Declarations", "level": 1},
+                {
+                    "name": "DC-1: AI tools are declared",
+                    "level": 2,
+                    "parent_name": "Declarations",
+                    "included_in_scoring": False,
+                    "guidelines": full_rubric(),
+                },
+                {"name": "Appendix", "level": 1, "included_in_scoring": False, "guidelines": full_rubric()},
+            ],
+        }
+    )
+    assert draft.is_complete(), draft.missing_fields()
+
+    _scorecard, version = await materialize_draft(db, draft, owner_id=owner.id)
+
+    nodes = (
+        (await db.execute(select(KpiNode).where(KpiNode.scorecard_version_id == version.id))).scalars().all()
+    )
+    by_name = {n.name: n for n in nodes}
+    assert len(nodes) == 6
+    assert by_name["DC-1: AI tools are declared"].included_in_scoring is False
+    assert by_name["Appendix"].included_in_scoring is False
+    scored = [n for n in nodes if n.included_in_scoring and n.weight is not None]
+    assert sum(float(n.weight) for n in scored) == 100

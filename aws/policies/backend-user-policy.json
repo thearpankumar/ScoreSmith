@@ -1,0 +1,40 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ObjectsInAppPrefixes",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+      "Resource": [
+        "arn:aws:s3:::${BUCKET}/uploads/*",
+        "arn:aws:s3:::${BUCKET}/batches/*",
+        "arn:aws:s3:::${BUCKET}/derived/*"
+      ]
+    },
+    {
+      "Sid": "ListAppPrefixes",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::${BUCKET}",
+      "Condition": { "StringLike": { "s3:prefix": ["uploads/*", "batches/*", "derived/*"] } }
+    },
+    {
+      "Sid": "ListInFlightMultipartUploads",
+      "Effect": "Allow",
+      "Action": "s3:ListBucketMultipartUploads",
+      "Resource": "arn:aws:s3:::${BUCKET}"
+    },
+    {
+      "Sid": "StartEvaluations",
+      "Effect": "Allow",
+      "Action": "states:StartExecution",
+      "Resource": "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:qs-eval-pipeline"
+    },
+    {
+      "Sid": "DescribeAndStopExecutions",
+      "Effect": "Allow",
+      "Action": ["states:DescribeExecution", "states:StopExecution"],
+      "Resource": "arn:aws:states:${REGION}:${ACCOUNT_ID}:execution:qs-eval-pipeline:*"
+    }
+  ]
+}

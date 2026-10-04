@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import { Bot, CheckCircle2, Loader2, SlidersHorizontal, Sparkles } from "lucide-react";
+import { Bot, Loader2, SlidersHorizontal } from "lucide-react";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
 import { SolidPanel } from "@/components/design-system/SolidPanel";
@@ -13,7 +13,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ScorePicker } from "./ScorePicker";
-import { createEvaluation, createManualEvaluation } from "@/lib/api-client";
+import { AiJudge } from "./ai-judge/AiJudge";
+import { createManualEvaluation } from "@/lib/api-client";
 import { computeWeightedFinalScore, effectiveLeafWeights, leafKpiNodes } from "@/lib/kpi-tree";
 import { getRagBand } from "@/lib/rag";
 import { cn } from "@/lib/utils";
@@ -29,7 +30,7 @@ type Mode = EvaluateMode;
  *    KPI, with a live weighted final score / RAG band computed client-side using the
  *    exact backend judge math. Persists through the plain evaluation CRUD routes — no
  *    AI / Bedrock involved, so it works in environments without AWS credentials.
- *  - "Ask the AI judge": the original paste-the-input-and-run flow.
+ *  - "Ask the AI judge": files / Drive links / spreadsheet queued as background jobs (see ./ai-judge).
  */
 export function EvaluateTab({
   scorecardId,
@@ -56,7 +57,7 @@ export function EvaluateTab({
           setName={setName}
         />
       ) : (
-        <AiJudge scorecardId={scorecardId} kpiNodes={kpiNodes} name={name} setName={setName} />
+        <AiJudge scorecardId={scorecardId} kpiNodes={kpiNodes} />
       )}
     </div>
   );
@@ -348,179 +349,6 @@ function ManualScoring({
             {" "}to submit.
           </p>
         )}
-      </SolidPanel>
-    </form>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// AI judge (original flow)
-// ---------------------------------------------------------------------------
-
-function AiJudge({
-  scorecardId,
-  kpiNodes,
-  name,
-  setName,
-}: {
-  scorecardId: string;
-  kpiNodes: KpiNode[];
-  name: string;
-  setName: (v: string) => void;
-}) {
-  const router = useRouter();
-  const leaves = leafKpiNodes(kpiNodes);
-
-  const [inputText, setInputText] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [scoredCount, setScoredCount] = useState(0);
-  const [error, setError] = useState<string | null>(null);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  useEffect(
-    () => () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    },
-    [],
-  );
-
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    if (!name.trim() || !inputText.trim() || submitting) return;
-
-    setSubmitting(true);
-    setError(null);
-    setScoredCount(0);
-
-    // Simulated streamed per-KPI judge progress (the real backend does this
-    // as one Bedrock call per KPI, streamed back over the endpoint).
-    intervalRef.current = setInterval(() => {
-      setScoredCount((c) => Math.min(c + 1, leaves.length));
-    }, 260);
-
-    try {
-      const evaluation = await createEvaluation({
-        scorecardId,
-        name: name.trim(),
-        inputSummary: name.trim(),
-        inputText,
-      });
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      setScoredCount(leaves.length);
-      router.push(`/charts/${scorecardId}/evaluations/${evaluation.id}`);
-    } catch {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      setSubmitting(false);
-      setError("Something went wrong running this evaluation. Please try again.");
-    }
-  }
-
-  const charCount = inputText.trim().length;
-  const canSubmit = !submitting && name.trim().length > 0 && charCount > 0;
-
-  return (
-    <form
-      onSubmit={handleSubmit}
-      className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[minmax(0,1fr)_20rem] xl:grid-cols-[minmax(0,1fr)_24rem]"
-    >
-      <GlassCard elevation={1} className="flex min-w-0 flex-col gap-5 p-5 sm:p-7">
-        <div className="flex items-start gap-3">
-          <span className="flex size-10 shrink-0 items-center justify-center rounded-full bg-lemon text-lemon-ink">
-            <Sparkles className="size-5" aria-hidden />
-          </span>
-          <div className="min-w-0">
-            <h2 className="text-lg font-semibold text-ink">Ask the AI judge</h2>
-            <p className="mt-0.5 text-sm text-ink-muted">
-              Paste the work to be rated and the AI judge scores every KPI against its guidelines. Requires the AI
-              service to be available — switch to &ldquo;Score manually&rdquo; otherwise.
-            </p>
-          </div>
-        </div>
-
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="eval-name">Evaluation name</Label>
-          <Input
-            id="eval-name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. Ticket #48213 — refund escalation"
-            disabled={submitting}
-            required
-          />
-        </div>
-
-        <div className="flex flex-col gap-1.5">
-          <div className="flex items-baseline justify-between gap-2">
-            <Label htmlFor="eval-input">Input to evaluate</Label>
-            <span className="text-xs tabular-nums text-ink-muted">{charCount.toLocaleString()} characters</span>
-          </div>
-          <Textarea
-            id="eval-input"
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-            placeholder="Paste the document, reply, or transcript to rate…"
-            className="min-h-64 bg-solid sm:min-h-80"
-            disabled={submitting}
-            required
-          />
-        </div>
-
-        {error && (
-          <p className="text-sm text-[var(--rag-poor)]" role="alert">
-            {error}
-          </p>
-        )}
-
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <p className="text-xs text-ink-muted">
-            {leaves.length} KPI{leaves.length === 1 ? "" : "s"} will be scored · results open automatically
-          </p>
-          <Button type="submit" disabled={!canSubmit} size="lg">
-            {submitting ? (
-              <>
-                <Loader2 className="size-4 animate-spin" aria-hidden /> Running evaluation…
-              </>
-            ) : (
-              "Run evaluation"
-            )}
-          </Button>
-        </div>
-      </GlassCard>
-
-      <SolidPanel className="flex min-w-0 flex-col gap-3 p-5 lg:sticky lg:top-4" aria-live="polite">
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-xs font-semibold uppercase tracking-wide text-ink-muted">
-            {submitting ? "Scoring in progress" : "KPIs the judge will score"}
-          </p>
-          <Badge variant="muted" className="tabular-nums">
-            {submitting ? `${scoredCount}/${leaves.length}` : leaves.length}
-          </Badge>
-        </div>
-        {submitting && (
-          <div className="h-2 overflow-hidden rounded-full bg-black/5" role="status">
-            <div
-              className="h-full rounded-full bg-lemon transition-[width]"
-              style={{ width: `${leaves.length ? (scoredCount / leaves.length) * 100 : 0}%` }}
-            />
-          </div>
-        )}
-        <ul className="thin-scrollbar max-h-[28rem] space-y-1.5 overflow-y-auto pr-1">
-          {leaves.map((kpi, i) => (
-            <li key={kpi.id} className="flex items-start gap-2 text-sm text-ink">
-              {submitting && i < scoredCount ? (
-                <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-[var(--rag-excellent)]" aria-hidden />
-              ) : (
-                <span
-                  className="mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border border-hairline text-[9px] tabular-nums text-ink-muted"
-                  aria-hidden
-                >
-                  {submitting ? "" : i + 1}
-                </span>
-              )}
-              <span className="min-w-0 break-words">{kpi.name}</span>
-            </li>
-          ))}
-        </ul>
       </SolidPanel>
     </form>
   );

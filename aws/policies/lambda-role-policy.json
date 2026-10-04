@@ -1,0 +1,45 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadUploads",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::${BUCKET}/uploads/*"
+    },
+    {
+      "Sid": "RawAndDerivedReadWrite",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": ["arn:aws:s3:::${BUCKET}/raw/*", "arn:aws:s3:::${BUCKET}/derived/*"]
+    },
+    {
+      "Sid": "ListPrefixes",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::${BUCKET}",
+      "Condition": { "StringLike": { "s3:prefix": ["derived/*", "raw/*", "uploads/*"] } }
+    },
+    {
+      "Sid": "InvokeOnlyThePipelineModels",
+      "Effect": "Allow",
+      "Action": "bedrock:InvokeModel",
+      "Resource": [
+        "arn:aws:bedrock:${REGION}::foundation-model/mistral.voxtral-small-24b-2507",
+        "arn:aws:bedrock:${REGION}::foundation-model/mistral.voxtral-mini-3b-2507",
+        "arn:aws:bedrock:${REGION}::foundation-model/moonshotai.kimi-k2.5",
+        "arn:aws:bedrock:${REGION}::foundation-model/qwen.qwen3-vl-235b-a22b",
+        "arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:inference-profile/us.meta.llama4-maverick-17b-instruct-v1:0",
+        "arn:aws:bedrock:us-east-1::foundation-model/meta.llama4-maverick-17b-instruct-v1:0",
+        "arn:aws:bedrock:us-east-2::foundation-model/meta.llama4-maverick-17b-instruct-v1:0",
+        "arn:aws:bedrock:us-west-2::foundation-model/meta.llama4-maverick-17b-instruct-v1:0"
+      ]
+    },
+    {
+      "Sid": "WriteOwnLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/qs-eval-*:*"
+    }
+  ]
+}
