@@ -121,18 +121,18 @@ export function NavRail() {
         </div>
       </div>
 
-      <div className="mt-auto flex shrink-0 justify-center pt-2">
-        <button
-          type="button"
-          onClick={() => setCollapsed(!collapsed)}
-          aria-expanded={!collapsed}
-          aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
-          title={collapsed ? "Expand navigation" : "Collapse navigation"}
-          className="rounded-full p-1.5 text-ink-muted hover:bg-black/5 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
-        >
-          {collapsed ? <PanelLeftOpen className="size-4.5" aria-hidden /> : <PanelLeftClose className="size-4.5" aria-hidden />}
-        </button>
-      </div>
+      {/* Collapse toggle: straddles the rail's right edge at mid-height, so it reads as a
+          handle on the sidebar's border instead of a row at the bottom. */}
+      <button
+        type="button"
+        onClick={() => setCollapsed(!collapsed)}
+        aria-expanded={!collapsed}
+        aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
+        title={collapsed ? "Expand navigation" : "Collapse navigation"}
+        className="absolute top-1/2 -right-3.5 z-10 flex size-7 -translate-y-1/2 items-center justify-center rounded-full border border-hairline bg-solid text-ink-muted shadow-sm transition-colors hover:bg-lemon hover:text-lemon-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
+      >
+        {collapsed ? <PanelLeftOpen className="size-4" aria-hidden /> : <PanelLeftClose className="size-4" aria-hidden />}
+      </button>
     </nav>
   );
 }

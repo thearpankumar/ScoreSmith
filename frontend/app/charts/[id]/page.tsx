@@ -2,11 +2,11 @@ import { notFound } from "next/navigation";
 
 import { OverviewTab } from "@/components/chart-detail/OverviewTab";
 import { GuidelinesMatrix } from "@/components/chart-detail/GuidelinesMatrix";
-import { EvaluateTab } from "@/components/chart-detail/EvaluateTab";
+import { ChartDetailTabs } from "@/components/chart-detail/ChartDetailTabs";
+import { CHART_TABS } from "@/components/chart-detail/chart-tabs";
 import { HistoryTab } from "@/components/chart-detail/HistoryTab";
 import { ScorecardActions } from "@/components/chart-detail/ScorecardActions";
 import { ScorecardStatusBadge } from "@/components/charts-library/ScorecardStatusBadge";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   getCurrentUserId,
   getScorecardWithVersion,
@@ -18,8 +18,6 @@ import { guidelineCoverage, leafKpiNodes, validateSiblingWeights } from "@/lib/k
 // Forced dynamic: live backend fetch on every request (see lib/api-client.ts apiFetch docstring).
 export const dynamic = "force-dynamic";
 
-const TABS = ["overview", "guidelines", "evaluate", "history"] as const;
-
 export default async function ChartDetailPage({
   params,
   searchParams,
@@ -30,7 +28,7 @@ export default async function ChartDetailPage({
   const { id } = await params;
   const { tab } = await searchParams;
   // `?tab=evaluate` etc. deep-links straight to a tab (e.g. from a "Score it" link).
-  const initialTab = TABS.find((t) => t === tab) ?? "overview";
+  const initialTab = CHART_TABS.find((t) => t === tab) ?? "overview";
   const withVersion = await getScorecardWithVersion(id);
   if (!withVersion) notFound();
   const { scorecard, version } = withVersion;
@@ -68,37 +66,29 @@ export default async function ChartDetailPage({
         />
       </div>
 
-      <Tabs defaultValue={initialTab}>
-        <TabsList>
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="guidelines">Guidelines</TabsTrigger>
-          <TabsTrigger value="evaluate">Evaluate</TabsTrigger>
-          <TabsTrigger value="history">History</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="overview">
+      <ChartDetailTabs
+        initialTab={initialTab}
+        scorecardId={scorecard.id}
+        kpiNodes={version.kpiNodes}
+        targetScore={scorecard.targetScore}
+        overview={
           <OverviewTab
             scorecard={scorecard}
             version={version}
             currentUserId={currentUserId}
             evaluationCount={versionEvaluationCount}
           />
-        </TabsContent>
-        <TabsContent value="guidelines">
-          <GuidelinesMatrix kpiNodes={version.kpiNodes} evaluations={evaluations} />
-        </TabsContent>
-        <TabsContent value="evaluate">
-          <EvaluateTab scorecardId={scorecard.id} kpiNodes={version.kpiNodes} targetScore={scorecard.targetScore} />
-        </TabsContent>
-        <TabsContent value="history">
+        }
+        guidelines={<GuidelinesMatrix kpiNodes={version.kpiNodes} evaluations={evaluations} />}
+        history={
           <HistoryTab
             scorecardId={scorecard.id}
             evaluations={evaluations}
             versionNumbers={versionNumbers}
             currentVersionId={version.id}
           />
-        </TabsContent>
-      </Tabs>
+        }
+      />
     </div>
   );
 }

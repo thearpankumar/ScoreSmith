@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import { Bot, CheckCircle2, Loader2, SlidersHorizontal } from "lucide-react";
+import { Bot, CheckCircle2, Loader2, SlidersHorizontal, Sparkles } from "lucide-react";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
 import { SolidPanel } from "@/components/design-system/SolidPanel";
@@ -19,7 +19,8 @@ import { getRagBand } from "@/lib/rag";
 import { cn } from "@/lib/utils";
 import type { KpiNode } from "@/lib/types";
 
-type Mode = "manual" | "ai";
+export type EvaluateMode = "manual" | "ai";
+type Mode = EvaluateMode;
 
 /**
  * Evaluate tab with two parallel paths that both land on the same evaluation result
@@ -34,25 +35,18 @@ export function EvaluateTab({
   scorecardId,
   kpiNodes,
   targetScore,
+  mode,
 }: {
   scorecardId: string;
   kpiNodes: KpiNode[];
   targetScore?: number;
+  /** Controlled by the parent so the mode switch can live on the tab row (see ChartDetailTabs). */
+  mode: Mode;
 }) {
-  const [mode, setMode] = useState<Mode>("manual");
   const [name, setName] = useState("");
 
   return (
     <div className="flex flex-col gap-4">
-      <div role="group" aria-label="Evaluation mode" className="glass-elev-1 inline-flex self-start rounded-full p-1">
-        <ModeButton active={mode === "manual"} onClick={() => setMode("manual")} icon={SlidersHorizontal}>
-          Score manually
-        </ModeButton>
-        <ModeButton active={mode === "ai"} onClick={() => setMode("ai")} icon={Bot}>
-          Ask the AI judge
-        </ModeButton>
-      </div>
-
       {mode === "manual" ? (
         <ManualScoring
           scorecardId={scorecardId}
@@ -64,6 +58,19 @@ export function EvaluateTab({
       ) : (
         <AiJudge scorecardId={scorecardId} kpiNodes={kpiNodes} name={name} setName={setName} />
       )}
+    </div>
+  );
+}
+
+export function EvaluateModeToggle({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => void }) {
+  return (
+    <div role="group" aria-label="Evaluation mode" className="glass-elev-1 inline-flex h-11 items-center rounded-full p-1">
+      <ModeButton active={mode === "manual"} onClick={() => onChange("manual")} icon={SlidersHorizontal}>
+        Score manually
+      </ModeButton>
+      <ModeButton active={mode === "ai"} onClick={() => onChange("ai")} icon={Bot}>
+        Ask the AI judge
+      </ModeButton>
     </div>
   );
 }
@@ -408,13 +415,28 @@ function AiJudge({
     }
   }
 
+  const charCount = inputText.trim().length;
+  const canSubmit = !submitting && name.trim().length > 0 && charCount > 0;
+
   return (
-    <GlassCard elevation={1} className="max-w-2xl p-6">
-      <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-        <p className="text-sm text-ink-muted">
-          Paste the work to be rated and the AI judge scores every KPI against its guidelines. Requires the AI service
-          to be available — use &ldquo;Score manually&rdquo; otherwise.
-        </p>
+    <form
+      onSubmit={handleSubmit}
+      className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[minmax(0,1fr)_20rem] xl:grid-cols-[minmax(0,1fr)_24rem]"
+    >
+      <GlassCard elevation={1} className="flex min-w-0 flex-col gap-5 p-5 sm:p-7">
+        <div className="flex items-start gap-3">
+          <span className="flex size-10 shrink-0 items-center justify-center rounded-full bg-lemon text-lemon-ink">
+            <Sparkles className="size-5" aria-hidden />
+          </span>
+          <div className="min-w-0">
+            <h2 className="text-lg font-semibold text-ink">Ask the AI judge</h2>
+            <p className="mt-0.5 text-sm text-ink-muted">
+              Paste the work to be rated and the AI judge scores every KPI against its guidelines. Requires the AI
+              service to be available — switch to &ldquo;Score manually&rdquo; otherwise.
+            </p>
+          </div>
+        </div>
+
         <div className="flex flex-col gap-1.5">
           <Label htmlFor="eval-name">Evaluation name</Label>
           <Input
@@ -426,46 +448,80 @@ function AiJudge({
             required
           />
         </div>
+
         <div className="flex flex-col gap-1.5">
-          <Label htmlFor="eval-input">Input to evaluate</Label>
+          <div className="flex items-baseline justify-between gap-2">
+            <Label htmlFor="eval-input">Input to evaluate</Label>
+            <span className="text-xs tabular-nums text-ink-muted">{charCount.toLocaleString()} characters</span>
+          </div>
           <Textarea
             id="eval-input"
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
             placeholder="Paste the document, reply, or transcript to rate…"
-            className="min-h-40 bg-solid"
+            className="min-h-64 bg-solid sm:min-h-80"
             disabled={submitting}
             required
           />
         </div>
 
-        {submitting && (
-          <div className="rounded-xl border border-hairline bg-bg p-4" role="status" aria-live="polite">
-            <p className="mb-2 flex items-center gap-2 text-sm font-medium text-ink">
-              <Loader2 className="size-4 animate-spin text-lemon-ink" aria-hidden />
-              Scoring KPIs ({scoredCount}/{leaves.length})…
-            </p>
-            <ul className="space-y-1">
-              {leaves.map((kpi, i) => (
-                <li key={kpi.id} className="flex items-center gap-2 text-xs text-ink-muted">
-                  {i < scoredCount ? (
-                    <CheckCircle2 className="size-3.5 text-[var(--rag-excellent)]" aria-hidden />
-                  ) : (
-                    <span className="size-3.5 rounded-full border border-hairline" aria-hidden />
-                  )}
-                  {kpi.name}
-                </li>
-              ))}
-            </ul>
-          </div>
+        {error && (
+          <p className="text-sm text-[var(--rag-poor)]" role="alert">
+            {error}
+          </p>
         )}
 
-        {error && <p className="text-sm text-[var(--rag-poor)]">{error}</p>}
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-xs text-ink-muted">
+            {leaves.length} KPI{leaves.length === 1 ? "" : "s"} will be scored · results open automatically
+          </p>
+          <Button type="submit" disabled={!canSubmit} size="lg">
+            {submitting ? (
+              <>
+                <Loader2 className="size-4 animate-spin" aria-hidden /> Running evaluation…
+              </>
+            ) : (
+              "Run evaluation"
+            )}
+          </Button>
+        </div>
+      </GlassCard>
 
-        <Button type="submit" disabled={submitting || !name.trim() || !inputText.trim()} className="self-start">
-          {submitting ? "Running evaluation…" : "Run evaluation"}
-        </Button>
-      </form>
-    </GlassCard>
+      <SolidPanel className="flex min-w-0 flex-col gap-3 p-5 lg:sticky lg:top-4" aria-live="polite">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-xs font-semibold uppercase tracking-wide text-ink-muted">
+            {submitting ? "Scoring in progress" : "KPIs the judge will score"}
+          </p>
+          <Badge variant="muted" className="tabular-nums">
+            {submitting ? `${scoredCount}/${leaves.length}` : leaves.length}
+          </Badge>
+        </div>
+        {submitting && (
+          <div className="h-2 overflow-hidden rounded-full bg-black/5" role="status">
+            <div
+              className="h-full rounded-full bg-lemon transition-[width]"
+              style={{ width: `${leaves.length ? (scoredCount / leaves.length) * 100 : 0}%` }}
+            />
+          </div>
+        )}
+        <ul className="thin-scrollbar max-h-[28rem] space-y-1.5 overflow-y-auto pr-1">
+          {leaves.map((kpi, i) => (
+            <li key={kpi.id} className="flex items-start gap-2 text-sm text-ink">
+              {submitting && i < scoredCount ? (
+                <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-[var(--rag-excellent)]" aria-hidden />
+              ) : (
+                <span
+                  className="mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border border-hairline text-[9px] tabular-nums text-ink-muted"
+                  aria-hidden
+                >
+                  {submitting ? "" : i + 1}
+                </span>
+              )}
+              <span className="min-w-0 break-words">{kpi.name}</span>
+            </li>
+          ))}
+        </ul>
+      </SolidPanel>
+    </form>
   );
 }
