@@ -40,7 +40,7 @@ class RagBand(enum.StrEnum):
 
     BAND_10_9 = "band_10_9"  # dark green  #1B5E20
     BAND_8 = "band_8"  # green       #66BB6A
-    BAND_7 = "band_7"  # grey        #9E9E9E
+    BAND_7 = "band_7"  # light green #9CCC65
     BAND_6 = "band_6"  # amber       #F9A825
     BAND_5 = "band_5"  # orange      #E65100
     BAND_4 = "band_4"  # red         #D32F2F

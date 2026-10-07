@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -28,6 +29,8 @@ from app.schemas.scorecard import (
     ScorecardVersionReadWithKpiNodes,
     ScorecardVersionUpdate,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/scorecards", tags=["scorecards"])
 
@@ -143,6 +146,7 @@ async def update_scorecard(
     scorecard = await db.get(Scorecard, scorecard_id)
     if scorecard is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard not found.")
+    old_target = scorecard.target_score
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(scorecard, field, value)
     try:
@@ -151,6 +155,12 @@ async def update_scorecard(
         await db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc.orig)) from exc
     await db.refresh(scorecard)
+    if scorecard.target_score != old_target:
+        # Scores are coloured against the target at read time (UI and Excel), so nothing needs recomputing.
+        logger.info(
+            "scorecard target changed: scorecard=%s user=%s old=%s new=%s",
+            scorecard.id, current_user.id, old_target, scorecard.target_score,
+        )
     return scorecard
 
 

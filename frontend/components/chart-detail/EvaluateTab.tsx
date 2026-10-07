@@ -230,7 +230,7 @@ function ManualScoring({
                       <Badge variant="outline" title="Share of the whole scorecard">
                         {((effective[kpi.id] ?? 0) * 100).toFixed(1)}% of total
                       </Badge>
-                      {selected !== undefined && <RagBadge score={selected} size="sm" showScore={false} />}
+                      {selected !== undefined && <RagBadge score={selected} size="sm" showScore={false} target={targetScore} />}
                     </div>
                   </div>
 
@@ -294,7 +294,7 @@ function ManualScoring({
             <span className="text-base font-normal text-ink-muted"> / 10</span>
           </p>
           <div className="mt-2">
-            <RagBadge score={finalScore} showScore={false} />
+            <RagBadge score={finalScore} showScore={false} target={targetScore} />
           </div>
           {!allScored && (
             <p className="mt-2 text-xs text-ink-muted">

@@ -12,7 +12,7 @@ import {
 import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
 
 import { SolidPanel } from "@/components/design-system/SolidPanel";
-import { getRagBand } from "@/lib/rag";
+import { getTargetBand } from "@/lib/rag";
 import { cn } from "@/lib/utils";
 import type { EvaluationKpiResult } from "@/lib/types";
 
@@ -52,7 +52,7 @@ export function KpiSummaryTable({
         header: "Score",
         cell: (info) => {
           const score = info.getValue();
-          const band = getRagBand(score);
+          const band = getTargetBand(score, targetScore);
           return (
             <div className="flex items-center gap-2">
               <div className="h-2 w-24 overflow-hidden rounded-full bg-black/5">
@@ -86,7 +86,7 @@ export function KpiSummaryTable({
         },
       }),
     ],
-    [],
+    [targetScore],
   );
 
   const table = useReactTable({

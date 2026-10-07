@@ -1,4 +1,4 @@
-import { getRagBand, hexToRgba } from "@/lib/rag";
+import { getRagBand, getTargetBand, hexToRgba } from "@/lib/rag";
 import { cn } from "@/lib/utils";
 
 export interface RagBadgeProps {
@@ -6,6 +6,12 @@ export interface RagBadgeProps {
   size?: "sm" | "md";
   showScore?: boolean;
   className?: string;
+  /**
+   * The scorecard's target score. When given (including `null` = "no target set, use the
+   * default"), the badge is coloured and labelled RELATIVE to that target ("Meets target",
+   * "Below target"…). Omit it only where the absolute 0-10 band is meant (guideline rungs).
+   */
+  target?: number | null;
 }
 
 /**
@@ -19,8 +25,8 @@ export interface RagBadgeProps {
  * even for the lighter bands (e.g. "Good" #66BB6A) which would fail
  * contrast as solid text/icon fill on a light background.
  */
-export function RagBadge({ score, size = "md", showScore = true, className }: RagBadgeProps) {
-  const band = getRagBand(score);
+export function RagBadge({ score, size = "md", showScore = true, className, target }: RagBadgeProps) {
+  const band = target === undefined ? getRagBand(score) : getTargetBand(score, target);
   const Icon = band.icon;
   const isSm = size === "sm";
 

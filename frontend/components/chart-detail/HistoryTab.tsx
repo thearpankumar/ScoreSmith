@@ -68,7 +68,7 @@ export function HistoryTab({
             </div>
             <div className="flex shrink-0 items-center gap-3">
               {evaluation.status === "completed" ? (
-                <RagBadge score={evaluation.finalWeightedScore} size="sm" />
+                <RagBadge score={evaluation.finalWeightedScore} size="sm" target={evaluation.targetScore} />
               ) : (
                 <EvaluationStatusBadge evaluation={evaluation} />
               )}

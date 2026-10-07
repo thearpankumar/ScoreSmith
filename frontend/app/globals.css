@@ -47,7 +47,7 @@
   /* RAG (red/amber/green) evaluation-score palette — separate from brand */
   --rag-excellent: #1b5e20;
   --rag-good: #66bb6a;
-  --rag-acceptable: #9e9e9e;
+  --rag-acceptable: #9ccc65;
   --rag-needs-improvement: #f9a825;
   --rag-weak: #e65100;
   --rag-poor: #d32f2f;

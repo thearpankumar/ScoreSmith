@@ -6,12 +6,13 @@ import { CheckCircle2, XCircle } from "lucide-react";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
 import { SolidPanel } from "@/components/design-system/SolidPanel";
-import { RagBadge } from "@/components/design-system/RagBadge";
 import { Badge } from "@/components/ui/badge";
 import { ScorecardStatusBadge } from "@/components/charts-library/ScorecardStatusBadge";
 import { KpiStructureTree, type StructureEditing } from "./KpiStructureTree";
 import { ScoringFormulaPanel } from "./ScoringFormulaPanel";
+import { TargetScoreField } from "./TargetScoreField";
 import { guidelineCoverage, leafKpiNodes, validateSiblingWeights } from "@/lib/kpi-tree";
+import { targetEditPermission } from "@/lib/target-score";
 import { formatDate } from "@/lib/utils";
 import { updateScoringFormula, validateScoringFormula } from "@/lib/api-client";
 import type { Scorecard, ScorecardVersion } from "@/lib/types";
@@ -69,10 +70,14 @@ export function OverviewTab({
           <p className="text-xs font-semibold uppercase tracking-wide text-ink-muted">At a glance</p>
           <dl className="mt-3 space-y-2.5 text-sm">
             <Row label="Owner" value={scorecard.ownerName} />
-            <div className="flex items-center justify-between gap-2">
-              <dt className="text-ink-muted">Target score</dt>
+            <div className="flex items-start justify-between gap-2">
+              <dt className="pt-1 text-ink-muted">Target score</dt>
               <dd>
-                <RagBadge score={scorecard.targetScore} size="sm" />
+                <TargetScoreField
+                  scorecardId={scorecard.id}
+                  target={scorecard.targetScore}
+                  {...targetEditPermission(scorecard, currentUserId)}
+                />
               </dd>
             </div>
             <Row

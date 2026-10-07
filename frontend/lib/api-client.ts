@@ -774,6 +774,12 @@ export async function updateScorecardStatus(scorecardId: string, status: Scoreca
   await apiFetch(`/api/v1/scorecards/${scorecardId}`, { method: "PATCH", auth: true, body: { status } });
 }
 
+/** Changes a scorecard's target score (draft or published). PATCH accepts `target_score`
+ * 0..10 without versioning: it only changes how results are coloured and compared. */
+export async function updateScorecardTarget(scorecardId: string, targetScore: number): Promise<void> {
+  await apiFetch(`/api/v1/scorecards/${scorecardId}`, { method: "PATCH", auth: true, body: { target_score: targetScore } });
+}
+
 /** Hover-delete on a scorecard card in the Charts library grid (`DELETE
  * /api/v1/scorecards/{id}` — backend/app/api/v1/scorecards.py::delete_scorecard). */
 export async function deleteScorecard(scorecardId: string): Promise<void> {
@@ -1006,6 +1012,64 @@ function mapEvaluation(be: BeEvaluation, ctx: EnrichmentContext): Evaluation {
     startedAt: be.started_at ?? null,
     finishedAt: be.finished_at ?? null,
   };
+}
+
+export interface EvaluationsExport {
+  blob: Blob;
+  filename: string;
+  /** Evaluations in the workbook / skipped by the server (deleted or not completed). */
+  count: number;
+  skipped: number;
+}
+
+/**
+ * Exports the given evaluations to an .xlsx workbook (`POST /api/v1/evaluations/export`).
+ * Not routed through `apiFetch`, which is JSON-only; shares its base URL, auth header and error formatting.
+ */
+export async function exportEvaluationsXlsx(
+  ids: string[],
+  opts: { includeReasoning: boolean; filterSummary?: string; signal?: AbortSignal },
+): Promise<EvaluationsExport> {
+  const path = "/api/v1/evaluations/export";
+  let res: Response;
+  try {
+    res = await fetch(`${apiBase()}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-User-Id": await getDevUserId() },
+      body: JSON.stringify({
+        evaluation_ids: ids,
+        include_reasoning: opts.includeReasoning,
+        filter_summary: opts.filterSummary ?? null,
+      }),
+      cache: "no-store",
+      signal: opts.signal,
+    });
+  } catch (err) {
+    if (opts.signal?.aborted) throw err;
+    throw new ApiError(`Couldn't reach the server (${err instanceof Error ? err.message : String(err)}).`, 0);
+  }
+
+  if (!res.ok) {
+    let detail = res.statusText || `Export failed (${res.status})`;
+    try {
+      const payload = (await res.json()) as { detail?: unknown };
+      if (payload && payload.detail !== undefined) detail = formatErrorDetail(payload.detail);
+    } catch {
+      // non-JSON error body — keep the status text
+    }
+    throw new ApiError(detail, res.status);
+  }
+
+  const blob = await res.blob();
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, "").replace("T", "-");
+  // Lazy import: keeps api-client.ts loadable by the node test runner (no extension-less runtime imports).
+  const { filenameFromDisposition } = await import("./download");
+  const filename = filenameFromDisposition(res.headers.get("Content-Disposition"), `evaluations_${stamp}.xlsx`);
+  const num = (h: string, fallback: number) => {
+    const v = Number(res.headers.get(h));
+    return res.headers.get(h) !== null && Number.isFinite(v) ? v : fallback;
+  };
+  return { blob, filename, count: num("X-Export-Count", ids.length), skipped: num("X-Export-Skipped", 0) };
 }
 
 export async function listEvaluations(filters?: { scorecardId?: string }): Promise<Evaluation[]> {

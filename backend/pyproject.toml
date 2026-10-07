@@ -31,6 +31,8 @@ dependencies = [
   "simpleeval>=1.0.8",
   # --- AI evaluation pipeline: batch spreadsheet parsing (app/pipeline/batch_parser.py) ---
   "openpyxl>=3.1.5",
+  # --- Excel export of evaluations (app/reporting/workbook.py): styled workbook writer ---
+  "XlsxWriter>=3.2.0,<4",
 ]
 
 [project.optional-dependencies]
@@ -56,6 +58,12 @@ extend-exclude = ["alembic/versions"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# Report layout code and its table-style fixtures read better with long, flat lines.
+"app/reporting/*.py" = ["E501"]
+"tests/*export*.py" = ["E501"]
+"tests/reporting_fixtures.py" = ["E501"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

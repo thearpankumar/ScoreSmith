@@ -77,6 +77,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Lets the browser read the download filename / export counts on the cross-origin Excel export.
+    expose_headers=["Content-Disposition", "X-Export-Count", "X-Export-Skipped"],
 )
 
 

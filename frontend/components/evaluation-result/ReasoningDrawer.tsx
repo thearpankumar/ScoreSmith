@@ -15,10 +15,13 @@ export function ReasoningDrawer({
   result,
   open,
   onOpenChange,
+  target,
 }: {
   result: EvaluationKpiResult | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** The scorecard target the KPI score badge is coloured against. */
+  target?: number | null;
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -28,7 +31,7 @@ export function ReasoningDrawer({
             <SheetHeader>
               <div className="flex items-center gap-2">
                 <SheetTitle>{result.kpiName}</SheetTitle>
-                <RagBadge score={result.score} size="sm" />
+                <RagBadge score={result.score} size="sm" target={target} />
               </div>
               <SheetDescription>Judge reasoning, evidence, and the matched guideline level.</SheetDescription>
             </SheetHeader>

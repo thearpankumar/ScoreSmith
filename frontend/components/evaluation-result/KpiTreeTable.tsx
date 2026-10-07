@@ -27,7 +27,16 @@ const columnHelper = createColumnHelper<NestedKpiNode>();
  * weight-rolled-up score computed from their children; leaf rows show the
  * judge's actual score and open a reasoning drawer.
  */
-export function KpiTreeTable({ kpiNodes, results }: { kpiNodes: KpiNode[]; results: EvaluationKpiResult[] }) {
+export function KpiTreeTable({
+  kpiNodes,
+  results,
+  target,
+}: {
+  kpiNodes: KpiNode[];
+  results: EvaluationKpiResult[];
+  /** The scorecard target the score badges are coloured against. */
+  target?: number | null;
+}) {
   const [expanded, setExpanded] = useState<ExpandedState>(true);
   const [drawerResult, setDrawerResult] = useState<EvaluationKpiResult | null>(null);
 
@@ -73,7 +82,7 @@ export function KpiTreeTable({ kpiNodes, results }: { kpiNodes: KpiNode[]; resul
         header: "Score",
         cell: ({ row }) => {
           const score = scoreByNodeId[row.original.id];
-          return score != null ? <RagBadge score={score} size="sm" /> : <span className="text-ink-muted">—</span>;
+          return score != null ? <RagBadge score={score} size="sm" target={target} /> : <span className="text-ink-muted">—</span>;
         },
       }),
       columnHelper.accessor("weight", {
@@ -99,7 +108,7 @@ export function KpiTreeTable({ kpiNodes, results }: { kpiNodes: KpiNode[]; resul
         },
       }),
     ],
-    [resultsByKpiId, scoreByNodeId],
+    [resultsByKpiId, scoreByNodeId, target],
   );
 
   const table = useReactTable({
@@ -140,7 +149,12 @@ export function KpiTreeTable({ kpiNodes, results }: { kpiNodes: KpiNode[]; resul
           </tbody>
         </table>
       </SolidPanel>
-      <ReasoningDrawer result={drawerResult} open={!!drawerResult} onOpenChange={(open) => !open && setDrawerResult(null)} />
+      <ReasoningDrawer
+        result={drawerResult}
+        open={!!drawerResult}
+        onOpenChange={(open) => !open && setDrawerResult(null)}
+        target={target}
+      />
     </>
   );
 }

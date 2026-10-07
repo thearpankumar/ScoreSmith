@@ -6,11 +6,14 @@ import { RagBadge } from "@/components/design-system/RagBadge";
 import { BulletChart } from "./BulletChart";
 import { KpiSummaryTable } from "./KpiSummaryTable";
 import { KpiTreeTable } from "./KpiTreeTable";
+import { effectiveTarget } from "@/lib/rag";
 import { formatDateTime } from "@/lib/utils";
 import type { Evaluation, KpiNode } from "@/lib/types";
 
 export function EvaluationResultView({ evaluation, kpiNodes }: { evaluation: Evaluation; kpiNodes: KpiNode[] }) {
-  const gap = Math.round((evaluation.targetScore - evaluation.finalWeightedScore) * 100) / 100;
+  // A scorecard without a target is judged against the app default (7), same as the colours.
+  const target = effectiveTarget(evaluation.targetScore);
+  const gap = Math.round((target - evaluation.finalWeightedScore) * 100) / 100;
   const metTarget = gap <= 0;
   // The real backend judge run is a Bedrock call (see backend/app/ai/judge.py) — in an
   // environment with no AWS credentials it fails and the evaluation is persisted with
@@ -59,29 +62,29 @@ export function EvaluationResultView({ evaluation, kpiNodes }: { evaluation: Eva
                 <p className="text-xs font-semibold uppercase tracking-wide text-ink-muted">Final weighted score</p>
                 <div className="mt-1 flex items-baseline gap-2">
                   <span className="text-3xl font-semibold text-ink">{evaluation.finalWeightedScore.toFixed(1)}</span>
-                  <span className="text-sm text-ink-muted">/ 10 · target {evaluation.targetScore.toFixed(1)}</span>
+                  <span className="text-sm text-ink-muted">/ 10 · target {target.toFixed(1)}</span>
                 </div>
                 <p className={metTarget ? "mt-1 text-sm text-[var(--rag-excellent)]" : "mt-1 text-sm text-[var(--rag-poor)]"}>
                   {metTarget ? `Meets target by ${Math.abs(gap).toFixed(1)}` : `${gap.toFixed(1)} below target`}
                 </p>
               </div>
-              <RagBadge score={evaluation.finalWeightedScore} />
+              <RagBadge score={evaluation.finalWeightedScore} target={target} />
             </div>
             <div className="mt-4">
-              <BulletChart score={evaluation.finalWeightedScore} target={evaluation.targetScore} />
+              <BulletChart score={evaluation.finalWeightedScore} target={target} />
             </div>
           </GlassCard>
 
           <section>
             <h2 className="mb-3 text-sm font-semibold text-ink">KPI summary</h2>
             <p className="mb-3 text-xs text-ink-muted">Sorted by gap to target — the KPIs needing the most attention first.</p>
-            <KpiSummaryTable results={evaluation.kpiResults} targetScore={evaluation.targetScore} />
+            <KpiSummaryTable results={evaluation.kpiResults} targetScore={target} />
           </section>
 
           <section>
             <h2 className="mb-3 text-sm font-semibold text-ink">KPI hierarchy &amp; reasoning</h2>
             <p className="mb-3 text-xs text-ink-muted">Expand a parent to see its sub-KPIs. Open “View” for the judge&apos;s reasoning and cited evidence.</p>
-            <KpiTreeTable kpiNodes={kpiNodes} results={evaluation.kpiResults} />
+            <KpiTreeTable kpiNodes={kpiNodes} results={evaluation.kpiResults} target={target} />
           </section>
         </>
       )}

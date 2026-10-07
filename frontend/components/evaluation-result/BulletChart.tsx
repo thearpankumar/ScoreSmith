@@ -2,17 +2,20 @@
 
 import { Bar, BarChart, ReferenceArea, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
-import { RAG_BANDS } from "@/lib/rag";
+import { targetBandThresholds } from "@/lib/rag";
 
 /**
  * Hero final-score BULLET chart (per the plan, deliberately not a gauge):
- * qualitative RAG-band ranges as background bands, a single bold bar for
+ * target-relative band ranges (see targetBandThresholds) as background bands, a single bold bar for
  * the achieved score, and a target tick. Bar/tick colour choices avoid
  * relying on colour alone — the achieved score and target are also stated
  * as plain text next to the chart (see EvaluationResultView).
  */
 export function BulletChart({ score, target }: { score: number; target: number }) {
   const data = [{ name: "Final score", achieved: score }];
+  // Highest band first; each band spans [its min, the next-higher band's min).
+  const thresholds = targetBandThresholds(target);
+  const bands = thresholds.map((th, i) => ({ ...th, max: i === 0 ? 10 : thresholds[i - 1].min }));
 
   return (
     <div>
@@ -27,13 +30,17 @@ export function BulletChart({ score, target }: { score: number; target: number }
             tickLine={false}
           />
           <YAxis type="category" dataKey="name" hide />
-          {RAG_BANDS.map((band) => (
+          {bands.map(({ band, min, max }) => (
             <ReferenceArea
               key={band.key}
-              x1={band.min}
-              x2={Math.min(10, band.max)}
+              x1={min}
+              x2={Math.min(10, max)}
               fill={band.color}
-              fillOpacity={0.16}
+              fillOpacity={0.2}
+              // Hairline gap keeps neighbouring bands distinguishable at this low tint.
+              stroke="var(--solid)"
+              strokeWidth={1}
+              strokeOpacity={1}
               ifOverflow="visible"
             />
           ))}

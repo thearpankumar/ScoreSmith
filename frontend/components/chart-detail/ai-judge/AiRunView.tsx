@@ -53,7 +53,7 @@ export function SingleRun({ evaluation, onNew }: { evaluation: Evaluation; onNew
                 </h2>
               </div>
             </div>
-            {result && <RagBadge score={result.finalWeightedScore} />}
+            {result && <RagBadge score={result.finalWeightedScore} target={result.targetScore} />}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Button asChild>
