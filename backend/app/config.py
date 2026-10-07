@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_OR_ALIASES = {
+    "s3_bucket": "OR_S3_BUCKET",
+    "sfn_state_machine_arn": "OR_SFN_STATE_MACHINE_ARN",
+    "aws_app_access_key_id": "OR_AWS_APP_ACCESS_KEY_ID",
+    "aws_app_secret_access_key": "OR_AWS_APP_SECRET_ACCESS_KEY",
+}
 
 
 class Settings(BaseSettings):
@@ -20,7 +28,30 @@ class Settings(BaseSettings):
 
     environment: str = "development"
 
-    # --- AWS Bedrock (Cycle 1c AI core) ---
+    # --- LLM provider switch ---
+    # "openrouter" (default) or "bedrock" (legacy, kept for rollback). Chat/judge/master/
+    # embedding model ids are exposed provider-neutrally via the `*_model_id` properties below.
+    llm_provider: str = "openrouter"
+
+    # --- OpenRouter (chat / judge / master / embeddings / web search) ---
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_chat_model_id: str = "openai/gpt-6-luna"
+    openrouter_judge_model_id: str = "deepseek/deepseek-v4.1-flash"
+    openrouter_master_model_id: str = "openai/gpt-6-luna"
+    openrouter_embedding_model_id: str = "openai/text-embedding-3-small"
+    openrouter_search_model_id: str = "openai/gpt-6-luna"
+    # Reasoning effort sent as `reasoning: {"effort": ...}` ("low" by default: heavy reasoning
+    # wastes tokens/latency on structured-output calls). Empty string = omit the field.
+    openrouter_reasoning_effort: str = "low"
+    # Web-search plugin engine ("native" | "exa" | ...). Empty = let OpenRouter choose.
+    openrouter_web_search_engine: str = ""
+    openrouter_http_referer: str = "https://github.com/thearpankumar/QualityAnalysisTool"
+    openrouter_app_title: str = "Quality Analysis Tool"
+    openrouter_read_timeout_seconds: int = 240
+    openrouter_connect_timeout_seconds: int = 10
+
+    # --- AWS Bedrock (legacy; used only when llm_provider="bedrock") ---
     # See infra/.env.example. Model is Z.ai GLM-5 (GLM-5 has no Bedrock embedding
     # endpoint, so embeddings stay on Titan Text Embeddings V2). Credentials use boto3's
     # normal resolution chain (env vars / shared profile / SSO / bearer token — see
@@ -138,10 +169,19 @@ class Settings(BaseSettings):
     # S3 bucket + Step Functions state machine written by aws/bootstrap into infra/.env. The APP keys
     # are a dedicated IAM user (S3 + states:* on one machine); they are NOT the Bedrock bearer token
     # and boto3 clients for S3/SFN are always built with them explicitly.
-    s3_bucket: str = ""
-    sfn_state_machine_arn: str = ""
-    aws_app_access_key_id: str = ""
-    aws_app_secret_access_key: str = ""
+    # Read ONLY from the OR_* env vars (no fallback to the old S3_BUCKET/SFN_*/AWS_APP_* names) so
+    # the OpenRouter deployment can never pick up the old Bedrock stack's resources.
+    s3_bucket: str = Field(default="", validation_alias="OR_S3_BUCKET")
+    sfn_state_machine_arn: str = Field(
+        default="", validation_alias="OR_SFN_STATE_MACHINE_ARN"
+    )
+    aws_app_access_key_id: str = Field(
+        default="", validation_alias="OR_AWS_APP_ACCESS_KEY_ID"
+    )
+    aws_app_secret_access_key: str = Field(
+        default="",
+        validation_alias="OR_AWS_APP_SECRET_ACCESS_KEY",
+    )
     # Max evaluations in ingesting/processing/scoring at once (clamped 1-5, see ai_eval_concurrency).
     ai_eval_max_concurrent: int = 3
     # true: no background dispatcher loop is started (tests / debugging); drive it with
@@ -155,6 +195,41 @@ class Settings(BaseSettings):
     upload_max_files: int = 10
     upload_part_size: int = 32 * 1024 * 1024
     upload_url_ttl_seconds: int = 900
+
+    def __init__(self, **data: object) -> None:
+        # Accept the field names as constructor kwargs (tests, scripts) while the ENVIRONMENT is
+        # read only through the OR_* aliases. (`populate_by_name` would also let the old
+        # S3_BUCKET/... env vars leak in, which is exactly what must not happen.)
+        for field_name, alias in _OR_ALIASES.items():
+            if field_name in data:
+                data[alias] = data.pop(field_name)
+        super().__init__(**data)
+
+    @property
+    def _is_bedrock(self) -> bool:
+        return self.llm_provider.strip().lower() == "bedrock"
+
+    @property
+    def chat_model_id(self) -> str:
+        return self.bedrock_chat_model_id if self._is_bedrock else self.openrouter_chat_model_id
+
+    @property
+    def judge_model_id(self) -> str:
+        return self.bedrock_judge_model_id if self._is_bedrock else self.openrouter_judge_model_id
+
+    @property
+    def master_model_id(self) -> str:
+        return self.bedrock_master_model_id if self._is_bedrock else self.openrouter_master_model_id
+
+    @property
+    def embedding_model_id(self) -> str:
+        return (
+            self.bedrock_embedding_model_id if self._is_bedrock else self.openrouter_embedding_model_id
+        )
+
+    @property
+    def jev_api_key(self) -> str:
+        return self.openrouter_jev_api or self.openrouter_api_key
 
     @property
     def ai_eval_concurrency(self) -> int:

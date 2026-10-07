@@ -62,7 +62,7 @@ async def run_evaluation(
     settings = get_settings()
     try:
         await run_judge(
-            db, evaluation, payload.input_text, bedrock, judge_model_id=settings.bedrock_judge_model_id
+            db, evaluation, payload.input_text, bedrock, judge_model_id=settings.judge_model_id
         )
     except BedrockUnavailableError as exc:
         evaluation.status = EvaluationStatus.FAILED

@@ -225,7 +225,7 @@ async def parse_batch_sheet(
         raise _unprocessable("s3_key is not an uploaded batch sheet (.xlsx / .csv).")
     data = await _aws(aws.get_object_bytes, payload.s3_key, MAX_BATCH_SHEET_BYTES)
     try:
-        preview = await parse_batch(bedrock, get_settings().bedrock_master_model_id, f"sheet.{ext}", data)
+        preview = await parse_batch(bedrock, get_settings().master_model_id, f"sheet.{ext}", data)
     except BatchParseError as exc:
         raise _unprocessable(str(exc)) from exc
     return BatchParseResponse(

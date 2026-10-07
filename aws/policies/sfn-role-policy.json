@@ -5,18 +5,18 @@
       "Effect": "Allow",
       "Action": "lambda:InvokeFunction",
       "Resource": [
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-ingest",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-ingest:*",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-extract-doc",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-extract-doc:*",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-plan-audio",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-plan-audio:*",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-transcribe-chunk",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-transcribe-chunk:*",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-analyze-image",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-analyze-image:*",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-assemble",
-        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-assemble:*"
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-ingest",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-ingest:*",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-extract-doc",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-extract-doc:*",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-plan-audio",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-plan-audio:*",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-transcribe-chunk",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-transcribe-chunk:*",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-analyze-image",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-analyze-image:*",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-assemble",
+        "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-assemble:*"
       ]
     }
   ]

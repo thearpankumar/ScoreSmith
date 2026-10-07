@@ -1,4 +1,4 @@
-# One container image for all six qs-eval Lambda functions. Each function selects its handler through the
+# One container image for all six qs-or (OpenRouter variant) Lambda functions. Each function selects its handler through the
 # Lambda "ImageConfig.Command" override (worker.handlers.ingest, ...extract_doc, ...plan_audio, ...transcribe_chunk,
 # ...analyze_image, ...assemble). Build for x86_64 with `--provenance=false` so Lambda accepts the manifest.
 FROM public.ecr.aws/lambda/python:3.12

@@ -28,13 +28,13 @@
       "Sid": "StartEvaluations",
       "Effect": "Allow",
       "Action": "states:StartExecution",
-      "Resource": "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:qs-eval-pipeline"
+      "Resource": "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${STATE_MACHINE}"
     },
     {
       "Sid": "DescribeAndStopExecutions",
       "Effect": "Allow",
       "Action": ["states:DescribeExecution", "states:StopExecution"],
-      "Resource": "arn:aws:states:${REGION}:${ACCOUNT_ID}:execution:qs-eval-pipeline:*"
+      "Resource": "arn:aws:states:${REGION}:${ACCOUNT_ID}:execution:${STATE_MACHINE}:*"
     }
   ]
 }

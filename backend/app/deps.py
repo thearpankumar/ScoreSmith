@@ -17,23 +17,39 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.bedrock_client import BedrockClient, BedrockClientProtocol
 from app.ai.jev_client import JevClient, JevClientProtocol
-from app.ai.web_search import AgentCoreWebSearchClient, WebSearchClientProtocol
+from app.ai.openrouter_client import OpenRouterClient
+from app.ai.web_search import AgentCoreWebSearchClient, OpenRouterWebSearchClient, WebSearchClientProtocol
+from app.config import get_settings
 from app.db import get_db
 from app.models.user import User
 from app.pipeline.aws_jobs import AwsJobsProtocol, Boto3AwsJobs
 from app.pipeline.jev_scorer import JevScoreClient, JevScoreClientProtocol
 
+
 # Single process-lifetime BedrockClient. Construction is cheap/lazy (see
 # app/ai/bedrock_client.py — the boto3 client itself is only created on first real call),
 # so a module-level singleton is safe to share across requests.
-_bedrock_client: BedrockClientProtocol = BedrockClient()
+def _use_bedrock() -> bool:
+    return get_settings().llm_provider.strip().lower() == "bedrock"
+
+
+def _build_llm_client() -> BedrockClientProtocol:
+    """Provider switch (`LLM_PROVIDER`): "openrouter" (default) or "bedrock" (legacy rollback).
+    Both constructors are lazy and never touch the network, so a missing API key does not
+    fail at import time (the first real call raises `BedrockUnavailableError` instead)."""
+    return BedrockClient() if _use_bedrock() else OpenRouterClient()
+
+
+_bedrock_client: BedrockClientProtocol = _build_llm_client()
 
 # Single process-lifetime AgentCoreWebSearchClient, mirroring _bedrock_client above.
 # Construction is cheap/lazy too — it only reads config; no network/HTTP client is
 # created until the first real .search() call (see app/ai/web_search.py). Safe (and
 # correct) to construct even when the AGENTCORE_GATEWAY_* settings are unset: `.search()`
 # then just returns [] rather than failing the chat turn.
-_web_search_client: WebSearchClientProtocol = AgentCoreWebSearchClient()
+_web_search_client: WebSearchClientProtocol = (
+    AgentCoreWebSearchClient() if _use_bedrock() else OpenRouterWebSearchClient()
+)
 
 # Single process-lifetime JevClient (OpenRouter-backed quality gate — see
 # app/ai/jev_client.py), mirroring _bedrock_client/_web_search_client above. Cheap/lazy
@@ -63,6 +79,9 @@ def get_bedrock_client() -> BedrockClientProtocol:
     suggest-similar, evaluations.py's run). Overridden in tests with a `FakeBedrockClient`
     via `app.dependency_overrides` — see tests/conftest.py."""
     return _bedrock_client
+
+
+get_llm_client = get_bedrock_client  # provider-neutral alias (tests override get_bedrock_client)
 
 
 def get_web_search_client() -> WebSearchClientProtocol:

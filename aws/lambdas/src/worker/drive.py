@@ -108,7 +108,7 @@ class DriveClient:
             import requests
 
             session = requests.Session()
-            session.headers["User-Agent"] = "Mozilla/5.0 (compatible; qs-eval-ingest/1.0)"
+            session.headers["User-Agent"] = "Mozilla/5.0 (compatible; qs-or-ingest/1.0)"
         self.session, self._list_folder, self.resolver = session, list_folder, resolver
         self.sleep, self.tries, self.log = sleep, tries, log
 

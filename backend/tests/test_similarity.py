@@ -73,3 +73,14 @@ async def test_orthogonal_embedding_is_excluded_below_threshold(async_db_session
     assert [r.name for r in all_results][0] == "Near Match"
     assert len(all_results) == 2
     assert all_results[0].similarity > all_results[1].similarity
+
+
+async def test_embedding_model_filter_excludes_other_models(async_db_session) -> None:
+    db = async_db_session
+    await _seed_scorecard_with_embedding(db, name="Old Titan Row", vector=_unit_vector(0))
+    results = await find_similar_by_vector(db, _unit_vector(0), threshold=0.5, embedding_model="test-synthetic")
+    assert [r.name for r in results] == ["Old Titan Row"]
+    other = await find_similar_by_vector(
+        db, _unit_vector(0), threshold=0.5, embedding_model="openai/text-embedding-3-small"
+    )
+    assert other == []

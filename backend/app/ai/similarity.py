@@ -9,6 +9,7 @@ Bedrock-backed convenience wrapper that embeds free-text first.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 
@@ -16,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.bedrock_client import BedrockClientProtocol
+from app.config import get_settings
 from app.models.scorecard import Scorecard
 from app.models.scorecard_embedding import ScorecardEmbedding
 from app.models.scorecard_version import ScorecardVersion
@@ -48,7 +50,10 @@ async def find_similar_by_vector(
     *,
     top_n: int = 5,
     threshold: float = SIMILARITY_THRESHOLD,
+    embedding_model: str | None = None,
 ) -> list[SimilarScorecardResult]:
+    """`embedding_model`: when given, only rows embedded with that exact model are compared
+    (vectors from different models, e.g. old Titan rows, are not comparable)."""
     distance = ScorecardEmbedding.embedding.cosine_distance(query_vector)
     stmt = (
         select(
@@ -64,6 +69,8 @@ async def find_similar_by_vector(
         .order_by(distance)
         .limit(top_n)
     )
+    if embedding_model is not None:
+        stmt = stmt.where(ScorecardEmbedding.embedding_model == embedding_model)
     rows = (await db.execute(stmt)).all()
     results = [
         SimilarScorecardResult(
@@ -87,5 +94,11 @@ async def find_similar_scorecards(
     top_n: int = 5,
     threshold: float = SIMILARITY_THRESHOLD,
 ) -> list[SimilarScorecardResult]:
-    query_vector = bedrock.embed(query_text)
-    return await find_similar_by_vector(db, query_vector, top_n=top_n, threshold=threshold)
+    query_vector = await asyncio.to_thread(bedrock.embed, query_text)
+    return await find_similar_by_vector(
+        db,
+        query_vector,
+        top_n=top_n,
+        threshold=threshold,
+        embedding_model=get_settings().embedding_model_id,
+    )

@@ -1,13 +1,16 @@
 <#
 .SYNOPSIS
-  Idempotent (describe-or-create) provisioning of the qs-eval AI evaluation pipeline.
+  Idempotent (describe-or-create) provisioning of the OpenRouter variant of the AI evaluation pipeline
+  (separate "qs-or" stack; never touches the main-branch Bedrock deployment).
 
 .DESCRIPTION
   .\aws\bootstrap.ps1 -WhatIf          print the planned commands only; makes NO AWS call and changes nothing
   .\aws\bootstrap.ps1                  create / update everything
 
-  Everything uses `aws --profile arpan-aws --region us-east-1`. Secrets are written to git-ignored infra/.env and
-  never printed.
+  Everything uses `aws --profile arpan-aws --region us-east-1`. Names come from aws/config.ps1.
+  The OpenRouter API key is read from $env:OPENROUTER_API_KEY, then from OPENROUTER_API_KEY= in infra/.env, and is
+  stored in SSM Parameter Store (SecureString); it is never printed and never placed in Lambda env vars.
+  Generated credentials / ids are written to the git-ignored env file (OR_* variables only) and never printed.
 
 .PARAMETER WhatIf
   Print planned commands only (no AWS calls at all, not even read-only ones). Alias: -DryRun.
@@ -18,7 +21,11 @@
 .PARAMETER SkipImage
   Reuse the newest image already in ECR instead of building/pushing.
 .PARAMETER RotateKey
-  Delete the existing qs-backend-app access key(s) and create a new one.
+  Delete the existing qs-or-backend-app access key(s) and create a new one.
+.PARAMETER EnvFile
+  Env file to read OPENROUTER_API_KEY from and to write the OR_* variables to (default infra/.env).
+.PARAMETER AwsProfile
+  AWS CLI profile (default arpan-aws).
 #>
 [CmdletBinding()]
 param(
@@ -26,25 +33,19 @@ param(
   [string]$CorsOrigin = '',
   [string]$Email = 'arpankumar1119@gmail.com',
   [switch]$SkipImage,
-  [switch]$RotateKey
+  [switch]$RotateKey,
+  [string]$EnvFile = '',
+  [Alias('Profile')][string]$AwsProfile = ''
 )
 $ErrorActionPreference = 'Stop'
 
-$Profile_ = 'arpan-aws'
-$Region = 'us-east-1'
-$Prefix = 'qs-eval'
-$StateMachine = 'qs-eval-pipeline'
-$Repo = 'qs-eval-worker'
-$LambdaRole = 'qs-eval-lambda-role'
-$SfnRole = 'qs-eval-sfn-role'
-$AppUser = 'qs-backend-app'
-$BudgetName = 'qs-eval-monthly'
+$Here = Split-Path -Parent $MyInvocation.MyCommand.Path
+. "$Here/config.ps1"
 $Dry = [bool]$WhatIf
 
-$Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $Here
-$EnvFile = Join-Path $RepoRoot 'infra/.env'
-$Work = Join-Path ([System.IO.Path]::GetTempPath()) ("qs-eval-" + [guid]::NewGuid().ToString('N'))
+if (-not $EnvFile) { $EnvFile = Join-Path $RepoRoot 'infra/.env' }
+$Work = Join-Path ([System.IO.Path]::GetTempPath()) ("$Prefix-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $Work | Out-Null
 $Utf8 = New-Object System.Text.UTF8Encoding $false
 
@@ -93,16 +94,54 @@ $LambdaRoleArn = "arn:aws:iam::${AccountId}:role/$LambdaRole"
 $SfnRoleArn = "arn:aws:iam::${AccountId}:role/$SfnRole"
 $SmArn = "arn:aws:states:${Region}:${AccountId}:stateMachine:$StateMachine"
 function FnArn($short) { "arn:aws:lambda:${Region}:${AccountId}:function:$Prefix-$short" }
-Write-Host "account=$AccountId region=$Region bucket=$Bucket"
+Write-Host "stack=$Prefix profile=$Profile_ account=$AccountId region=$Region bucket=$Bucket"
 
-# Render a template with the account placeholders; returns the path of the rendered copy.
+# Render a template with the placeholders; returns the path of the rendered copy.
 function Render([string]$Src, [hashtable]$Extra = @{}) {
   $text = [System.IO.File]::ReadAllText($Src)
-  $text = $text.Replace('${ACCOUNT_ID}', $AccountId).Replace('${REGION}', $Region).Replace('${BUCKET}', $Bucket).Replace('${BUDGET_EMAIL}', $Email)
+  $map = [ordered]@{
+    '${ACCOUNT_ID}'    = $AccountId
+    '${REGION}'        = $Region
+    '${BUCKET}'        = $Bucket
+    '${BUDGET_EMAIL}'  = $Email
+    '${PREFIX}'        = $Prefix
+    '${APP_USER}'      = $AppUser
+    '${STATE_MACHINE}' = $StateMachine
+    '${BUDGET_NAME}'   = $BudgetName
+    '${SSM_PARAM}'     = $SsmParam
+  }
+  foreach ($k in $map.Keys) { $text = $text.Replace($k, $map[$k]) }
   foreach ($k in $Extra.Keys) { $text = $text.Replace($k, $Extra[$k]) }
   $dst = Join-Path $Work (Split-Path -Leaf $Src)
   [System.IO.File]::WriteAllText($dst, $text, $Utf8)
   return $dst
+}
+
+# ------------------------------------------------------------------ env file helpers (never print values)
+function Set-EnvVar([string]$Key, [string]$Value) {
+  $lines = @()
+  if (Test-Path $EnvFile) { $lines = @(Get-Content $EnvFile | Where-Object { $_ -notmatch "^$([regex]::Escape($Key))=" }) }
+  $lines += "$Key=$Value"
+  [System.IO.File]::WriteAllText($EnvFile, (($lines -join "`n") + "`n"), $Utf8)
+}
+function Test-EnvHas([string]$Key) {
+  (Test-Path $EnvFile) -and [bool](Select-String -Path $EnvFile -Pattern "^$([regex]::Escape($Key))=." -Quiet)
+}
+# OPENROUTER_API_KEY: process env first, then the env file. Returns @{ Value; Source } or $null.
+function Get-OpenRouterKey {
+  if ($env:OPENROUTER_API_KEY -and $env:OPENROUTER_API_KEY.Trim()) {
+    return @{ Value = $env:OPENROUTER_API_KEY.Trim(); Source = 'the OPENROUTER_API_KEY environment variable' }
+  }
+  if (Test-Path $EnvFile) {
+    foreach ($line in (Get-Content $EnvFile)) {
+      if ($line -match '^\s*(?:export\s+)?OPENROUTER_API_KEY\s*=\s*(.*?)\s*$') {
+        $v = $Matches[1]
+        if ($v -match '^"([^"]*)"' -or $v -match "^'([^']*)'" -or $v -match '^(\S*)') { $v = $Matches[1] }
+        if ($v) { return @{ Value = $v; Source = $EnvFile } }
+      }
+    }
+  }
+  return $null
 }
 
 try {
@@ -158,7 +197,26 @@ try {
     }
   }
 
-  # ---------------------------------------------------------------- 3. IAM roles
+  # ---------------------------------------------------------------- 3. OpenRouter key -> SSM SecureString
+  Say "OpenRouter API key -> SSM SecureString $SsmParam"
+  $KeyStored = $false
+  $keyInfo = Get-OpenRouterKey
+  if ($keyInfo) {
+    $keyFile = Join-Path $Work 'openrouter-key.txt'
+    [System.IO.File]::WriteAllText($keyFile, $keyInfo.Value, $Utf8)   # no trailing newline; deleted with $Work
+    Write-Host "  key found in $($keyInfo.Source) (value not printed)"
+    Invoke-AwsMut ssm put-parameter --name $SsmParam --type SecureString --overwrite --value (FileUrl $keyFile) --description "OpenRouter API key for the $Prefix pipeline Lambdas"
+    $KeyStored = $true
+    $keyInfo = $null
+  } elseif (Test-Aws ssm get-parameter --name $SsmParam) {
+    Write-Host "  WARNING: no OPENROUTER_API_KEY in the environment or in $EnvFile; keeping the key already stored in SSM."
+  } else {
+    Write-Host "  WARNING: no OPENROUTER_API_KEY found (environment variable or $EnvFile) and $SsmParam does not exist yet."
+    Write-Host '           The Lambdas are still deployed but audio/image analysis will fail until the key is stored.'
+    Write-Host "           Add  OPENROUTER_API_KEY=...  to $EnvFile and re-run .\aws\bootstrap.ps1 (idempotent)."
+  }
+
+  # ---------------------------------------------------------------- 4. IAM roles
   function Ensure-Role([string]$Name, [string]$Trust, [string]$PolicyName, [string]$PolicyFile, [string]$Desc) {
     $created = $false
     if (Test-Aws iam get-role --role-name $Name) {
@@ -172,15 +230,15 @@ try {
     return $created
   }
   Say "IAM role $LambdaRole"
-  $c1 = Ensure-Role $LambdaRole (Render "$Here/policies/lambda-trust.json") 'qs-eval-lambda-inline' (Render "$Here/policies/lambda-role-policy.json") 'qs-eval Lambda execution role (S3 prefixes, Bedrock models, logs)'
+  $c1 = Ensure-Role $LambdaRole (Render "$Here/policies/lambda-trust.json") $LambdaPolicyName (Render "$Here/policies/lambda-role-policy.json") "$Prefix Lambda execution role (S3 prefixes, one SSM parameter, logs)"
   Say "IAM role $SfnRole"
-  $c2 = Ensure-Role $SfnRole (Render "$Here/policies/sfn-trust.json") 'qs-eval-sfn-inline' (Render "$Here/policies/sfn-role-policy.json") 'qs-eval Step Functions role (invoke the six functions only)'
+  $c2 = Ensure-Role $SfnRole (Render "$Here/policies/sfn-trust.json") $SfnPolicyName (Render "$Here/policies/sfn-role-policy.json") "$Prefix Step Functions role (invoke the six functions only)"
   if ($c1 -or $c2) {
     Say 'Waiting 15s for new IAM roles to propagate'
     if ($Dry) { Plan 'Start-Sleep 15' } else { Start-Sleep 15 }
   }
 
-  # ---------------------------------------------------------------- 4. Lambda functions
+  # ---------------------------------------------------------------- 5. Lambda functions
   # name | handler | memory MB | ephemeral MB | reserved concurrency
   $Functions = @(
     @('ingest', 'worker.handlers.ingest', 3008, 10240, 3),
@@ -196,6 +254,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "lambda wait $State failed for $Fn" }
   }
 
+  $EnvJson = FileUrl (Write-LambdaEnvJson $Work)
   Say 'Log groups (14-day retention) and Lambda functions'
   $TotalReserved = 0
   foreach ($f in $Functions) {
@@ -211,8 +270,8 @@ try {
     [System.IO.File]::WriteAllText($imgCfgFile, "{`"Command`":[`"$handler`"]}", $Utf8)
     $imgCfg = FileUrl $imgCfgFile
     if (Test-Aws lambda get-function --function-name $fn) {
-      Write-Host "  function $fn exists (updating configuration + code)"
-      Invoke-AwsMut lambda update-function-configuration --function-name $fn --role $LambdaRoleArn --timeout 900 --memory-size $mem --ephemeral-storage "Size=$eph" --image-config $imgCfg
+      Write-Host "  function $fn exists (updating configuration + environment + code)"
+      Invoke-AwsMut lambda update-function-configuration --function-name $fn --role $LambdaRoleArn --timeout 900 --memory-size $mem --ephemeral-storage "Size=$eph" --image-config $imgCfg --environment $EnvJson
       Wait-Fn 'function-updated-v2' $fn
       Invoke-AwsMut lambda update-function-code --function-name $fn --image-uri $ImageUri
       Wait-Fn 'function-updated-v2' $fn
@@ -220,7 +279,7 @@ try {
       $created = $false
       for ($attempt = 1; $attempt -le 4 -and -not $created; $attempt++) {
         try {
-          Invoke-AwsMut lambda create-function --function-name $fn --package-type Image --code "ImageUri=$ImageUri" --role $LambdaRoleArn --timeout 900 --memory-size $mem --ephemeral-storage "Size=$eph" --architectures x86_64 --image-config $imgCfg --environment 'Variables={LOG_LEVEL=INFO}' --description "qs-eval pipeline: $short"
+          Invoke-AwsMut lambda create-function --function-name $fn --package-type Image --code "ImageUri=$ImageUri" --role $LambdaRoleArn --timeout 900 --memory-size $mem --ephemeral-storage "Size=$eph" --architectures x86_64 --image-config $imgCfg --environment $EnvJson --description "$Prefix pipeline: $short"
           $created = $true
         } catch {
           Write-Host "  create-function failed (IAM propagation?); retrying in 10s ($attempt/4)"
@@ -232,17 +291,27 @@ try {
     }
   }
 
+  # Account-level guard. AWS always keeps 100 unreserved executions, and a new account's limit is only 10, so
+  # reservations are applied only where the account can afford them. The unreserved figure already excludes what
+  # THIS stack reserved on an earlier run, so that amount is added back (keeps re-runs idempotent). A second
+  # deployment in the same account (e.g. the main-branch stack + qs-or) needs another 42 on top of the first stack's: when the
+  # account cannot afford it the step is skipped with a message and everything else still works.
   Say 'Reserved concurrency guard (only where the account allows; AWS keeps 100 unreserved)'
   $Unreserved = Get-AwsText '0' lambda get-account-settings --query 'AccountLimit.UnreservedConcurrentExecutions' --output text
-  if ($Dry -or ($Unreserved -match '^\d+$' -and [int]$Unreserved -ge ($TotalReserved + 100))) {
+  $OwnReserved = 0
+  foreach ($f in $Functions) {
+    $cur = Get-AwsText '0' lambda get-function-concurrency --function-name "$Prefix-$($f[0])" --query ReservedConcurrentExecutions --output text
+    if ($cur -match '^\d+$') { $OwnReserved += [int]$cur }
+  }
+  if ($Dry -or ($Unreserved -match '^\d+$' -and ([int]$Unreserved + $OwnReserved) -ge ($TotalReserved + 100))) {
     foreach ($f in $Functions) {
       Invoke-AwsMut lambda put-function-concurrency --function-name "$Prefix-$($f[0])" --reserved-concurrent-executions $f[4]
     }
   } else {
-    Write-Host "  SKIPPED: unreserved concurrency is $Unreserved, need >= $($TotalReserved + 100). Request a Lambda concurrency quota increase, then re-run."
+    Write-Host "  SKIPPED: unreserved concurrency is $Unreserved (+$OwnReserved already reserved by $Prefix), need >= $($TotalReserved + 100). Request a Lambda concurrency quota increase, then re-run. Everything else works without reservations."
   }
 
-  # ---------------------------------------------------------------- 5. State machine
+  # ---------------------------------------------------------------- 6. State machine
   Say "Step Functions state machine $StateMachine"
   $asl = [System.IO.File]::ReadAllText("$Here/statemachine.asl.json")
   foreach ($pair in @(@('IngestFnArn', 'ingest'), @('ExtractDocFnArn', 'extract-doc'), @('PlanAudioFnArn', 'plan-audio'),
@@ -257,33 +326,23 @@ try {
     Invoke-AwsMut stepfunctions create-state-machine --name $StateMachine --type STANDARD --definition (FileUrl $AslFile) --role-arn $SfnRoleArn
   }
 
-  # ---------------------------------------------------------------- 6. Backend IAM user + key
+  # ---------------------------------------------------------------- 7. Backend IAM user + key
   Say "IAM user $AppUser"
   if (Test-Aws iam get-user --user-name $AppUser) { Write-Host '  user exists' } else { Invoke-AwsMut iam create-user --user-name $AppUser }
-  Invoke-AwsMut iam put-user-policy --user-name $AppUser --policy-name 'qs-backend-app-inline' --policy-document (FileUrl (Render "$Here/policies/backend-user-policy.json"))
+  Invoke-AwsMut iam put-user-policy --user-name $AppUser --policy-name $AppUserPolicyName --policy-document (FileUrl (Render "$Here/policies/backend-user-policy.json"))
 
-  function Set-EnvVar([string]$Key, [string]$Value) {
-    $lines = @()
-    if (Test-Path $EnvFile) { $lines = @(Get-Content $EnvFile | Where-Object { $_ -notmatch "^$([regex]::Escape($Key))=" }) }
-    $lines += "$Key=$Value"
-    [System.IO.File]::WriteAllLines($EnvFile, [string[]]$lines, $Utf8)
-  }
-  function Test-EnvHas([string]$Key) {
-    (Test-Path $EnvFile) -and [bool](Select-String -Path $EnvFile -Pattern "^$([regex]::Escape($Key))=." -Quiet)
-  }
-
-  Say "Access key for $AppUser and infra/.env"
+  Say "Access key for $AppUser and $EnvFile"
   if ($Dry) {
     Plan "(check) aws iam list-access-keys --user-name $AppUser"
     Plan "if the user has NO access key: aws iam create-access-key --user-name $AppUser  (output captured, not printed)"
-    Plan "write S3_BUCKET, SFN_STATE_MACHINE_ARN (always) and AWS_APP_ACCESS_KEY_ID / AWS_APP_SECRET_ACCESS_KEY (only if a key was created) to $EnvFile"
+    Plan "write $($EnvKeys[0]), $($EnvKeys[1]) (always) and $($EnvKeys[2]) / $($EnvKeys[3]) (only if a key was created) to $EnvFile; no other variable is touched"
     Plan 'with -RotateKey: aws iam delete-access-key for existing keys first'
   } else {
-    git -C $RepoRoot check-ignore -q infra/.env
-    if ($LASTEXITCODE -ne 0) { throw 'infra/.env is not git-ignored; refusing to write secrets' }
+    git -C $RepoRoot check-ignore -q $EnvFile
+    if ($LASTEXITCODE -eq 1) { throw "$EnvFile is not git-ignored; refusing to write secrets" }
     if (-not (Test-Path $EnvFile)) { New-Item -ItemType File -Path $EnvFile | Out-Null }
-    Set-EnvVar 'S3_BUCKET' $Bucket
-    Set-EnvVar 'SFN_STATE_MACHINE_ARN' $SmArn
+    Set-EnvVar 'OR_S3_BUCKET' $Bucket
+    Set-EnvVar 'OR_SFN_STATE_MACHINE_ARN' $SmArn
     if ($RotateKey) {
       $ids = (& aws @AwsBase iam list-access-keys --user-name $AppUser --query 'AccessKeyMetadata[].AccessKeyId' --output text) -split '\s+' | Where-Object { $_ }
       foreach ($kid in $ids) { & aws @AwsBase iam delete-access-key --user-name $AppUser --access-key-id $kid }
@@ -291,19 +350,19 @@ try {
     $nkeys = (& aws @AwsBase iam list-access-keys --user-name $AppUser --query 'length(AccessKeyMetadata)' --output text).Trim()
     if ($nkeys -eq '0') {
       $creds = (& aws @AwsBase iam create-access-key --user-name $AppUser --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text) -split '\s+'
-      Set-EnvVar 'AWS_APP_ACCESS_KEY_ID' $creds[0]
-      Set-EnvVar 'AWS_APP_SECRET_ACCESS_KEY' $creds[1]
+      Set-EnvVar 'OR_AWS_APP_ACCESS_KEY_ID' $creds[0]
+      Set-EnvVar 'OR_AWS_APP_SECRET_ACCESS_KEY' $creds[1]
       $creds = $null
-      Write-Host '  created a new access key and stored it in infra/.env (not printed)'
-    } elseif (Test-EnvHas 'AWS_APP_SECRET_ACCESS_KEY') {
-      Write-Host '  access key already exists and infra/.env has credentials; left unchanged'
+      Write-Host "  created a new access key and stored it in $EnvFile (not printed)"
+    } elseif (Test-EnvHas 'OR_AWS_APP_SECRET_ACCESS_KEY') {
+      Write-Host "  access key already exists and $EnvFile has credentials; left unchanged"
     } else {
-      Write-Host "  WARNING: $AppUser already has an access key but infra/.env has no secret (it cannot be retrieved)."
+      Write-Host "  WARNING: $AppUser already has an access key but $EnvFile has no secret (it cannot be retrieved)."
       Write-Host '           Re-run with -RotateKey to replace it.'
     }
   }
 
-  # ---------------------------------------------------------------- 7. Budget
+  # ---------------------------------------------------------------- 8. Budget
   Say "AWS Budget $BudgetName (`$25/month, alerts to $Email)"
   if (Test-Aws budgets describe-budget --account-id $AccountId --budget-name $BudgetName) {
     Write-Host '  budget exists'
@@ -317,7 +376,9 @@ try {
   } else {
     Write-Host "Bucket:        $Bucket"
     Write-Host "State machine: $SmArn"
-    Write-Host 'Credentials and ids are in infra/.env. Update code later with aws/deploy-lambdas.ps1.'
+    Write-Host "SSM parameter: $SsmParam (key stored this run: $KeyStored)"
+    Write-Host "OR_* credentials and ids are in $EnvFile. Update code later with aws/deploy-lambdas.ps1."
+    if (-not $KeyStored) { Write-Host "NOTE: add OPENROUTER_API_KEY to $EnvFile and re-run this script to store/refresh the key in SSM." }
   }
 } finally {
   Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue

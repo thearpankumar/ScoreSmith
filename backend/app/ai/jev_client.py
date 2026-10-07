@@ -129,7 +129,7 @@ class JevClient:
 
     def __init__(self, *, api_key: str | None = None, model_id: str | None = None) -> None:
         settings = get_settings()
-        self._api_key = api_key if api_key is not None else settings.openrouter_jev_api
+        self._api_key = api_key if api_key is not None else settings.jev_api_key
         self._model_id = model_id if model_id is not None else settings.openrouter_jev_model_id
 
     @property

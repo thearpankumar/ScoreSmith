@@ -1,5 +1,5 @@
 {
-  "Comment": "qs-eval-pipeline: one execution per evaluation. Ingest -> per-file fan-out (docs: ExtractDoc -> AnalyzeImage per image; video: PlanAudio -> TranscribeChunk per chunk -> merge) -> Assemble. Only S3 keys travel between states (256 KB payload limit). Placeholders like ${IngestFnArn} are substituted by aws/bootstrap.",
+  "Comment": "Evaluation pipeline: one execution per evaluation. Ingest -> per-file fan-out (docs: ExtractDoc -> AnalyzeImage per image; video: PlanAudio -> TranscribeChunk per chunk -> merge) -> Assemble. Only S3 keys travel between states (256 KB payload limit). Placeholders like ${IngestFnArn} are substituted by aws/bootstrap.",
   "StartAt": "Ingest",
   "TimeoutSeconds": 14400,
   "States": {

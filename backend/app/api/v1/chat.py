@@ -112,14 +112,14 @@ async def _generate_and_persist_title(
     """Issue 1 (see task notes): a brand-new session's title must be generated as the
     VERY FIRST thing on its first turn — before check_similarity/research_kpis/
     propose_kpis (the heavier LangGraph work — see scorecard_builder.py) ever run — via
-    ONE fast/cheap Bedrock call (settings.bedrock_judge_model_id, not the heavier chat
+    ONE fast/cheap Bedrock call (settings.judge_model_id, not the heavier chat
     model), and persisted immediately so a concurrent request (a different tab's session
     list poll, or this same request's own eventual response) can see it well before the
     graph call returns. Best-effort: never raises, never blocks session creation on a
     cosmetic feature — see generate_session_title's own "never raise" contract."""
     settings = get_settings()
     title = await asyncio.to_thread(
-        generate_session_title, bedrock, settings.bedrock_judge_model_id, first_message
+        generate_session_title, bedrock, settings.judge_model_id, first_message
     )
     if not title:
         return None
@@ -238,7 +238,7 @@ async def _background_turn(
                     str(session_id),
                     message,
                     bedrock,
-                    chat_model_id=settings.bedrock_chat_model_id,
+                    chat_model_id=settings.chat_model_id,
                     db=db,
                     web_search_client=web_search,
                     turn_started_at=turn_started_at,
@@ -543,7 +543,7 @@ async def start_chat_session(
             str(session_id),
             payload.message,
             bedrock,
-            chat_model_id=settings.bedrock_chat_model_id,
+            chat_model_id=settings.chat_model_id,
             db=db,
             web_search_client=web_search,
             turn_started_at=turn_started_at,
@@ -683,7 +683,7 @@ async def _start_refine_session(
                 str(session.id),
                 message,
                 bedrock,
-                chat_model_id=settings.bedrock_chat_model_id,
+                chat_model_id=settings.chat_model_id,
                 db=db,
                 web_search_client=web_search,
                 turn_started_at=turn_started_at,
@@ -779,7 +779,7 @@ async def send_chat_message(
             str(session.id),
             payload.message,
             bedrock,
-            chat_model_id=settings.bedrock_chat_model_id,
+            chat_model_id=settings.chat_model_id,
             db=db,
             web_search_client=web_search,
             turn_started_at=turn_started_at,

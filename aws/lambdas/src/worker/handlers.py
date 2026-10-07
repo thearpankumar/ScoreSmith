@@ -37,14 +37,14 @@ def plan_audio(event, context=None):
 
 
 def transcribe_chunk(event, context=None):
-    from .bedrock_ops import run_transcribe_chunk
+    from .openrouter_ops import run_transcribe_chunk
 
     _log(event, "transcribe_chunk")
     return run_transcribe_chunk(event, S3Store(event["bucket"]))
 
 
 def analyze_image(event, context=None):
-    from .bedrock_ops import run_analyze_image
+    from .openrouter_ops import run_analyze_image
 
     _log(event, "analyze_image")
     return run_analyze_image(event, S3Store(event["bucket"]))

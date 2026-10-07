@@ -48,6 +48,7 @@ def test_suggest_similar_returns_ranked_matches(client: TestClient, seed_user_id
     import asyncio
 
     async def _seed():
+        from app.config import get_settings
         from app.db import AsyncSessionLocal
         from app.models.scorecard_embedding import ScorecardEmbedding
 
@@ -56,7 +57,7 @@ def test_suggest_similar_returns_ranked_matches(client: TestClient, seed_user_id
                 ScorecardEmbedding(
                     scorecard_version_id=version["id"],
                     embedding=vector,
-                    embedding_model="test-synthetic",
+                    embedding_model=get_settings().embedding_model_id,
                     source_text_hash="deadbeef",
                 )
             )

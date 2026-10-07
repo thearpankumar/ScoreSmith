@@ -407,9 +407,9 @@ async def run_scoring(evaluation_id: uuid.UUID, deps: ScoringDeps) -> None:
 
     settings = get_settings()
     if deps.master_model_id is None:
-        deps.master_model_id = settings.bedrock_master_model_id
+        deps.master_model_id = settings.master_model_id
     if deps.fallback_model_id is None:
-        deps.fallback_model_id = settings.bedrock_judge_model_id
+        deps.fallback_model_id = settings.judge_model_id
     loaded = await _load_evaluation(evaluation_id)
     graph = build_scoring_graph(evaluation_id, deps, loaded)
     try:

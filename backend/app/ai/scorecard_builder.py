@@ -1637,7 +1637,7 @@ async def _judge_duplicate_pairs(
                 system="You decide whether two KPI names are the same measurement concept. Call the tool once.",
                 tools=[JUDGE_DUPLICATE_KPIS_TOOL],
                 force_tool_use=True,
-                model_id=get_settings().bedrock_judge_model_id,
+                model_id=get_settings().judge_model_id,
             )
             if not result.is_tool_use or result.tool_name != "judge_duplicate_kpis" or result.truncated:
                 return
@@ -4369,7 +4369,7 @@ def _header_call(bedrock: BedrockClientProtocol, message: str, kpi_names: list[s
         ),
         tools=[SET_SCORECARD_HEADER_TOOL],
         force_tool_use=True,
-        model_id=get_settings().bedrock_judge_model_id,
+        model_id=get_settings().judge_model_id,
     )
     if result.is_tool_use and result.tool_name == "set_scorecard_header":
         return _clean_header(result.tool_input or {})

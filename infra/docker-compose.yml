@@ -26,20 +26,25 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-qs_app}:${POSTGRES_PASSWORD:-qs_dev_password}@db:5432/${POSTGRES_DB:-quality_scorecard}
-      # This environment's AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (infra/.env) are, in
-      # practice, an AWS Bedrock long-term "API key" (bearer-token credential), not a
-      # SigV4 IAM access key/secret pair — using them as plain AWS_ACCESS_KEY_ID/
-      # AWS_SECRET_ACCESS_KEY makes every Bedrock call fail with
-      # `UnrecognizedClientException: The security token included in the request is
-      # invalid` (confirmed live against this account). botocore's bearer-auth support
-      # (see botocore/handlers.py::get_bearer_auth_supported_services, which lists
-      # "bedrock") looks for AWS_BEARER_TOKEN_BEDROCK and prefers it automatically for
-      # bedrock/bedrock-runtime calls when present; the value must be prefixed "A"
-      # (confirmed live: without it, Bedrock rejects with "Invalid API Key format: Must
-      # start with pre-defined prefix"). Standard AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
-      # are left in place too (via env_file above) since they're harmless when unused and
-      # some other AWS SDK call in this app (none currently) might still want them.
-      AWS_BEARER_TOKEN_BEDROCK: A${AWS_SECRET_ACCESS_KEY}
+      # LLM provider: OpenRouter by default (LLM_PROVIDER=bedrock keeps the legacy Bedrock path,
+      # which then needs AWS credentials in infra/.env). All values come from infra/.env; they
+      # are listed explicitly so a new container always picks them up.
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_CHAT_MODEL_ID: ${OPENROUTER_CHAT_MODEL_ID:-openai/gpt-6-luna}
+      OPENROUTER_JUDGE_MODEL_ID: ${OPENROUTER_JUDGE_MODEL_ID:-deepseek/deepseek-v4.1-flash}
+      OPENROUTER_MASTER_MODEL_ID: ${OPENROUTER_MASTER_MODEL_ID:-openai/gpt-6-luna}
+      OPENROUTER_EMBEDDING_MODEL_ID: ${OPENROUTER_EMBEDDING_MODEL_ID:-openai/text-embedding-3-small}
+      OPENROUTER_SEARCH_MODEL_ID: ${OPENROUTER_SEARCH_MODEL_ID:-openai/gpt-6-luna}
+      OPENROUTER_REASONING_EFFORT: ${OPENROUTER_REASONING_EFFORT:-low}
+      OPENROUTER_WEB_SEARCH_ENGINE: ${OPENROUTER_WEB_SEARCH_ENGINE:-}
+      # AI-evaluation AWS stack (S3 + Step Functions) of the OpenRouter deployment. These OR_* names
+      # are deliberately different from the old Bedrock stack's so the two can never be mixed up.
+      OR_S3_BUCKET: ${OR_S3_BUCKET:-}
+      OR_SFN_STATE_MACHINE_ARN: ${OR_SFN_STATE_MACHINE_ARN:-}
+      OR_AWS_APP_ACCESS_KEY_ID: ${OR_AWS_APP_ACCESS_KEY_ID:-}
+      OR_AWS_APP_SECRET_ACCESS_KEY: ${OR_AWS_APP_SECRET_ACCESS_KEY:-}
       # OpenRouter Jev quality-gate key (see app/ai/jev_client.py / app/config.py's
       # openrouter_jev_api field) — already present via env_file above (infra/.env), but
       # listed explicitly here too, alongside the other AI-layer credentials, so a new

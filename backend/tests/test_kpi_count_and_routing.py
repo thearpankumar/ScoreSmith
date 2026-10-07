@@ -407,7 +407,7 @@ async def test_clear_list_is_routed_to_user_specified_by_the_small_model() -> No
     fake = FakeBedrockClient(route_fn=lambda **_: tool_use_result("route_request", {"mode": "user_specified"}))
     decision = await rr.route_request(_LIST_MESSAGE, bedrock=fake, jev_client=None)
     assert (decision.mode, decision.source) == ("user_specified", "small_model") and not decision.skip_extraction
-    assert fake.route_calls[0]["model_id"] == rr.get_settings().bedrock_judge_model_id  # the small model
+    assert fake.route_calls[0]["model_id"] == rr.get_settings().judge_model_id  # the small model
 
 
 async def test_ambiguous_falls_through_to_the_main_model_extraction() -> None:

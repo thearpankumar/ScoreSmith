@@ -21,25 +21,16 @@
       "Condition": { "StringLike": { "s3:prefix": ["derived/*", "raw/*", "uploads/*"] } }
     },
     {
-      "Sid": "InvokeOnlyThePipelineModels",
+      "Sid": "ReadOpenRouterKey",
       "Effect": "Allow",
-      "Action": "bedrock:InvokeModel",
-      "Resource": [
-        "arn:aws:bedrock:${REGION}::foundation-model/mistral.voxtral-small-24b-2507",
-        "arn:aws:bedrock:${REGION}::foundation-model/mistral.voxtral-mini-3b-2507",
-        "arn:aws:bedrock:${REGION}::foundation-model/moonshotai.kimi-k2.5",
-        "arn:aws:bedrock:${REGION}::foundation-model/qwen.qwen3-vl-235b-a22b",
-        "arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:inference-profile/us.meta.llama4-maverick-17b-instruct-v1:0",
-        "arn:aws:bedrock:us-east-1::foundation-model/meta.llama4-maverick-17b-instruct-v1:0",
-        "arn:aws:bedrock:us-east-2::foundation-model/meta.llama4-maverick-17b-instruct-v1:0",
-        "arn:aws:bedrock:us-west-2::foundation-model/meta.llama4-maverick-17b-instruct-v1:0"
-      ]
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter${SSM_PARAM}"
     },
     {
       "Sid": "WriteOwnLogs",
       "Effect": "Allow",
       "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
-      "Resource": "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/qs-eval-*:*"
+      "Resource": "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/lambda/${PREFIX}-*:*"
     }
   ]
 }

@@ -61,21 +61,47 @@ class MemoryStore:
                 for k, v in sorted(self.objects.items()) if k.startswith(prefix)]
 
 
-class FakeConverse:
-    """bedrock-runtime stand-in. `plan` maps modelId -> text | Exception | callable(kwargs)."""
+class FakeHttpResponse:
+    def __init__(self, status=200, body=None, text=None):
+        self.status_code = status
+        self._body = body
+        self.text = text if text is not None else json.dumps(body)
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("no json")
+        return self._body
+
+
+def chat_ok(text, prompt_tokens=1, completion_tokens=2):
+    return FakeHttpResponse(200, {"choices": [{"message": {"role": "assistant", "content": text}}],
+                                  "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}})
+
+
+def chat_err(status, message="boom"):
+    return FakeHttpResponse(status, {"error": {"code": status, "message": message}})
+
+
+class FakeOrSession:
+    """requests.Session stand-in for OpenRouter. `plan` maps model -> response | text | Exception | callable(json) |
+    list of those (consumed in order, the last one repeats). Every POST is recorded in `.calls`."""
 
     def __init__(self, plan):
         self.plan = plan
         self.calls: list[dict] = []
 
-    def converse(self, **kw):
-        self.calls.append(kw)
-        action = self.plan[kw["modelId"]]
-        if callable(action) and not isinstance(action, Exception):
-            action = action(kw)
+    def post(self, url, headers=None, json=None, timeout=None, **kw):
+        self.calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        action = self.plan[json["model"]]
+        if isinstance(action, list):
+            action = action.pop(0) if len(action) > 1 else action[0]
+        if callable(action) and not isinstance(action, (Exception, FakeHttpResponse)):
+            action = action(json)
+        if isinstance(action, str):
+            action = chat_ok(action)
         if isinstance(action, Exception):
             raise action
-        return {"output": {"message": {"content": [{"text": action}]}}, "usage": {"inputTokens": 1, "outputTokens": 2}}
+        return action
 
 
 class FakeResponse:

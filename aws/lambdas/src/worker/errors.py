@@ -23,7 +23,7 @@ class PipelineError(Exception):
 
 
 class TransientError(Exception):
-    """Retryable by the state machine (throttling, all Bedrock models temporarily failing)."""
+    """Retryable by the state machine (throttling, all models, or OpenRouter, temporarily failing)."""
 
 
 _CODE_RE = re.compile(r"\b(" + "|".join(sorted(ERROR_CODES)) + r"):\s*(.*)", re.S)

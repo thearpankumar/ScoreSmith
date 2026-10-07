@@ -311,3 +311,139 @@ class AgentCoreWebSearchClient:
                     backoff = (2**attempt) + random.uniform(0, 1)
                     await asyncio.sleep(backoff)
         return []  # pragma: no cover — unreachable (loop always returns/retries)
+
+
+# --- OpenRouter web search (chat/completions + the `web` plugin) ---------------------------
+
+
+def extract_openrouter_results(data: dict[str, Any], max_results: int = _MAX_RESULTS) -> list[SearchResult]:
+    """Maps `choices[0].message.annotations[]` of type `url_citation` to `SearchResult`s
+    (deduplicated by URL, capped at `max_results`). Never raises on a malformed body."""
+    results: list[SearchResult] = []
+    try:
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+        annotations = message.get("annotations") or []
+    except (AttributeError, IndexError, TypeError):
+        return results
+    if not isinstance(annotations, list):
+        return results
+    seen: set[str] = set()
+    for ann in annotations:
+        if len(results) >= max_results:
+            break
+        if not isinstance(ann, dict) or ann.get("type") != "url_citation":
+            continue
+        cite = ann.get("url_citation")
+        if not isinstance(cite, dict) or not cite.get("url"):
+            continue
+        url = str(cite["url"])
+        if url in seen:
+            continue
+        seen.add(url)
+        results.append(
+            _normalize_result(
+                {
+                    "title": cite.get("title"),
+                    "url": url,
+                    "snippet": cite.get("content"),
+                    "published_date": cite.get("published_date") or cite.get("publishedDate"),
+                }
+            )
+        )
+    return results
+
+
+class OpenRouterWebSearchClient:
+    """`WebSearchClientProtocol` backed by OpenRouter's `web` plugin: one chat completion
+    (`openrouter_search_model_id`) whose url_citation annotations are the results. Same
+    contract as the AgentCore client: `search()` never raises, returns [] on any failure."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model_id: str | None = None,
+        engine: str | None = None,
+        max_results: int = _MAX_RESULTS,
+        max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
+        transport: httpx.AsyncBaseTransport | None = None,
+        backoff: bool = True,
+    ) -> None:
+        settings = get_settings()
+        self._api_key = api_key if api_key is not None else settings.openrouter_api_key
+        self._base_url = (base_url or settings.openrouter_base_url).rstrip("/")
+        self._model_id = model_id or settings.openrouter_search_model_id
+        self._engine = engine if engine is not None else settings.openrouter_web_search_engine
+        self._max_results = max(1, min(max_results, _MAX_RESULTS))
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._transport = transport
+        self._backoff = backoff
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._api_key)
+
+    def _payload(self, query: str) -> dict[str, Any]:
+        plugin: dict[str, Any] = {"id": "web", "max_results": self._max_results}
+        if self._engine:
+            plugin["engine"] = self._engine
+        return {
+            "model": self._model_id,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Search the web for the following query and give a brief summary of the "
+                        f"most relevant, authoritative findings.\n\nQuery: {query}"
+                    ),
+                }
+            ],
+            "plugins": [plugin],
+            "max_tokens": 1000,
+        }
+
+    async def search(self, query: str) -> list[SearchResult]:
+        if not self.is_configured:
+            logger.warning("OpenRouter web search is not configured (OPENROUTER_API_KEY empty); returning [].")
+            return []
+        settings = get_settings()
+        headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
+        if settings.openrouter_http_referer:
+            headers["HTTP-Referer"] = settings.openrouter_http_referer
+        if settings.openrouter_app_title:
+            headers["X-OpenRouter-Title"] = settings.openrouter_app_title
+            headers["X-Title"] = settings.openrouter_app_title
+        payload = self._payload(query)
+        async with self._semaphore:
+            for attempt in range(_MAX_ATTEMPTS):
+                try:
+                    async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS * 2, transport=self._transport) as client:
+                        response = await client.post(
+                            f"{self._base_url}/chat/completions", json=payload, headers=headers
+                        )
+                        response.raise_for_status()
+                        data = response.json()
+                    if isinstance(data, dict) and data.get("error") and not data.get("choices"):
+                        raise RuntimeError("OpenRouter returned an error body")
+                    results = extract_openrouter_results(data, self._max_results)
+                    logger.info("web_search query=%r -> %d result(s) (openrouter)", query, len(results))
+                    return results
+                except Exception as exc:  # noqa: BLE001 — never raise from search()
+                    is_last = attempt + 1 >= _MAX_ATTEMPTS
+                    # Log only the exception type/status: never the request headers (API key).
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    logger.warning(
+                        "web_search query=%r failed on attempt %d/%d (%s%s)%s",
+                        query,
+                        attempt + 1,
+                        _MAX_ATTEMPTS,
+                        type(exc).__name__,
+                        f" HTTP {status}" if status else "",
+                        " - giving up, returning []" if is_last else " - retrying",
+                    )
+                    if is_last:
+                        return []
+                    if self._backoff:
+                        await asyncio.sleep((2**attempt) + random.uniform(0, 1))
+        return []  # pragma: no cover

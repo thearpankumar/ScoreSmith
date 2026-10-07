@@ -260,6 +260,7 @@ def test_start_session_surfaces_similar_scorecard_before_propose_kpis(
     vector = [1.0] + [0.0] * (EMBEDDING_DIM - 1)
 
     async def _seed_embedding() -> None:
+        from app.config import get_settings
         from app.db import AsyncSessionLocal
         from app.models.scorecard_embedding import ScorecardEmbedding
 
@@ -268,7 +269,7 @@ def test_start_session_surfaces_similar_scorecard_before_propose_kpis(
                 ScorecardEmbedding(
                     scorecard_version_id=version["id"],
                     embedding=vector,
-                    embedding_model="test-synthetic",
+                    embedding_model=get_settings().embedding_model_id,
                     source_text_hash="deadbeef",
                 )
             )

@@ -336,6 +336,9 @@ _MODEL_MAX_OUTPUT_TOKENS: dict[str, int] = {
     "zai.glm-5": 128000,
     # Llama 4 Maverick (the AI-evaluation master agent) rejects maxTokens above 8192.
     "us.meta.llama4-maverick-17b-instruct-v1:0": 8192,
+    # OpenRouter models (see app/ai/openrouter_client.py; same clamp helper).
+    "openai/gpt-6-luna": 128000,
+    "deepseek/deepseek-v4.1-flash": 64000,
 }
 
 

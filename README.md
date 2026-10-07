@@ -9,7 +9,7 @@
 ![pgvector](https://img.shields.io/badge/pgvector-%2B%20ltree-4169E1?logo=postgresql&logoColor=white)
 ![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-4-06B6D4?logo=tailwindcss&logoColor=white)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.2-1C3C3C)
-![AWS Bedrock](https://img.shields.io/badge/AWS-Bedrock-232F3E?logo=amazonwebservices&logoColor=white)
+![OpenRouter](https://img.shields.io/badge/LLM-OpenRouter-6467F2)
 ![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
@@ -17,7 +17,7 @@
 
 ## Key features
 
-- **Chat-driven scorecard builder** — a [LangGraph](https://github.com/langchain-ai/langgraph) state machine, backed by AWS Bedrock (Z.ai GLM-5), asks clarifying questions, proposes KPIs "LLM first, human second," and checkpoints every step to Postgres so a session survives a server restart mid-question.
+- **Chat-driven scorecard builder** — a [LangGraph](https://github.com/langchain-ai/langgraph) state machine, backed by OpenRouter (`openai/gpt-6-luna`), asks clarifying questions, proposes KPIs "LLM first, human second," and checkpoints every step to Postgres so a session survives a server restart mid-question.
 - **Two ways to start a scorecard, chosen automatically** — if you describe a use case ("a quality scorecard for SRE incident response") the builder designs the KPIs for you (*open-ended mode*). If you paste your own KPI list with the use case, it **keeps your KPIs exactly as written** and only fills in what is missing (*user-specified mode*). A list plus "and suggest more" runs both (*hybrid mode*). See [How the chat decides what to do](#how-the-chat-decides-what-to-do).
 - **Your KPIs are protected** — in user-specified and hybrid mode the builder never drops, renames, re-parents, dedupes or caps your KPIs, and never silently changes a weight or guideline *you* supplied. A later change is accepted only when your latest message actually asks for it (checked server-side, not left to the model). Weights you didn't give are filled in (research-informed risk/impact weighting, optionally with a suggested scoring formula); weights you gave are kept, and only rescaled — with a note — if they don't sum to 100.
 - **Genuine multi-agent, CATEGORY-based research fan-out (open-ended mode)** — before the first KPI is ever proposed, the graph decides named, business-recognizable KPI categories for the user's domain (e.g. "Schedule", "Budget", "Quality" for a project-milestone scorecard), then runs one independent research agent per category *concurrently* (`asyncio.gather`, not sequentially), each with its own real web-search budget via an AWS Bedrock AgentCore Gateway MCP tool. Each agent proposes its **own** batch of grounded KPIs nested under its category; their 11-level guidelines are then written in parallel, compact chunks. A cross-category dedup/merge pass resolves near-duplicate KPI concepts (obvious duplicates deterministically, borderline pairs by one batched judge call) before the result is shown, grouped by category, both on screen and in the saved `kpi_nodes` hierarchy.
@@ -25,10 +25,10 @@
 - **Follow-up edits are one small operation** — "make Customer Satisfaction Score 8% and scale the others" is applied by the server (`edit_kpis`: set weight with proportional rebalance, rename, remove, add, move, regenerate one KPI's guidelines), so the model never has to re-type the whole scorecard. The reply is a server-built summary of what really changed.
 - **Chat turns run in the background** — sending a message returns immediately (`202`); the UI polls the session and a live trace, so the draft header, your KPIs, weights and guidelines appear on screen as they are ready, with no refresh, an elapsed timer and a Cancel button. A refresh mid-turn resumes where it was.
 - **Cheap request routing** — a free keyword/format check, then Jev's multiple-choice `choice` question (or the small judge model) decides the mode; only a confident "open-ended" skips the full extraction, and a clearly structured list is parsed with zero model calls.
-- **Embedding-based reuse suggestions** — a new request is checked against existing scorecards (pgvector cosine similarity over Titan-embedded purpose text, threshold 0.75) and offered as "use as-is / adapt / start fresh" *before* generating from scratch.
+- **Embedding-based reuse suggestions** — a new request is checked against existing scorecards (pgvector cosine similarity over embedded purpose text, threshold 0.75) and offered as "use as-is / adapt / start fresh" *before* generating from scratch.
 - **AI evaluation of real submissions** — upload videos / PDFs / DOCX, paste public Google Drive links, or drop a spreadsheet of submissions in *any* column layout. Downloading, text/image extraction, transcription and image OCR run on **AWS serverless** (S3 + Step Functions + Lambda), not on your machine. Locally, a LangGraph pipeline has **Llama 4 Maverick** (the master agent) pick the relevant evidence for each KPI, **Jev** score it against that KPI's guideline ladder, and Maverick write the reasoning. See [AI evaluation of real submissions](#ai-evaluation-of-real-submissions-files-google-drive-spreadsheets).
 - **Batch evaluation with a queue** — a spreadsheet becomes one evaluation per row. A DB-backed dispatcher runs a bounded number at once (default 3, up to 5), starts the next as soon as one finishes, adapts to AWS/Bedrock throttling instead of failing, and survives a backend restart. The AI names each evaluation `Name (email)` from the sheet or the submission.
-- **Ensemble LLM judge (text-only path)** — every leaf KPI is scored by **3 independent** Bedrock Converse calls (Z.ai GLM-4.7-Flash) with the guideline rungs presented in a different order each time (ascending / descending / deterministic shuffle) to counter position bias, aggregated by median, and flagged `needs_review` when the calls disagree.
+- **Ensemble LLM judge (text-only path)** — every leaf KPI is scored by **3 independent** OpenRouter chat calls (`deepseek/deepseek-v4.1-flash`) with the guideline rungs presented in a different order each time (ascending / descending / deterministic shuffle) to counter position bias, aggregated by median, and flagged `needs_review` when the calls disagree.
 - **Reasoning-before-score judging** — the judge's tool schema forces `matched_level → evidence_quotes → reasoning → score`, so the model commits to a rubric level and cites verbatim evidence before it ever writes a number.
 - **Custom scoring-formula engine** — the default weighted average can be overridden with an arbitrary safe expression (`kpi["Name"] * 0.6 + min(kpi["A"], kpi["B"]) * 0.4`, `+ - * / **`, `min/max/avg/mean/sqrt/abs`), parsed via `simpleeval`'s AST whitelist (no `eval`), used identically by both the AI judge and manual scoring paths so they can never disagree about what a score means.
 - **Hierarchical KPI trees** — up to 4 levels deep, with weights on leaf KPIs only (categories/sections are unweighted groupings), stored as Postgres `ltree` materialized paths, each leaf carrying a full 0–10 qualitative + quantitative guideline ladder.
@@ -66,8 +66,8 @@ graph TD
     end
 
     subgraph AWSCloud["AWS"]
-        Bedrock["AWS Bedrock Converse API<br/>Z.ai GLM-5 (chat) · GLM-4.7-Flash (judge)<br/>Llama 4 Maverick (AI-evaluation master)<br/>Titan Text Embeddings V2"]
-        Gateway["AWS AgentCore Gateway<br/>web_search MCP tool, hand SigV4-signed"]
+        Bedrock["OpenRouter chat/completions + embeddings<br/>openai/gpt-6-luna (chat, master) · deepseek/deepseek-v4.1-flash (judge)<br/>openai/text-embedding-3-small (1024-d)"]
+        Gateway["OpenRouter web plugin<br/>web_search tool (url_citation annotations)"]
         S3Store[("S3<br/>uploads, raw, derived text")]
         StepFn["Step Functions + 6 Lambda workers<br/>Drive download, PDF/DOCX extract,<br/>ffmpeg, Voxtral, vision OCR"]
     end
@@ -156,7 +156,7 @@ sequenceDiagram
     participant Sim as check_similarity
     participant Research as research_kpis (master)
     participant Agents as Category research agents (N, parallel)
-    participant Search as AgentCore Gateway web_search
+    participant Search as OpenRouter web_search
     participant Jev as Jev (OpenRouter quality gate)
     participant Propose as propose_kpis (GLM-5)
     participant DB as Postgres
@@ -416,7 +416,7 @@ sequenceDiagram
     participant UI as Charts › Evaluate tab
     participant API as FastAPI /evaluations
     participant Judge as Ensemble judge (judge.py)
-    participant Bedrock as AWS Bedrock — GLM-4.7-Flash
+    participant Bedrock as OpenRouter — judge model
     participant Formula as compute_final_score()
     participant DB as Postgres
 
@@ -449,15 +449,15 @@ sequenceDiagram
 | ORM / migrations | SQLAlchemy 2.0 (async), Alembic, `psycopg[binary]` v3 |
 | Validation | Pydantic v2 / pydantic-settings |
 | Agent orchestration | LangGraph 1.2 + `langgraph-checkpoint-postgres` (Postgres-backed checkpointing) |
-| LLM access | boto3 → AWS Bedrock Converse/ConverseStream API |
-| Chat / builder model | Z.ai GLM-5 (`zai.glm-5`) |
-| AI-evaluation master agent | Meta Llama 4 Maverick (`us.meta.llama4-maverick-17b-instruct-v1:0`) — evidence selection, identification, reasoning, spreadsheet column mapping |
+| LLM access | OpenRouter (OpenAI-compatible chat-completions + embeddings) over `httpx`, behind the `LLM_PROVIDER` switch; the legacy boto3 → AWS Bedrock Converse client is kept for rollback (`LLM_PROVIDER=bedrock`) |
+| Chat / builder model | `openai/gpt-6-luna` (`OPENROUTER_CHAT_MODEL_ID`) |
+| AI-evaluation master agent | `openai/gpt-6-luna` (`OPENROUTER_MASTER_MODEL_ID`) — evidence selection, identification, reasoning, spreadsheet column mapping |
 | AI-evaluation scorer | TypeSafe AI **Jev** `score` + `noul` questions (per KPI, against the guideline ladder) |
 | Video / document processing | AWS Lambda container image (Python 3.12, ffmpeg, PyMuPDF, python-docx), orchestrated by AWS Step Functions; Mistral Voxtral (transcription) and Kimi K2.5 / Qwen3-VL (image OCR) via Bedrock |
 | Object storage | Amazon S3 (private, SSE-S3, lifecycle expiry), direct browser multipart upload with presigned URLs |
-| Judge model | Z.ai GLM-4.7-Flash (`zai.glm-4.7-flash`) — cheap enough to justify a k=3 ensemble |
-| Embeddings | Amazon Titan Text Embeddings V2 (`amazon.titan-embed-text-v2:0`) |
-| Web search | AWS Bedrock AgentCore Gateway (MCP `tools/call`, hand-rolled SigV4 over `httpx`) |
+| Judge model | `deepseek/deepseek-v4.1-flash` (`OPENROUTER_JUDGE_MODEL_ID`) — cheap enough to justify a k=3 ensemble |
+| Embeddings | `openai/text-embedding-3-small` requested with `dimensions=1024` (L2-normalised) to fit the existing pgvector column. Rows are tagged with the embedding model and similarity search only compares rows from the configured model, so older Titan vectors are simply ignored (re-embedded on the next save) |
+| Web search | OpenRouter `web` plugin on `OPENROUTER_SEARCH_MODEL_ID` (results = `url_citation` annotations); the AgentCore Gateway client remains in `web_search.py` for the Bedrock provider |
 | Quality gate (self-critique) and request routing | TypeSafe AI **Jev** via OpenRouter's alpha Decisions API (`typesafe/jev-1.13`) — a separate provider from Bedrock, used for the three 0–1 quality-rating checkpoints and the `choice` routing question |
 | Live updates | Short polling with backoff (chat turns run as background tasks; state is durable in Postgres) |
 | Request routing | Deterministic gate + parser, then Jev's `choice` question or the small judge model (`app/ai/request_routing.py`) |
@@ -498,14 +498,14 @@ ScoreSmith/
 
 ## Getting started / local development
 
-Requires Docker + Docker Compose, and AWS Bedrock access (a Bedrock "API key" bearer-token credential or a SigV4 IAM key pair) for the AI features — the rest of the app (scorecard CRUD, manual evaluation) works without Bedrock configured.
+Requires Docker + Docker Compose, and an OpenRouter API key (`OPENROUTER_API_KEY`) for the AI features — the rest of the app (scorecard CRUD, manual evaluation) works without it.
 
 ```bash
 cd infra
 cp .env.example .env
-# Fill in at minimum: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (see the note below), AWS_REGION.
-# Optionally fill in AGENTCORE_GATEWAY_* to enable real web search in the research fan-out —
-# left blank, web_search.py just returns no results rather than failing the chat turn.
+# Fill in at minimum: OPENROUTER_API_KEY (models default to the ones in .env.example).
+# Web search uses the same OPENROUTER_API_KEY; with no key, web_search just returns no results.
+# (OPENROUTER_JEV_API falls back to OPENROUTER_API_KEY when left blank.)
 # Optionally fill in OPENROUTER_JEV_API to enable the Jev quality-gate self-critique layer —
 # left blank, every gate check degrades to "passed" rather than blocking the chat turn.
 docker compose up --build
@@ -515,7 +515,7 @@ docker compose up --build
 - Backend API: <http://localhost:8000> (interactive docs at `/docs`, health check at `/health`)
 - Postgres: `localhost:5432`
 
-**Optional: the AI evaluation of files and Drive links.** This needs the AWS stack from [Setting up AWS](#ai-evaluation-of-real-submissions-files-google-drive-spreadsheets) (`aws/bootstrap`), which fills `S3_BUCKET`, `SFN_STATE_MACHINE_ARN` and the backend user's key in `infra/.env`. Run it once, then `docker compose up -d --build backend`.
+**Optional: the AI evaluation of files and Drive links.** This needs the AWS stack from [Setting up AWS](#ai-evaluation-of-real-submissions-files-google-drive-spreadsheets) (`aws/bootstrap`), which fills `OR_S3_BUCKET`, `OR_SFN_STATE_MACHINE_ARN` and the backend user's key in `infra/.env`. Run it once, then `docker compose up -d --build backend`.
 
 The backend container applies pending Alembic migrations on every start (a failure is logged but doesn't stop the API; if you see "alembic upgrade head failed", run `docker compose exec backend python -m alembic upgrade head` yourself — without migrations 0009 and 0010 chat turns and AI evaluations fail). Seed data is **not** loaded automatically — run it once:
 
@@ -536,29 +536,29 @@ docker compose exec backend python -m app.scripts.seed
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / `POSTGRES_PORT` | Local Postgres container |
 | `TEST_DATABASE_URL` | Sibling test database, kept separate so `pytest`'s per-test `TRUNCATE` never touches seeded dev data |
 | `BACKEND_PORT` / `FRONTEND_PORT` | Compose host port mappings |
-| `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Bedrock credentials. **Note**: if your credential is a Bedrock long-term "API key" (bearer token) rather than a real SigV4 IAM pair, plain `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` fails with `UnrecognizedClientException`; `docker-compose.yml` auto-derives `AWS_BEARER_TOKEN_BEDROCK` from `AWS_SECRET_ACCESS_KEY` (prefixed `A`) to work around this — see the comments in `infra/docker-compose.yml` and `infra/.env.example` for the full story |
-| `BEDROCK_CHAT_MODEL_ID` / `BEDROCK_JUDGE_MODEL_ID` / `BEDROCK_EMBEDDING_MODEL_ID` | Default to `zai.glm-5`, `zai.glm-4.7-flash`, `amazon.titan-embed-text-v2:0` |
-| `AGENTCORE_GATEWAY_WEB_SEARCH_URL` / `_TOOL_NAME` / `_AWS_ACCESS_KEY_ID` / `_AWS_SECRET_ACCESS_KEY` | AWS AgentCore Gateway web-search tool — a separate credential pair from the main Bedrock ones; the only web-search backend this project talks to |
-| `OPENROUTER_JEV_API` | OpenRouter API key for the Jev quality-gate layer (`app/ai/jev_client.py`) — a separate provider from Bedrock. Left blank, every gate check degrades to "passed" rather than blocking the chat turn |
+| `LLM_PROVIDER` / `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` | Provider switch (`openrouter` default, `bedrock` = legacy rollback) and the OpenRouter credentials |
+| `OPENROUTER_CHAT_MODEL_ID` / `_JUDGE_` / `_MASTER_` / `_EMBEDDING_` / `_SEARCH_MODEL_ID` | Default to `openai/gpt-6-luna`, `deepseek/deepseek-v4.1-flash`, `openai/gpt-6-luna`, `openai/text-embedding-3-small`, `openai/gpt-6-luna` |
+| `OPENROUTER_REASONING_EFFORT` / `OPENROUTER_WEB_SEARCH_ENGINE` | Reasoning effort sent with chat calls (default `low`; empty omits it) and the optional web-plugin engine (empty = OpenRouter default) |
+| `OPENROUTER_JEV_API` | OpenRouter key for the Jev quality-gate layer (`app/ai/jev_client.py`); falls back to `OPENROUTER_API_KEY` when blank. With no key at all, every gate check degrades to "passed" rather than blocking the chat turn |
 | `NEXT_PUBLIC_API_BASE_URL` | Backend URL as seen by the *browser* (client-side fetches) |
 | `INTERNAL_API_BASE_URL` | Backend URL as seen *inside* the frontend container (server components / route handlers), via the Compose service name |
 | `JWT_SECRET` | Present in `.env.example` for future real auth; not currently read anywhere in the backend — see [Current limitations](#current-limitations) |
 | `REQUEST_ROUTER` | `auto` (default) · `jev` · `small_model` · `off` — how the cheap mode router decides between open-ended / user-specified / hybrid |
 | `CHAT_TURN_TIMEOUT_SECONDS` | Wall-clock cap for one chat turn (default `900`) |
 | `CHAT_TURNS_INLINE` | `false` (default): turns run in the background and the POST returns 202. `true`: run inline (used by the test suite) |
-| `BEDROCK_MAX_CONCURRENCY` | Max simultaneous Bedrock calls from the research / guideline fan-outs (default `8`); the connection pool follows it |
-| `BEDROCK_READ_TIMEOUT_SECONDS` / `BEDROCK_CONNECT_TIMEOUT_SECONDS` / `BEDROCK_MAX_ATTEMPTS` / `BEDROCK_MAX_POOL_CONNECTIONS` | boto3 client tuning (defaults `240` / `10` / `2` / `32`) — large structured outputs need far more than botocore's 60 s default read timeout |
-| `BEDROCK_MAX_OUTPUT_TOKENS` | Output-token limit per call (default `16000`, clamped per model — GLM-4.7-Flash tops out around 4K; `0` omits the limit). A call cut off at the limit is detected and retried smaller |
+| `BEDROCK_MAX_CONCURRENCY` | Max simultaneous LLM calls from the research / guideline fan-outs (default `8`); the connection pool follows it |
+| `BEDROCK_READ_TIMEOUT_SECONDS` / `BEDROCK_CONNECT_TIMEOUT_SECONDS` / `BEDROCK_MAX_ATTEMPTS` / `BEDROCK_MAX_POOL_CONNECTIONS` | Bedrock (boto3) tuning; `BEDROCK_MAX_ATTEMPTS` also bounds OpenRouter 502/503 retries. OpenRouter read/connect timeouts: `OPENROUTER_READ_TIMEOUT_SECONDS` / `OPENROUTER_CONNECT_TIMEOUT_SECONDS` (defaults `240` / `10` / `2` / `32`) — large structured outputs need far more than botocore's 60 s default read timeout |
+| `BEDROCK_MAX_OUTPUT_TOKENS` | Output-token limit per call (default `16000`, clamped per model — per-model caps live in `bedrock_client.py`; `0` omits the limit). A call cut off at the limit is detected and retried smaller |
 | `USER_KPIS_PER_FILL_CALL` | KPIs per guideline-writing call in user-specified mode (default `5`) |
 | `USER_RESEARCH_TIMEOUT_SECONDS` / `USER_ENRICH_DEADLINE_SECONDS` / `OPEN_FILL_DEADLINE_SECONDS` | Time budgets (defaults `45` / `170` / `150`) after which research is dropped and remaining KPIs get model-knowledge guidelines in small calls |
 | `QUALITY_GATE_CALL_TIMEOUT_SECONDS` / `QUALITY_GATE_BUDGET_SECONDS` | Per-Jev-call timeout and per-turn gate time budget (defaults `12` / `150`) |
-| `S3_BUCKET` / `SFN_STATE_MACHINE_ARN` | The AI-evaluation AWS stack. Written into `infra/.env` by `aws/bootstrap`; without them the file/Drive flow returns a clear 503 |
-| `AWS_APP_ACCESS_KEY_ID` / `AWS_APP_SECRET_ACCESS_KEY` | Access key of the least-privilege `qs-backend-app` IAM user (S3 prefixes + the one state machine). Separate from the Bedrock credential, which is not used for S3 |
+| `OR_S3_BUCKET` / `OR_SFN_STATE_MACHINE_ARN` | The AI-evaluation AWS stack of this deployment (read only under these names, never the old `S3_BUCKET`/`SFN_STATE_MACHINE_ARN`). Without them the file/Drive flow returns a clear 503 |
+| `OR_AWS_APP_ACCESS_KEY_ID` / `OR_AWS_APP_SECRET_ACCESS_KEY` | Access key of the least-privilege IAM user (S3 prefixes + the one state machine) |
 | `AI_EVAL_MAX_CONCURRENT` | Evaluations processed at once (default `3`, clamped to 1–5); the rest wait in the queue |
-| `BEDROCK_MASTER_MODEL_ID` | Master agent for the AI evaluation (default `us.meta.llama4-maverick-17b-instruct-v1:0`); its output limit is clamped to 8192 tokens |
+| `OPENROUTER_MASTER_MODEL_ID` | Master agent for the AI evaluation (default `openai/gpt-6-luna`) |
 | `UPLOAD_MAX_BYTES` / `UPLOAD_MAX_FILES` / `UPLOAD_PART_SIZE` / `UPLOAD_URL_TTL_SECONDS` | Upload limits and multipart settings (defaults 2 GiB per file, 10 files, 32 MiB parts, 15 min presigned URLs) |
 | `AI_EVAL_POLL_SECONDS` / `AI_EVAL_TIMEOUT_SECONDS` / `AI_EVAL_INLINE` | Dispatcher poll interval (`4`), per-evaluation wall-clock cap (`14400`), and inline execution for tests (`false`) |
-| `BEDROCK_MAX_CONCURRENCY` (also) | Upper bound of the adaptive limiter used for the master agent's Bedrock calls; it backs off below this when Bedrock throttles |
+| `BEDROCK_MAX_CONCURRENCY` (also) | Upper bound of the adaptive limiter used for the master agent's LLM calls; it backs off below this when Bedrock throttles |
 
 Everything except the AWS stack variables has a default, and none is required to run the app.
 

@@ -1,5 +1,5 @@
 {
-  "BudgetName": "qs-eval-monthly",
+  "BudgetName": "${BUDGET_NAME}",
   "BudgetLimit": { "Amount": "25", "Unit": "USD" },
   "TimeUnit": "MONTHLY",
   "BudgetType": "COST"

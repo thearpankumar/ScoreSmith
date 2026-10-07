@@ -6,7 +6,7 @@ Single source of truth for the three build areas (`aws/`, `backend/`, `frontend/
 - Region `us-east-1`, profile `arpan-aws`, prefix `qs-eval`.
 - Bucket `qs-eval-<account-id>-us-east-1`. State machine `qs-eval-pipeline`. Lambdas `qs-eval-ingest|extract-doc|plan-audio|transcribe-chunk|analyze-image|assemble`. ECR repo `qs-eval-worker`.
 - IAM: role `qs-eval-lambda-role`, role `qs-eval-sfn-role`, user `qs-backend-app`.
-- Backend env vars: `S3_BUCKET`, `SFN_STATE_MACHINE_ARN`, `AWS_APP_ACCESS_KEY_ID`, `AWS_APP_SECRET_ACCESS_KEY` (written by `aws/bootstrap` into git-ignored `infra/.env`; never printed), `AI_EVAL_MAX_CONCURRENT` (default 3, clamp 1-5), `BEDROCK_MASTER_MODEL_ID=us.meta.llama4-maverick-17b-instruct-v1:0`.
+- Backend env vars: `OR_S3_BUCKET`, `OR_SFN_STATE_MACHINE_ARN`, `OR_AWS_APP_ACCESS_KEY_ID`, `OR_AWS_APP_SECRET_ACCESS_KEY` (written by `aws/bootstrap` into git-ignored `infra/.env`; never printed), `AI_EVAL_MAX_CONCURRENT` (default 3, clamp 1-5), `BEDROCK_MASTER_MODEL_ID=us.meta.llama4-maverick-17b-instruct-v1:0`.
 
 ## S3 layout
 - `uploads/{user_id}/{upload_group_id}/{uuid}.{ext}`: browser uploads (staging). Lifecycle 14 d.

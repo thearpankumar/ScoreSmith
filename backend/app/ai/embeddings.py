@@ -1,4 +1,4 @@
-"""Titan embedding generation + upsert into `scorecard_embeddings`, for the "suggest
+"""Embedding generation + upsert into `scorecard_embeddings`, for the "suggest
 similar scorecard" feature (see `similarity.py` for the search side).
 
 Source text is deliberately just `purpose + domain + KPI names` (per the plan: "a
@@ -9,6 +9,7 @@ scorecard", which is the question similarity search is answering.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 
@@ -60,6 +61,7 @@ async def upsert_scorecard_embedding(
     )
     source_text = build_source_text(scorecard, kpi_names)
     text_hash = _hash(source_text)
+    model_id = embedding_model_id or get_settings().embedding_model_id
 
     existing = (
         (
@@ -72,11 +74,15 @@ async def upsert_scorecard_embedding(
         .scalars()
         .one_or_none()
     )
-    if existing is not None and existing.source_text_hash == text_hash:
+    if (
+        existing is not None
+        and existing.source_text_hash == text_hash
+        and existing.embedding_model == model_id
+    ):
         return existing  # unchanged since last embed — nothing to do
 
-    vector = bedrock.embed(source_text)
-    model_id = embedding_model_id or get_settings().bedrock_embedding_model_id
+    # The client is synchronous (httpx / boto3): keep the event loop free.
+    vector = await asyncio.to_thread(bedrock.embed, source_text)
 
     if existing is not None:
         existing.embedding = vector

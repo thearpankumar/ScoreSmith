@@ -92,6 +92,12 @@ Phase 0 + Cycle 1 (Data Foundation + core CRUD API) of the Quality Scorecard Sys
 > `asyncio.WindowsSelectorEventLoopPolicy()` automatically on `sys.platform == "win32"`, so
 > this is handled for you — no action needed, just documented here so it isn't a mystery.
 
+## LLM provider
+
+The AI layer talks to **OpenRouter** by default (`LLM_PROVIDER=openrouter`): `app/ai/openrouter_client.py` implements the same `BedrockClientProtocol` as the legacy `BedrockClient` (kept for rollback with `LLM_PROVIDER=bedrock`), using OpenAI-style chat-completions with forced tool calls for structured output, plus `/embeddings` (1024-d, so no pgvector migration). Web search uses OpenRouter's `web` plugin (`OpenRouterWebSearchClient`). Set `OPENROUTER_API_KEY` and the `OPENROUTER_*_MODEL_ID` variables (see `infra/.env.example`); call sites read the provider-neutral `settings.chat_model_id` / `judge_model_id` / `master_model_id` / `embedding_model_id`.
+
+The AI-evaluation AWS settings are read from `OR_S3_BUCKET`, `OR_SFN_STATE_MACHINE_ARN`, `OR_AWS_APP_ACCESS_KEY_ID`, `OR_AWS_APP_SECRET_ACCESS_KEY` only (no fallback to the old names).
+
 ## Docker
 
 The backend is built/run via `infra/docker-compose.yml` (`../backend` build context,
