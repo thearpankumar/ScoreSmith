@@ -239,7 +239,7 @@ def test_export_colours_follow_the_scorecards_target(client: TestClient, db_sess
     owner = _user(db_session)
     _, version, leaves = _scorecard(db_session, owner, "Low Target Card", target=4.0)
     evs = [_evaluation(db_session, owner, version, leaves, "Pat", "pat@example.com", 4.2, [4, 4, 4, 5]),
-           _evaluation(db_session, owner, version, leaves, "Quinn", "quinn@example.com", 2.0, [2, 2, 2, 2])]
+           _evaluation(db_session, owner, version, leaves, "Quinn", "quinn@example.com", 1.9, [2, 2, 2, 2])]
     wb = _wb(_post(client, owner, [e.id for e in evs]))
     board = wb["Leaderboard"]
     head = next(c.row for row in board.iter_rows() for c in row if c.value == "Rank")

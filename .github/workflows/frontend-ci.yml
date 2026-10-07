@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - "frontend/**"
+      - "backend/tests/data/target_band_cases.json"
       - ".github/workflows/frontend-ci.yml"
   pull_request:
     branches: [main]
     paths:
       - "frontend/**"
+      - "backend/tests/data/target_band_cases.json"
       - ".github/workflows/frontend-ci.yml"
 
 defaults:
@@ -38,6 +40,9 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+      - name: Unit tests
+        run: npm run test:unit
 
       - name: Build
         run: npm run build
