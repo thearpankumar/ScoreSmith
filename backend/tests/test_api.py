@@ -12,30 +12,21 @@ def test_health(client: TestClient) -> None:
     assert r.json() == {"status": "ok"}
 
 
-def test_user_crud(client: TestClient, seed_user_id: str) -> None:
-    r = client.post(
-        "/api/v1/users",
-        json={"email": "api-crud@example.com", "name": "API Crud"},
-        headers={"X-User-Id": seed_user_id},
-    )
-    assert r.status_code == 201
-    user = r.json()
+def test_me_profile_and_removed_user_admin_api(client: TestClient, seed_user_id: str) -> None:
+    h = {"X-User-Id": seed_user_id}
+    me = client.get("/api/v1/me", headers=h)
+    assert me.status_code == 200
+    assert me.json()["email"] == "bootstrap@qualityscorecard.local"
+    assert "password_hash" not in me.json()
 
-    r = client.get(f"/api/v1/users/{user['id']}")
-    assert r.status_code == 200
-    assert r.json()["email"] == "api-crud@example.com"
-
-    r = client.patch(
-        f"/api/v1/users/{user['id']}", json={"name": "Renamed"}, headers={"X-User-Id": user["id"]}
-    )
+    r = client.patch("/api/v1/me", json={"name": "Renamed", "role": "admin"}, headers=h)
     assert r.status_code == 200
     assert r.json()["name"] == "Renamed"
+    assert r.json()["role"] == "member"  # a user cannot promote themselves
 
-    r = client.delete(f"/api/v1/users/{user['id']}", headers={"X-User-Id": user["id"]})
-    assert r.status_code == 204
-
-    r = client.get(f"/api/v1/users/{user['id']}")
-    assert r.status_code == 404
+    # The open user-admin endpoints are gone.
+    assert client.get(f"/api/v1/users/{seed_user_id}", headers=h).status_code == 404
+    assert client.get("/api/v1/me", headers={"X-Test-Anonymous": "1"}).status_code == 401
 
 
 def test_scorecard_version_kpi_bulk_create_and_nested_read(client: TestClient, seed_user_id: str) -> None:

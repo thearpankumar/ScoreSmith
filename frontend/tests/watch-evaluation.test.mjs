@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 const calls = [];
-const progressHeaders = []; // headers sent with each progress request
+const progressHeaders = []; // fetch init of each progress request
 let script = []; // GET /evaluations/{id}/progress responses, one per poll
 globalThis.document = { visibilityState: "visible", addEventListener() {}, removeEventListener() {} };
 globalThis.window = undefined;
@@ -16,8 +16,8 @@ globalThis.fetch = async (url, init = {}) => {
   const u = String(url);
   calls.push(`${init.method ?? "GET"} ${u.replace(/^.*\/api\/v1/, "")}`);
   if (init.signal?.aborted) throw new DOMException("aborted", "AbortError");
-  if (u.includes("/progress")) progressHeaders.push(init.headers ?? {});
-  if (u.includes("/users")) return json(200, [{ id: "u1", email: "designer@qualityscorecard.local", name: "A", role: "admin", created_at: "" }]);
+  if (u.includes("/progress")) progressHeaders.push(init);
+  if (/\/api\/v1\/me($|\?)/.test(u)) return json(200, { id: "u1", email: "designer@qualityscorecard.local", name: "A", role: "member", created_at: "" });
   if (/scorecard-versions|\/versions/.test(u)) return json(404, { detail: "nf" });
   const next = script.shift();
   if (next instanceof Error) throw next;
@@ -40,7 +40,7 @@ test("polls until completed and stops (no extra polls)", async () => {
   assert.deepEqual(seen, [["queued", 2], ["ingesting", null], ["scoring", null], ["completed", null]]);
   assert.equal(final.status, "completed");
   assert.equal(script.length, 0);
-  const polls = calls.filter((c) => !c.includes("/users")); // the one-off user lookup is not a poll
+  const polls = calls.filter((c) => !c.endsWith(" /me")); // the one-off "who am I" lookup is not a poll
   assert.equal(polls.length, 4);
   assert.ok(polls.every((c) => c === "GET /evaluations/ev1/progress"));
 });
@@ -118,10 +118,12 @@ test("evaluation list rows map the new AI fields; 422 detail arrays are readable
   );
 });
 
-test("progress polls send the X-User-Id header (the route 401s without it: 'Connection lost' forever)", async () => {
+test("progress polls ride on the session cookie (credentials: include) and never send a user-id header", async () => {
   progressHeaders.length = 0;
   script = [{ body: prog({ status: "completed", stage: "done" }) }];
   await api.watchEvaluation("ev1", { signal: new AbortController().signal, onUpdate() {} });
   assert.equal(progressHeaders.length, 1);
-  assert.equal(progressHeaders[0]["X-User-Id"], "u1");
+  assert.equal(progressHeaders[0].credentials, "include");
+  assert.equal(progressHeaders[0].headers["X-User-Id"], undefined);
+  assert.equal(progressHeaders[0].headers["x-user-id"], undefined);
 });

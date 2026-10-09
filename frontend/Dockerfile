@@ -1,7 +1,7 @@
 # Dev-mode Dockerfile for the Quality Scorecard frontend.
 # Matches infra/docker-compose.yml's `frontend` service: build context is
-# ../frontend, the container listens on port 3000, NEXT_PUBLIC_API_BASE_URL
-# is injected via env, and the compose file bind-mounts the source tree for
+# ../frontend, the container listens on port 3000, INTERNAL_API_BASE_URL
+# (the backend the /api/v1/* proxy forwards to; read when Next starts, or at build time for `next build`) is injected via env, and the compose file bind-mounts the source tree for
 # live reload (with node_modules/.next kept as anonymous volumes so the
 # image's installed deps and build cache aren't shadowed by the mount).
 FROM node:20-slim

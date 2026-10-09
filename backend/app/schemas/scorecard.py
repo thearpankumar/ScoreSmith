@@ -12,7 +12,6 @@ from app.schemas.kpi import KpiNodeReadWithGuidelines
 
 class ScorecardCreate(BaseModel):
     name: str
-    owner_id: uuid.UUID
     domain: str | None = None
     purpose_statement: str | None = None
     scope: str | None = None
@@ -47,7 +46,6 @@ class ScorecardRead(ORMBase):
 class ScorecardVersionCreate(BaseModel):
     version_number: int
     guideline_notes: str | None = None
-    created_by: uuid.UUID
     is_active: bool = True
     scoring_formula: str | None = None
 

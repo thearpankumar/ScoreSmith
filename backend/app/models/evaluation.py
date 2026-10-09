@@ -42,6 +42,12 @@ class Evaluation(UUIDPKMixin, TimestampMixin, Base):
     evaluated_by: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
+    # The USER that owns this evaluation (migration 0012). Always set server-side from the authenticated
+    # user; defaults to `evaluated_by` for code that builds rows directly (scripts, tests).
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True,
+        default=lambda ctx: ctx.get_current_parameters()["evaluated_by"],
+    )
     input_reference: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[EvaluationStatus] = mapped_column(
         evaluation_status_enum, nullable=False, default=EvaluationStatus.PENDING
@@ -71,8 +77,18 @@ class Evaluation(UUIDPKMixin, TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
 
+    # --- Horizontal scaling: driver lease (migration 0011_scaling_leases) ---
+    # The process driving an active evaluation owns it through `lease_owner` until `lease_expires_at`,
+    # renewing both (and `heartbeat_at`) about every 15 s. Another process may adopt the evaluation only
+    # once the lease has expired (or was released on a clean shutdown). NOT the user-ownership column.
+    lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set by the API process on cancel; whichever process drives the evaluation sees it and stops.
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     scorecard_version: Mapped[ScorecardVersion] = relationship("ScorecardVersion")
-    evaluator: Mapped[User] = relationship("User")
+    evaluator: Mapped[User] = relationship("User", foreign_keys=[evaluated_by])
     kpi_results: Mapped[list[EvaluationKpiResult]] = relationship(
         "EvaluationKpiResult", back_populates="evaluation", cascade="all, delete-orphan"
     )

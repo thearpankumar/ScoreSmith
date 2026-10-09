@@ -50,7 +50,6 @@ import math
 import re
 import sys
 import time
-import weakref
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import asdict, dataclass, field
@@ -83,6 +82,7 @@ from app.ai.similarity import find_similar_scorecards
 from app.ai.turn_events import emit_turn_event
 from app.ai.web_search import SearchResult, WebSearchClientProtocol
 from app.config import get_settings
+from app.limits.redis_semaphore import get_semaphore
 
 if sys.platform == "win32":
     # Same rationale as app/main.py: psycopg's async mode needs the selector event loop
@@ -1439,21 +1439,22 @@ def _assess_research_coverage(
 # --- Bounded Bedrock concurrency -------------------------------------------------------------
 #
 # The research fan-out (agents x continuation chunks x dedup judging) can put dozens of Converse
-# calls in flight for a 40+ KPI request. A process-wide semaphore (per event loop — an
+# calls in flight for a 40+ KPI request. A process-wide semaphore (per event loop - an
 # asyncio.Semaphore binds to the loop it is first awaited on, and tests run one loop per test)
-# caps that at `settings.bedrock_max_concurrency` to avoid Bedrock throttling.
-_bedrock_semaphores: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
-    weakref.WeakKeyDictionary()
-)
+# caps that at `settings.bedrock_max_concurrency` to avoid Bedrock throttling. Bedrock's quota is
+# account-level, so with several worker processes the same cap is ALSO enforced cluster-wide through
+# Redis (`bedrock_global_concurrency`, default = the per-process cap); without Redis, or if it is down,
+# only the per-process cap applies.
 
 
-def _bedrock_slots() -> asyncio.Semaphore:
-    loop = asyncio.get_running_loop()
-    semaphore = _bedrock_semaphores.get(loop)
-    if semaphore is None:
-        semaphore = asyncio.Semaphore(max(1, get_settings().bedrock_max_concurrency))
-        _bedrock_semaphores[loop] = semaphore
-    return semaphore
+def _bedrock_slots():
+    """Async context manager gating one Bedrock call (per-process cap + cluster-wide cap)."""
+    sem = get_semaphore(
+        "bedrock",
+        local_limit=lambda: get_settings().bedrock_max_concurrency,
+        global_limit=lambda: get_settings().bedrock_global_concurrency or get_settings().bedrock_max_concurrency,
+    )
+    return sem.slot()
 
 
 async def _converse_limited(bedrock: BedrockClientProtocol, **kwargs: Any) -> Any:
@@ -5442,6 +5443,21 @@ def _conversation_context_text(messages: list[ChatTurn], max_turns: int = 8) -> 
     return "\n".join(f"{turn['role'].capitalize()}: {turn['content']}" for turn in relevant)
 
 
+async def _session_owner_id(db: Any, thread_id: Any) -> Any:
+    """The owning user of the chat session whose LangGraph thread id is `thread_id` (None if unknown)."""
+    import uuid as _uuid
+
+    from sqlalchemy import select as _select
+
+    from app.models.chat_session import ChatSession
+
+    try:
+        sid = _uuid.UUID(str(thread_id))
+    except (ValueError, TypeError):
+        return None
+    return (await db.execute(_select(ChatSession.user_id).where(ChatSession.id == sid))).scalar_one_or_none()
+
+
 async def check_similarity(state: BuilderState, config: RunnableConfig) -> dict[str, Any]:
     """Reuse-suggestion wiring (fixes the gap where `find_similar_scorecards` was only
     reachable via the standalone `POST /scorecards/suggest-similar` endpoint): runs once,
@@ -5467,7 +5483,13 @@ async def check_similarity(state: BuilderState, config: RunnableConfig) -> dict[
         return {"similarity_checked": True}
 
     try:
-        results = await find_similar_scorecards(db, bedrock, query_text, top_n=3)
+        # Only the session owner's OWN scorecards may be suggested (never another user's names / purposes). The
+        # owner comes from the chat session row, so every caller (request or background worker) is covered;
+        # an unknown session fails closed.
+        owner_id = await _session_owner_id(db, configurable.get("thread_id"))
+        if owner_id is None:
+            return {"similarity_checked": True}
+        results = await find_similar_scorecards(db, bedrock, query_text, top_n=3, owner_id=owner_id)
     except Exception:
         logger.warning(
             "check_similarity: similarity search failed; proceeding without suggestions.",

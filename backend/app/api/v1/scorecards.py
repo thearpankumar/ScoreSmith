@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -13,8 +13,11 @@ from sqlalchemy.orm import selectinload
 from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
 from app.ai.scoring_formula import validate as validate_scoring_formula_expr
 from app.ai.similarity import SIMILARITY_THRESHOLD, SimilarScorecardResult, find_similar_scorecards
+from app.audit import audit
+from app.authz import get_owned_scorecard, get_owned_version
 from app.db import get_db
 from app.deps import get_bedrock_client, get_current_user
+from app.models.enums import AuditAction
 from app.models.evaluation import Evaluation
 from app.models.kpi_node import KpiNode
 from app.models.scorecard import Scorecard
@@ -55,13 +58,15 @@ async def suggest_similar_scorecards(
     payload: SuggestSimilarRequest,
     db: AsyncSession = Depends(get_db),
     bedrock: BedrockClientProtocol = Depends(get_bedrock_client),
+    current_user: User = Depends(get_current_user),
 ) -> list[SimilarScorecardResult]:
     """Free-text query -> ranked existing scorecards worth reusing/adapting (the "suggest
     similar scorecard" feature from the plan). Embeds `query` with Titan, then runs a
     pgvector cosine-similarity search over `scorecard_embeddings`."""
     try:
         return await find_similar_scorecards(
-            db, bedrock, payload.query, top_n=payload.top_n, threshold=payload.threshold
+            db, bedrock, payload.query, top_n=payload.top_n, threshold=payload.threshold,
+            owner_id=current_user.id,
         )
     except BedrockUnavailableError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
@@ -79,7 +84,9 @@ class ValidateFormulaDraftResponse(BaseModel):
 
 
 @router.post("/validate-formula", response_model=ValidateFormulaDraftResponse)
-async def validate_formula_draft_endpoint(payload: ValidateFormulaDraftRequest) -> ValidateFormulaDraftResponse:
+async def validate_formula_draft_endpoint(
+    payload: ValidateFormulaDraftRequest, current_user: User = Depends(get_current_user)
+) -> ValidateFormulaDraftResponse:
     """Issue 2 (see task notes): the SAME formula-editing capability the chart-detail
     page's `ScoringFormulaPanel`/`ScoringFormulaBuilderDialog` already has, but for a
     chat draft that has no `scorecard_id`/`version_id` yet (it isn't materialized until
@@ -96,15 +103,13 @@ async def validate_formula_draft_endpoint(payload: ValidateFormulaDraftRequest) 
 
 @router.get("", response_model=list[ScorecardRead])
 async def list_scorecards(
-    skip: int = 0,
-    limit: int = 100,
-    owner_id: uuid.UUID | None = None,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=200),
     domain: str | None = None,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> list[Scorecard]:
-    stmt = select(Scorecard).order_by(Scorecard.created_at.desc())
-    if owner_id is not None:
-        stmt = stmt.where(Scorecard.owner_id == owner_id)
+    stmt = select(Scorecard).where(Scorecard.owner_id == current_user.id).order_by(Scorecard.created_at.desc())
     if domain is not None:
         stmt = stmt.where(Scorecard.domain == domain)
     result = await db.execute(stmt.offset(skip).limit(limit))
@@ -114,12 +119,16 @@ async def list_scorecards(
 @router.post("", response_model=ScorecardRead, status_code=status.HTTP_201_CREATED)
 async def create_scorecard(
     payload: ScorecardCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> Scorecard:
-    scorecard = Scorecard(**payload.model_dump())
+    scorecard = Scorecard(**payload.model_dump(), owner_id=current_user.id)  # the owner is always the caller
     db.add(scorecard)
     try:
+        await db.flush()
+        audit(db, request, actor_id=current_user.id, entity_type="scorecard", entity_id=scorecard.id,
+              action=AuditAction.CREATE)
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -129,27 +138,30 @@ async def create_scorecard(
 
 
 @router.get("/{scorecard_id}", response_model=ScorecardRead)
-async def get_scorecard(scorecard_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> Scorecard:
-    scorecard = await db.get(Scorecard, scorecard_id)
-    if scorecard is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard not found.")
-    return scorecard
+async def get_scorecard(
+    scorecard_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
+) -> Scorecard:
+    return await get_owned_scorecard(db, current_user, scorecard_id)
 
 
 @router.patch("/{scorecard_id}", response_model=ScorecardRead)
 async def update_scorecard(
     scorecard_id: uuid.UUID,
     payload: ScorecardUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> Scorecard:
-    scorecard = await db.get(Scorecard, scorecard_id)
-    if scorecard is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard not found.")
+    scorecard = await get_owned_scorecard(db, current_user, scorecard_id)
     old_target = scorecard.target_score
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    if changes.get("current_version_id") is not None:  # may only point at one of THIS scorecard's versions
+        await get_owned_version(db, current_user, changes["current_version_id"], scorecard_id)
+    for field, value in changes.items():
         setattr(scorecard, field, value)
     try:
+        audit(db, request, actor_id=current_user.id, entity_type="scorecard", entity_id=scorecard.id,
+              action=AuditAction.UPDATE, diff={"fields": sorted(changes)})
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -167,12 +179,11 @@ async def update_scorecard(
 @router.delete("/{scorecard_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_scorecard(
     scorecard_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> None:
-    scorecard = await db.get(Scorecard, scorecard_id)
-    if scorecard is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard not found.")
+    scorecard = await get_owned_scorecard(db, current_user, scorecard_id)
     # Deleting a scorecard deletes "every version of it, and its evaluations" (the delete dialog's
     # promise). Evaluations reference a version with ON DELETE RESTRICT, and their per-KPI results
     # reference KPI nodes, so they have to go first; deleting an evaluation cascades to its results.
@@ -188,6 +199,8 @@ async def delete_scorecard(
     await db.flush()
     await db.delete(scorecard)
     try:
+        audit(db, request, actor_id=current_user.id, entity_type="scorecard", entity_id=scorecard_id,
+              action=AuditAction.DELETE)
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -201,8 +214,9 @@ async def delete_scorecard(
 
 @router.get("/{scorecard_id}/versions", response_model=list[ScorecardVersionRead])
 async def list_scorecard_versions(
-    scorecard_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+    scorecard_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> list[ScorecardVersion]:
+    await get_owned_scorecard(db, current_user, scorecard_id)
     result = await db.execute(
         select(ScorecardVersion)
         .where(ScorecardVersion.scorecard_id == scorecard_id)
@@ -219,15 +233,17 @@ async def list_scorecard_versions(
 async def create_scorecard_version(
     scorecard_id: uuid.UUID,
     payload: ScorecardVersionCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> ScorecardVersion:
-    scorecard = await db.get(Scorecard, scorecard_id)
-    if scorecard is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard not found.")
-    version = ScorecardVersion(scorecard_id=scorecard_id, **payload.model_dump())
+    await get_owned_scorecard(db, current_user, scorecard_id)
+    version = ScorecardVersion(scorecard_id=scorecard_id, created_by=current_user.id, **payload.model_dump())
     db.add(version)
     try:
+        await db.flush()
+        audit(db, request, actor_id=current_user.id, entity_type="scorecard_version", entity_id=version.id,
+              action=AuditAction.CREATE)
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -243,8 +259,12 @@ async def create_scorecard_version(
     "/{scorecard_id}/versions/{version_id}", response_model=ScorecardVersionReadWithKpiNodes
 )
 async def get_scorecard_version(
-    scorecard_id: uuid.UUID, version_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+    scorecard_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> ScorecardVersion:
+    await get_owned_version(db, current_user, version_id, scorecard_id)
     result = await db.execute(
         select(ScorecardVersion)
         .where(ScorecardVersion.id == version_id, ScorecardVersion.scorecard_id == scorecard_id)
@@ -286,14 +306,13 @@ async def validate_formula_endpoint(
     version_id: uuid.UUID,
     payload: ValidateFormulaRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> ValidateFormulaResponse:
     """Real backend validation for the chart-detail formula editor's live green/red
     indicator (see app/ai/scoring_formula.py::validate) — the frontend calls this rather
     than reimplementing formula parsing client-side, so validation can never drift from
     what `PATCH .../versions/{id}` (below) or an actual evaluation would do."""
-    version = await db.get(ScorecardVersion, version_id)
-    if version is None or version.scorecard_id != scorecard_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard version not found.")
+    await get_owned_version(db, current_user, version_id, scorecard_id)
     names = await _leaf_kpi_names(db, version_id)
     result = validate_scoring_formula_expr(payload.formula, names)
     return ValidateFormulaResponse(**result.to_dict())
@@ -304,12 +323,11 @@ async def update_scorecard_version(
     scorecard_id: uuid.UUID,
     version_id: uuid.UUID,
     payload: ScorecardVersionUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> ScorecardVersion:
-    version = await db.get(ScorecardVersion, version_id)
-    if version is None or version.scorecard_id != scorecard_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard version not found.")
+    version = await get_owned_version(db, current_user, version_id, scorecard_id)
     data = payload.model_dump(exclude_unset=True)
     if "scoring_formula" in data and data["scoring_formula"]:
         names = await _leaf_kpi_names(db, version_id)
@@ -318,6 +336,8 @@ async def update_scorecard_version(
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=result.error)
     for field, value in data.items():
         setattr(version, field, value)
+    audit(db, request, actor_id=current_user.id, entity_type="scorecard_version", entity_id=version.id,
+          action=AuditAction.UPDATE, diff={"fields": sorted(data)})
     await db.commit()
     await db.refresh(version)
     return version
@@ -331,18 +351,19 @@ async def update_scorecard_version(
 async def delete_scorecard_version(
     scorecard_id: uuid.UUID,
     version_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> None:
-    version = await db.get(ScorecardVersion, version_id)
-    if version is None or version.scorecard_id != scorecard_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard version not found.")
+    version = await get_owned_version(db, current_user, version_id, scorecard_id)
     scorecard = await db.get(Scorecard, scorecard_id)
     if scorecard is not None and scorecard.current_version_id == version_id:
         scorecard.current_version_id = None
         await db.flush()
     await db.delete(version)
     try:
+        audit(db, request, actor_id=current_user.id, entity_type="scorecard_version", entity_id=version_id,
+              action=AuditAction.DELETE)
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()

@@ -10,14 +10,14 @@ import { ApiError, updateCurrentUser } from "@/lib/api-client";
 import type { User } from "@/lib/types";
 
 /**
- * Wired to the real backend (`PATCH /api/v1/users/{id}` via `updateCurrentUser` — see
- * lib/api-client.ts): name/email are persisted for real. The weekly-digest checkbox and
+ * Wired to the real backend (`PATCH /api/v1/me` via `updateCurrentUser` — see
+ * lib/api-client.ts): the display name is persisted for real; the e-mail address is the sign-in
+ * identity and is shown read-only. The weekly-digest checkbox and
  * role remain local/display-only — there's no notification-preferences column or RBAC
  * yet (both explicitly deferred past Cycle 1, per the plan).
  */
 export function SettingsForm({ user }: { user: User }) {
   const [name, setName] = useState(user.name);
-  const [email, setEmail] = useState(user.email);
   const [weeklyDigest, setWeeklyDigest] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -29,9 +29,8 @@ export function SettingsForm({ user }: { user: User }) {
     setError(null);
     setSaved(false);
     try {
-      const updated = await updateCurrentUser({ name, email });
+      const updated = await updateCurrentUser({ name });
       setName(updated.name);
-      setEmail(updated.email);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
@@ -49,7 +48,7 @@ export function SettingsForm({ user }: { user: User }) {
       </div>
       <div className="flex flex-col gap-1.5">
         <Label htmlFor="settings-email">Email</Label>
-        <Input id="settings-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+        <Input id="settings-email" type="email" value={user.email} readOnly aria-readonly />
       </div>
       <div className="flex flex-col gap-1.5">
         <Label>Role</Label>

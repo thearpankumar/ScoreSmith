@@ -1,3 +1,5 @@
+import * as React from "react";
+
 import type {
   AiBatch,
   AiCompleteFile,
@@ -40,22 +42,20 @@ import type {
  * `mock-data.ts` (kept around only as illustrative sample-shape reference / a fallback
  * for `getCachedEvaluation`'s browser-only cache).
  *
- * --- Base URL: client vs. server-side fetch ---
- * `NEXT_PUBLIC_API_BASE_URL` is exposed to the browser bundle and must resolve the way
- * the *host machine* sees the backend (`http://localhost:8000` per infra/.env.example).
- * But every page here is a Next.js Server Component that also calls these functions
- * during SSR, running *inside the frontend container* — there, "localhost" means the
- * frontend container itself, not the backend one. Server-side calls instead use
- * `INTERNAL_API_BASE_URL` (`http://backend:8000`, the Compose service DNS name; see
- * infra/docker-compose.yml). `apiBase()` picks the right one via `typeof window`.
+ * --- Base URL: browser vs. server-side fetch ---
+ * In the browser every call is same-origin (`/api/v1/...`): `next.config.ts` proxies `/api/v1/*` to the backend, so the
+ * session cookies are first-party and no backend URL ever reaches the client bundle. Every page here is also a Next.js
+ * Server Component that calls these functions during SSR, running *inside the frontend container* — there the backend
+ * is reached directly via `INTERNAL_API_BASE_URL` (`http://backend:8000`, the Compose service DNS name; see
+ * infra/docker-compose.yml), and the request's own cookies are forwarded.
  *
- * --- Dev auth stub ---
- * `backend/app/deps.py::get_current_user` trusts a raw `X-User-Id` header. There's no
- * login flow yet (real OIDC is deferred per the plan), so we resolve a stable "current
- * user" by looking up the seed script's designer account by email
- * (`backend/app/scripts/generate_scenarios.py` -> `designer@qualityscorecard.local`)
- * rather than hardcoding its (randomly-generated-at-seed-time) UUID, so this keeps
- * working across `python -m app.scripts.seed --reset` runs.
+ * --- Authentication ---
+ * The session is a pair of httpOnly cookies (short-lived access JWT + rotating refresh token) set by `POST
+ * /auth/login`; nothing in this file reads or stores a token. Browser calls send `credentials: "include"` and, for
+ * unsafe methods, the `X-CSRF-Token` header (the readable `qs_csrf` cookie, double-submit). On a 401 the browser
+ * refreshes the session once (single-flight) and retries; if that fails it navigates to `/login?next=…`. On the server
+ * the middleware (`middleware.ts`) already renews an expired access token before the page renders, so a 401 there means
+ * the session is really gone and the page redirects to `/login`.
  *
  * --- Bedrock-unavailable errors ---
  * Endpoints backed by AWS Bedrock (`POST /chat/sessions[...]`, `POST
@@ -71,11 +71,12 @@ import type {
 // Base URL + low-level fetch plumbing
 // ---------------------------------------------------------------------------
 
+const IS_BROWSER = typeof window !== "undefined";
+
+/** "" in the browser (same-origin, proxied by Next); the backend's internal URL during SSR. */
 function apiBase(): string {
-  if (typeof window === "undefined") {
-    return process.env.INTERNAL_API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
-  }
-  return process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+  if (IS_BROWSER) return "";
+  return process.env.INTERNAL_API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 }
 
 /** Kept for compatibility with anything that wants "the" base URL (e.g. debugging). */
@@ -101,10 +102,15 @@ export class BedrockUnavailableError extends ApiError {
 interface RequestOptions {
   method?: "GET" | "POST" | "PATCH" | "DELETE";
   body?: unknown;
-  /** Attaches the dev-auth-stub X-User-Id header (see module docstring). */
-  auth?: boolean;
   /** Aborts the request (e.g. an unmounted poller) — surfaces as the native AbortError. */
   signal?: AbortSignal;
+  /** Extra request headers (e.g. `Idempotency-Key`). */
+  headers?: Record<string, string>;
+  /**
+   * The route is part of the sign-in flow itself (login, signup, forgot/reset): a 401 is an ordinary
+   * "wrong credentials" answer, so skip the refresh-and-retry and the redirect to /login.
+   */
+  authRoute?: boolean;
 }
 
 /** FastAPI `detail` is a string, or (422) a list of `{loc,msg}` / per-item objects. */
@@ -127,38 +133,129 @@ function formatErrorDetail(detail: unknown): string {
   return String(detail);
 }
 
-async function apiFetch<T>(path: string, opts: RequestOptions = {}): Promise<T> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (opts.auth) {
-    headers["X-User-Id"] = await getDevUserId();
+const CSRF_COOKIE = "qs_csrf";
+
+function readCookie(name: string): string | undefined {
+  if (typeof document === "undefined") return undefined;
+  const hit = document.cookie.split("; ").find((c) => c.startsWith(`${name}=`));
+  return hit ? decodeURIComponent(hit.slice(name.length + 1)) : undefined;
+}
+
+/** The request's own cookies, forwarded to the backend during SSR (only our `qs_*` session cookies). */
+async function serverCookieHeader(): Promise<string | undefined> {
+  try {
+    const { cookies } = await import("next/headers");
+    const store = await cookies();
+    const header = store
+      .getAll()
+      .filter((c) => c.name.startsWith("qs_"))
+      .map((c) => `${c.name}=${c.value}`)
+      .join("; ");
+    return header || undefined;
+  } catch {
+    return undefined; // not inside a Next.js request (unit tests, scripts)
   }
+}
+
+let refreshInFlight: Promise<boolean> | null = null;
+
+/** Renews the session from the refresh cookie (browser only). Concurrent callers share one request. */
+export function refreshSession(): Promise<boolean> {
+  if (!refreshInFlight) {
+    refreshInFlight = fetch("/api/v1/auth/refresh", {
+      method: "POST",
+      credentials: "include",
+      headers: { "X-CSRF-Token": readCookie(CSRF_COOKIE) ?? "" },
+      cache: "no-store",
+    })
+      .then((r) => r.ok)
+      .catch(() => false)
+      .finally(() => {
+        refreshInFlight = null;
+      });
+  }
+  return refreshInFlight;
+}
+
+function goToLogin(): void {
+  if (IS_BROWSER) {
+    const here = window.location.pathname;
+    if (here.startsWith("/login") || here === "/") return;
+    // The session died while the app was open: end on the homepage. `expired=1` makes the middleware clear the dead
+    // cookies instead of bouncing a cookie that merely looks valid back into the app.
+    window.location.assign("/?expired=1");
+  }
+}
+
+/**
+ * One authenticated HTTP request (cookies, CSRF header, 401 -> refresh -> retry). Returns the raw `Response` so
+ * callers that need a body other than JSON (the Excel export) share the same session handling as `apiFetch`.
+ */
+export async function apiRequest(
+  path: string,
+  init: { method?: string; headers?: Record<string, string>; body?: BodyInit; signal?: AbortSignal; authRoute?: boolean },
+): Promise<Response> {
+  const method = init.method ?? "GET";
+  const send = async (): Promise<Response> => {
+    const headers: Record<string, string> = { ...(init.headers ?? {}) };
+    if (IS_BROWSER) {
+      if (method !== "GET") headers["X-CSRF-Token"] = readCookie(CSRF_COOKIE) ?? "";
+    } else {
+      const cookie = await serverCookieHeader();
+      if (cookie) headers["Cookie"] = cookie;
+    }
+    return fetch(`${apiBase()}${path}`, {
+      method,
+      headers,
+      body: init.body,
+      cache: "no-store",
+      credentials: "include",
+      signal: init.signal,
+    });
+  };
+
+  let res = await send();
+  if (res.status === 401 && !init.authRoute) {
+    if (IS_BROWSER && (await refreshSession())) {
+      res = await send();
+    }
+    if (res.status === 401) {
+      if (IS_BROWSER) {
+        goToLogin();
+      } else {
+        // Server render with no usable session: send the visitor to the login page.
+        const { redirect } = await import("next/navigation");
+        redirect("/login?expired=1");
+      }
+    }
+  }
+  return res;
+}
+
+async function apiFetch<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/json", ...(opts.headers ?? {}) };
 
   let res: Response;
   try {
-    res = await fetch(`${apiBase()}${path}`, {
+    res = await apiRequest(path, {
       method: opts.method ?? "GET",
       headers,
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-      cache: "no-store",
       signal: opts.signal,
+      authRoute: opts.authRoute,
     });
   } catch (err) {
     if (opts.signal?.aborted) throw err; // a deliberate abort is not a backend failure
-    // Next.js throws its own internal sentinel error out of `fetch(..., { cache:
-    // "no-store" })` during static generation, to signal "this route needs dynamic
-    // rendering, retry it as a dynamic request" — it is not a real fetch failure. It's
-    // tagged with `digest === "DYNAMIC_SERVER_USAGE"`. Re-wrapping it into a generic
-    // ApiError here (as this catch used to do unconditionally) hid that tag from Next,
-    // which made `next build` hard-fail instead of marking the route dynamic. Every page
-    // that calls into this client also now sets `export const dynamic = "force-dynamic"`
-    // (see e.g. app/charts/page.tsx) so this shouldn't fire in practice, but rethrowing
-    // it unmodified here too is the robust, defense-in-depth fix at the source.
+    // Next.js throws its own internal sentinels out of `fetch(..., { cache: "no-store" })` (DYNAMIC_SERVER_USAGE during
+    // static generation) and out of `redirect()` (NEXT_REDIRECT, used above for a lost session). They are not fetch
+    // failures: rethrow them unmodified so Next can act on them (mark the route dynamic / perform the redirect).
     if (
       err &&
       typeof err === "object" &&
       "digest" in err &&
       typeof (err as { digest?: unknown }).digest === "string" &&
-      (err as { digest: string }).digest.startsWith("DYNAMIC_SERVER_USAGE")
+      ((err as { digest: string }).digest.startsWith("DYNAMIC_SERVER_USAGE") ||
+        (err as { digest: string }).digest.startsWith("NEXT_REDIRECT"))
     ) {
       throw err;
     }
@@ -196,6 +293,9 @@ async function apiFetch<T>(path: string, opts: RequestOptions = {}): Promise<T> 
   return payload as T;
 }
 
+/** The same request plumbing for the sign-in pages (`lib/auth-client.ts`). */
+export { apiFetch as authApiFetch };
+
 // ---------------------------------------------------------------------------
 // Backend response shapes (snake_case, mirroring backend/app/schemas/*.py)
 // ---------------------------------------------------------------------------
@@ -204,11 +304,9 @@ interface BeUser {
   id: string;
   email: string;
   name: string;
-  org_id: string | null;
   role: string;
-  auth_provider_id: string | null;
+  email_verified?: boolean;
   created_at: string;
-  updated_at: string;
 }
 
 interface BeScorecard {
@@ -394,51 +492,20 @@ interface BeSuggestSimilarResult {
 }
 
 // ---------------------------------------------------------------------------
-// Shared caches: users (for the dev-auth stub + display-name enrichment)
+// The signed-in user (for display-name enrichment and owner checks)
 // ---------------------------------------------------------------------------
 
-/** Seeded by backend/app/scripts/generate_scenarios.py::run_all_scenarios. */
-const DEV_USER_EMAIL = "designer@qualityscorecard.local";
+// There is no user directory any more: the API only ever returns the caller's own data, so the only name that
+// needs resolving is the caller's. Never cached at module level: on the server one process serves every user.
+// `React.cache` memoises per request on the server and is a pass-through elsewhere.
+const perRequest: <T extends () => Promise<unknown>>(fn: T) => T =
+  (React as unknown as { cache?: <T extends () => Promise<unknown>>(fn: T) => T }).cache ?? ((fn) => fn);
 
-let usersPromise: Promise<BeUser[]> | null = null;
-
-async function getAllUsers(): Promise<BeUser[]> {
-  if (!usersPromise) {
-    usersPromise = apiFetch<BeUser[]>("/api/v1/users?limit=200").catch((err) => {
-      usersPromise = null; // allow a retry on the next call rather than caching a failure
-      throw err;
-    });
-  }
-  return usersPromise;
-}
+const fetchMe = perRequest(() => apiFetch<BeUser>("/api/v1/me"));
 
 async function getUserNameMap(): Promise<Map<string, string>> {
-  const users = await getAllUsers();
-  return new Map(users.map((u) => [u.id, u.name]));
-}
-
-let devUserIdPromise: Promise<string> | null = null;
-
-async function getDevUserId(): Promise<string> {
-  if (!devUserIdPromise) {
-    devUserIdPromise = getAllUsers()
-      .then((users) => {
-        const match = users.find((u) => u.email === DEV_USER_EMAIL);
-        if (!match) {
-          throw new ApiError(
-            `Dev auth stub: no seeded user with email "${DEV_USER_EMAIL}" was found. Run ` +
-              `"python -m app.scripts.seed" against this database first.`,
-            404,
-          );
-        }
-        return match.id;
-      })
-      .catch((err) => {
-        devUserIdPromise = null;
-        throw err;
-      });
-  }
-  return devUserIdPromise;
+  const me = await fetchMe();
+  return new Map([[me.id, me.name]]);
 }
 
 function mapUser(be: BeUser): User {
@@ -448,34 +515,21 @@ function mapUser(be: BeUser): User {
     email: be.email,
     // Backend `role` is a free-form string (default "member" — see
     // backend/app/schemas/user.py); the frontend's UserRole is a narrower display-only
-    // union. Cast rather than validate: this is a dev-only stub with no real RBAC yet
-    // (see SettingsForm), so an unrecognized role just displays as-is via `String(role)`.
+    // union. Cast rather than validate: there is no RBAC yet (see SettingsForm), so an
+    // unrecognized role just displays as-is via `String(role)`.
     role: be.role as UserRole,
-    orgId: be.org_id,
+    orgId: null,
   };
 }
 
-/** Settings page: the current dev user's full profile (Settings > profile form), via the
- * same designer@qualityscorecard.local resolution the dev-auth stub already uses
- * elsewhere in this file (see getDevUserId/DEV_USER_EMAIL) — not a second mechanism. */
+/** The signed-in user's profile (`GET /api/v1/me`), for Settings and the user menu. */
 export async function getCurrentUser(): Promise<User> {
-  const users = await getAllUsers();
-  const match = users.find((u) => u.email === DEV_USER_EMAIL);
-  if (!match) {
-    throw new ApiError(
-      `Dev auth stub: no seeded user with email "${DEV_USER_EMAIL}" was found. Run ` +
-        `"python -m app.scripts.seed" against this database first.`,
-      404,
-    );
-  }
-  return mapUser(match);
+  return mapUser(await fetchMe());
 }
 
-/** Settings page "Save changes": `PATCH /api/v1/users/{id}` for the current dev user. */
-export async function updateCurrentUser(patch: { name?: string; email?: string }): Promise<User> {
-  const id = await getDevUserId();
-  const updated = await apiFetch<BeUser>(`/api/v1/users/${id}`, { method: "PATCH", auth: true, body: patch });
-  usersPromise = null; // invalidate the cached user list so name/email enrichment picks up the change
+/** Settings page "Save changes": `PATCH /api/v1/me` (only the display name is editable). */
+export async function updateCurrentUser(patch: { name?: string }): Promise<User> {
+  const updated = await apiFetch<BeUser>("/api/v1/me", { method: "PATCH", body: patch });
   return mapUser(updated);
 }
 
@@ -694,20 +748,20 @@ export async function getScorecardWithVersion(
 // ---------------------------------------------------------------------------
 
 export async function renameKpiNode(nodeId: string, name: string): Promise<void> {
-  await apiFetch(`/api/v1/kpi-nodes/${nodeId}`, { method: "PATCH", auth: true, body: { name } });
+  await apiFetch(`/api/v1/kpi-nodes/${nodeId}`, { method: "PATCH", body: { name } });
 }
 
 /** Atomic multi-node weight update (`PATCH /kpi-nodes/weights`) — every sibling group
  * touched must still sum to 100 when the request commits, or the backend returns 409. */
 export async function updateKpiWeights(weights: Array<{ id: string; weight: number }>): Promise<void> {
   if (weights.length === 0) return;
-  await apiFetch("/api/v1/kpi-nodes/weights", { method: "PATCH", auth: true, body: { weights } });
+  await apiFetch("/api/v1/kpi-nodes/weights", { method: "PATCH", body: { weights } });
 }
 
 /** Clears a node's stored weight (a node that now has children is a category and carries
  * no weight of its own — see backend migration 0008_category_nodes_no_weight). */
 export async function clearKpiNodeWeight(nodeId: string): Promise<void> {
-  await apiFetch(`/api/v1/kpi-nodes/${nodeId}`, { method: "PATCH", auth: true, body: { weight: null } });
+  await apiFetch(`/api/v1/kpi-nodes/${nodeId}`, { method: "PATCH", body: { weight: null } });
 }
 
 export async function createKpiNode(input: {
@@ -720,7 +774,6 @@ export async function createKpiNode(input: {
 }): Promise<void> {
   await apiFetch(`/api/v1/scorecard-versions/${input.versionId}/kpi-nodes/bulk`, {
     method: "POST",
-    auth: true,
     body: {
       nodes: [
         {
@@ -736,7 +789,7 @@ export async function createKpiNode(input: {
 }
 
 export async function deleteKpiNode(nodeId: string): Promise<void> {
-  await apiFetch(`/api/v1/kpi-nodes/${nodeId}`, { method: "DELETE", auth: true });
+  await apiFetch(`/api/v1/kpi-nodes/${nodeId}`, { method: "DELETE" });
 }
 
 /** Create or update one guideline rung. `quantitativeText` undefined = leave the stored
@@ -758,32 +811,30 @@ export async function upsertGuideline(input: {
   if (input.guidelineId) {
     await apiFetch(`/api/v1/kpi-nodes/${input.nodeId}/guidelines/${input.guidelineId}`, {
       method: "PATCH",
-      auth: true,
       body,
     });
   } else {
     await apiFetch(`/api/v1/kpi-nodes/${input.nodeId}/guidelines`, {
       method: "POST",
-      auth: true,
       body: { ...body, score_level: input.scoreLevel },
     });
   }
 }
 
 export async function updateScorecardStatus(scorecardId: string, status: Scorecard["status"]): Promise<void> {
-  await apiFetch(`/api/v1/scorecards/${scorecardId}`, { method: "PATCH", auth: true, body: { status } });
+  await apiFetch(`/api/v1/scorecards/${scorecardId}`, { method: "PATCH", body: { status } });
 }
 
 /** Changes a scorecard's target score (draft or published). PATCH accepts `target_score`
  * 0..10 without versioning: it only changes how results are coloured and compared. */
 export async function updateScorecardTarget(scorecardId: string, targetScore: number): Promise<void> {
-  await apiFetch(`/api/v1/scorecards/${scorecardId}`, { method: "PATCH", auth: true, body: { target_score: targetScore } });
+  await apiFetch(`/api/v1/scorecards/${scorecardId}`, { method: "PATCH", body: { target_score: targetScore } });
 }
 
 /** Hover-delete on a scorecard card in the Charts library grid (`DELETE
  * /api/v1/scorecards/{id}` — backend/app/api/v1/scorecards.py::delete_scorecard). */
 export async function deleteScorecard(scorecardId: string): Promise<void> {
-  await apiFetch(`/api/v1/scorecards/${scorecardId}`, { method: "DELETE", auth: true });
+  await apiFetch(`/api/v1/scorecards/${scorecardId}`, { method: "DELETE" });
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +908,6 @@ export async function updateScoringFormula(
 ): Promise<void> {
   await apiFetch(`/api/v1/scorecards/${scorecardId}/versions/${versionId}`, {
     method: "PATCH",
-    auth: true,
     body: { scoring_formula: formula },
   });
 }
@@ -866,14 +916,13 @@ export async function updateScoringFormula(
 export async function updateKpiIncludedInScoring(nodeId: string, includedInScoring: boolean): Promise<void> {
   await apiFetch(`/api/v1/kpi-nodes/${nodeId}`, {
     method: "PATCH",
-    auth: true,
     body: { included_in_scoring: includedInScoring },
   });
 }
 
-/** Dev-auth-stub "current user" id (see module docstring) — used for owner checks. */
+/** The signed-in user's id — used for owner checks. */
 export async function getCurrentUserId(): Promise<string> {
-  return getDevUserId();
+  return (await fetchMe()).id;
 }
 
 export async function listScorecardDomains(): Promise<string[]> {
@@ -1024,7 +1073,7 @@ export interface EvaluationsExport {
 
 /**
  * Exports the given evaluations to an .xlsx workbook (`POST /api/v1/evaluations/export`).
- * Not routed through `apiFetch`, which is JSON-only; shares its base URL, auth header and error formatting.
+ * Not routed through `apiFetch`, which is JSON-only; shares its session handling (`apiRequest`) and error formatting.
  */
 export async function exportEvaluationsXlsx(
   ids: string[],
@@ -1033,15 +1082,14 @@ export async function exportEvaluationsXlsx(
   const path = "/api/v1/evaluations/export";
   let res: Response;
   try {
-    res = await fetch(`${apiBase()}${path}`, {
+    res = await apiRequest(path, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-User-Id": await getDevUserId() },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         evaluation_ids: ids,
         include_reasoning: opts.includeReasoning,
         filter_summary: opts.filterSummary ?? null,
       }),
-      cache: "no-store",
       signal: opts.signal,
     });
   } catch (err) {
@@ -1095,7 +1143,7 @@ export async function listEvaluations(filters?: { scorecardId?: string }): Promi
 /** Hover-delete on an evaluation row in the Evaluations list (`DELETE
  * /api/v1/evaluations/{id}` — backend/app/api/v1/evaluations.py::delete_evaluation). */
 export async function deleteEvaluation(id: string): Promise<void> {
-  await apiFetch(`/api/v1/evaluations/${id}`, { method: "DELETE", auth: true });
+  await apiFetch(`/api/v1/evaluations/${id}`, { method: "DELETE" });
 }
 
 export async function getEvaluation(id: string): Promise<Evaluation | undefined> {
@@ -1128,11 +1176,9 @@ export async function createEvaluation(input: CreateEvaluationInput): Promise<Ev
 
   const created = await apiFetch<BeEvaluation>("/api/v1/evaluations", {
     method: "POST",
-    auth: true,
     body: {
       scorecard_version_id: scorecard.current_version_id,
       name: input.name,
-      evaluated_by: await getDevUserId(),
       input_reference: { summary: input.inputSummary },
       domain: scorecard.domain,
     },
@@ -1197,11 +1243,9 @@ export async function createManualEvaluation(input: {
 
   const created = await apiFetch<BeEvaluation>("/api/v1/evaluations", {
     method: "POST",
-    auth: true,
     body: {
       scorecard_version_id: scorecard.current_version_id,
       name: input.name,
-      evaluated_by: await getDevUserId(),
       input_reference: { summary: input.inputSummary, mode: "manual" },
       status: "in_progress",
       domain: scorecard.domain,
@@ -1213,7 +1257,6 @@ export async function createManualEvaluation(input: {
     for (const s of input.scores) {
       await apiFetch(`/api/v1/evaluations/${created.id}/results`, {
         method: "POST",
-        auth: true,
         body: {
           kpi_node_id: s.kpiNodeId,
           score: s.score,
@@ -1225,11 +1268,10 @@ export async function createManualEvaluation(input: {
     }
     finalBe = await apiFetch<BeEvaluation>(`/api/v1/evaluations/${created.id}/finalize`, {
       method: "POST",
-      auth: true,
     });
   } catch (err) {
     try {
-      await apiFetch(`/api/v1/evaluations/${created.id}`, { method: "PATCH", auth: true, body: { status: "failed" } });
+      await apiFetch(`/api/v1/evaluations/${created.id}`, { method: "PATCH", body: { status: "failed" } });
     } catch {
       // best-effort only
     }
@@ -1263,7 +1305,6 @@ export async function initAiUploads(
     }>;
   }>("/api/v1/evaluations/ai/uploads", {
     method: "POST",
-    auth: true,
     signal,
     body: { purpose, files: files.map((f) => ({ name: f.name, size: f.size, content_type: f.contentType })) },
   });
@@ -1285,7 +1326,6 @@ export async function completeAiUploads(files: AiCompleteFile[]): Promise<AiComp
     "/api/v1/evaluations/ai/uploads/complete",
     {
       method: "POST",
-      auth: true,
       body: {
         files: files.map((f) => ({
           upload_id: f.uploadId,
@@ -1302,7 +1342,6 @@ export async function completeAiUploads(files: AiCompleteFile[]): Promise<AiComp
 export async function abortAiUploads(files: Array<{ uploadId: string; s3Key: string }>): Promise<void> {
   await apiFetch("/api/v1/evaluations/ai/uploads/abort", {
     method: "POST",
-    auth: true,
     body: { files: files.map((f) => ({ upload_id: f.uploadId, s3_key: f.s3Key })) },
   });
 }
@@ -1320,7 +1359,7 @@ export async function parseBatchSheet(s3Key: string, signal?: AbortSignal): Prom
     }>;
     skipped?: Array<{ row_index: number; reason: string }>;
     columns?: Record<string, string | null>;
-  }>("/api/v1/evaluations/ai/batches/parse", { method: "POST", auth: true, signal, body: { s3_key: s3Key } });
+  }>("/api/v1/evaluations/ai/batches/parse", { method: "POST", signal, body: { s3_key: s3Key } });
   return {
     rows: be.rows.map((r) => ({
       rowIndex: r.row_index,
@@ -1339,7 +1378,6 @@ export async function parseBatchSheet(s3Key: string, signal?: AbortSignal): Prom
 export async function createAiJobs(input: CreateAiJobsInput): Promise<CreateAiJobsResult> {
   const be = await apiFetch<{ batch_id: string | null; evaluations: BeEvaluation[] }>("/api/v1/evaluations/ai/jobs", {
     method: "POST",
-    auth: true,
     body: {
       scorecard_id: input.scorecardId,
       direction_prompt: input.directionPrompt?.trim() ? input.directionPrompt.trim() : null,
@@ -1439,19 +1477,17 @@ export function mapProgress(be: BeProgress): EvaluationProgress {
 
 /** `GET /evaluations/{id}/progress`. */
 export async function getEvaluationProgress(id: string, signal?: AbortSignal): Promise<EvaluationProgress> {
-  // `auth: true`: the route requires the current user (X-User-Id). Without it every browser poll got a 401, which the
-  // watcher shows as "Connection lost" forever.
-  return mapProgress(await apiFetch<BeProgress>(`/api/v1/evaluations/${id}/progress`, { signal, auth: true }));
+  return mapProgress(await apiFetch<BeProgress>(`/api/v1/evaluations/${id}/progress`, { signal }));
 }
 
 /** `POST /evaluations/{id}/cancel` (202): ends as `failed` with error_code `cancelled`. */
 export async function cancelEvaluation(id: string): Promise<void> {
-  await apiFetch(`/api/v1/evaluations/${id}/cancel`, { method: "POST", auth: true });
+  await apiFetch(`/api/v1/evaluations/${id}/cancel`, { method: "POST" });
 }
 
 /** `POST /evaluations/{id}/retry` (202): only valid from `failed`. */
 export async function retryEvaluation(id: string): Promise<void> {
-  await apiFetch(`/api/v1/evaluations/${id}/retry`, { method: "POST", auth: true });
+  await apiFetch(`/api/v1/evaluations/${id}/retry`, { method: "POST" });
 }
 
 /** `GET /evaluations/ai/batches/{id}`. */
@@ -1465,7 +1501,7 @@ export async function getAiBatch(id: string, signal?: AbortSignal): Promise<AiBa
     evaluations?: BeEvaluation[];
   };
   try {
-    be = await apiFetch(`/api/v1/evaluations/ai/batches/${id}`, { signal, auth: true });
+    be = await apiFetch(`/api/v1/evaluations/ai/batches/${id}`, { signal });
   } catch (err) {
     if (err instanceof ApiError && err.status === 404) return undefined;
     throw err;
@@ -1664,7 +1700,7 @@ export async function listChatSessions(): Promise<ChatSession[]> {
  * the chat_sessions row (cascading to its messages/turn-events) and its LangGraph
  * checkpoint state. */
 export async function deleteChatSession(sessionId: string): Promise<void> {
-  await apiFetch(`/api/v1/chat/sessions/${sessionId}`, { method: "DELETE", auth: true });
+  await apiFetch(`/api/v1/chat/sessions/${sessionId}`, { method: "DELETE" });
 }
 
 /**
@@ -1678,7 +1714,6 @@ export async function deleteChatSession(sessionId: string): Promise<void> {
 export async function startRefineSession(scorecardId: string): Promise<string> {
   const turn = await apiFetch<BeChatTurn>("/api/v1/chat/sessions", {
     method: "POST",
-    auth: true,
     body: { target_scorecard_id: scorecardId },
   });
   return turn.session_id;
@@ -1844,12 +1879,10 @@ export async function startChatTurn(params: {
     sessionId === "new"
       ? await apiFetch<BeChatTurn>("/api/v1/chat/sessions", {
           method: "POST",
-          auth: true, // dev auth stub is now applied uniformly to every mutating route — see app/deps.py
           body: { message, session_id: clientSessionId },
         })
       : await apiFetch<BeChatTurn>(`/api/v1/chat/sessions/${sessionId}/messages`, {
           method: "POST",
-          auth: true,
           body: { message },
         });
   return snapshotOf(turn);
@@ -1858,7 +1891,7 @@ export async function startChatTurn(params: {
 /** `POST /chat/sessions/{id}/cancel` — stops the running background turn (a no-op if none runs).
  * The turn then ends with `turn_error_code: "cancelled"`, which `watchChatTurn` reports. */
 export async function cancelChatTurn(sessionId: string): Promise<void> {
-  await apiFetch(`/api/v1/chat/sessions/${sessionId}/cancel`, { method: "POST", auth: true });
+  await apiFetch(`/api/v1/chat/sessions/${sessionId}/cancel`, { method: "POST" });
 }
 
 const abortError = () => new DOMException("Stopped watching the assistant.", "AbortError");

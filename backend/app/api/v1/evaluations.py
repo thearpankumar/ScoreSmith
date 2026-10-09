@@ -3,25 +3,29 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app import idempotency as idem
 from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
 from app.ai.judge import compute_final_score, effective_leaf_weights, leaf_nodes, run_judge
+from app.audit import audit
+from app.authz import accessible_evaluations, get_accessible_evaluation, get_owned_version
 from app.config import get_settings
 from app.db import get_db
 from app.deps import get_bedrock_client, get_current_user
-from app.models.enums import EvaluationStatus, rag_band_for_score
+from app.models.enums import AuditAction, EvaluationStatus, rag_band_for_score
 from app.models.evaluation import Evaluation
 from app.models.evaluation_kpi_result import EvaluationKpiResult
 from app.models.kpi_node import KpiNode
 from app.models.scorecard_version import ScorecardVersion
 from app.models.user import User
 from app.schemas.evaluation import (
+    PIPELINE_STATUSES,
     EvaluationCreate,
     EvaluationKpiResultCreate,
     EvaluationKpiResultRead,
@@ -44,15 +48,13 @@ async def run_evaluation(
     payload: EvaluationRunRequest,
     db: AsyncSession = Depends(get_db),
     bedrock: BedrockClientProtocol = Depends(get_bedrock_client),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> Evaluation:
     """Runs the LLM judge (see app/ai/judge.py) against `payload.input_text` for every
     leaf KPI under this evaluation's scorecard version, and persists per-KPI results plus
     the weighted final score / RAG band onto the existing `evaluations` /
     `evaluation_kpi_results` rows."""
-    evaluation = await db.get(Evaluation, evaluation_id)
-    if evaluation is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Evaluation not found.")
+    evaluation = await get_accessible_evaluation(db, current_user, evaluation_id)
 
     # Keep a record of what was actually judged (input_reference is documented as
     # free-form JSONB metadata about the evaluated input — see data_dictionary.md).
@@ -84,8 +86,9 @@ async def run_evaluation(
 @router.post("/{evaluation_id}/finalize", response_model=EvaluationReadWithResults)
 async def finalize_evaluation(
     evaluation_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> Evaluation:
     """Manual-scoring finalize step: computes `final_weighted_score`/`rag_band` from
     whatever `EvaluationKpiResult` rows already exist for this evaluation (posted one per
@@ -100,9 +103,7 @@ async def finalize_evaluation(
     for this pass; that client-side math is retained as a live preview only now, this
     endpoint is the actual source of truth persisted).
     """
-    evaluation = await db.get(Evaluation, evaluation_id)
-    if evaluation is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Evaluation not found.")
+    evaluation = await get_accessible_evaluation(db, current_user, evaluation_id)
 
     nodes_result = await db.execute(
         select(KpiNode).where(KpiNode.scorecard_version_id == evaluation.scorecard_version_id)
@@ -146,6 +147,8 @@ async def finalize_evaluation(
     evaluation.rag_band = rag_band_for_score(final_score)
     evaluation.status = EvaluationStatus.COMPLETED
     evaluation.submitted_at = datetime.now(UTC)
+    audit(db, request, actor_id=current_user.id, entity_type="evaluation", entity_id=evaluation_id,
+          action=AuditAction.UPDATE, event="finalized")
     await db.commit()
 
     result = await db.execute(
@@ -158,13 +161,15 @@ async def finalize_evaluation(
 
 @router.get("", response_model=list[EvaluationRead])
 async def list_evaluations(
-    skip: int = 0,
-    limit: int = 100,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=200),
     scorecard_version_id: uuid.UUID | None = None,
     evaluated_by: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> list[Evaluation]:
-    stmt = select(Evaluation).order_by(Evaluation.created_at.desc())
+    # Only the caller's evaluations and those of scorecards they own; `evaluated_by` just narrows further.
+    stmt = accessible_evaluations(current_user).order_by(Evaluation.created_at.desc())
     if scorecard_version_id is not None:
         stmt = stmt.where(Evaluation.scorecard_version_id == scorecard_version_id)
     if evaluated_by is not None:
@@ -176,12 +181,30 @@ async def list_evaluations(
 @router.post("", response_model=EvaluationRead, status_code=status.HTTP_201_CREATED)
 async def create_evaluation(
     payload: EvaluationCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Evaluation:
-    evaluation = Evaluation(**payload.model_dump())
+    key = idem.normalize_key(idempotency_key)
+    if key:  # a retried POST with the same key returns the evaluation created the first time
+        stored = await idem.begin(
+            db, current_user.id, "evaluation", key, idem.request_fingerprint(payload.model_dump_json())
+        )
+        if stored is not None:
+            existing = await db.get(Evaluation, uuid.UUID(stored["evaluation_id"]))
+            if existing is not None:
+                return existing
+    await get_owned_version(db, current_user, payload.scorecard_version_id)  # may only evaluate one's own scorecards
+    # The evaluator / owner is always the authenticated user, never a client-supplied id.
+    evaluation = Evaluation(**payload.model_dump(), evaluated_by=current_user.id, owner_id=current_user.id)
     db.add(evaluation)
     try:
+        await db.flush()
+        audit(db, request, actor_id=current_user.id, entity_type="evaluation", entity_id=evaluation.id,
+              action=AuditAction.CREATE)
+        if key:
+            await idem.remember(db, current_user.id, "evaluation", key, {"evaluation_id": str(evaluation.id)})
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -191,9 +214,11 @@ async def create_evaluation(
 
 
 @router.get("/{evaluation_id}", response_model=EvaluationReadWithResults)
-async def get_evaluation(evaluation_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> Evaluation:
+async def get_evaluation(
+    evaluation_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
+) -> Evaluation:
     result = await db.execute(
-        select(Evaluation)
+        accessible_evaluations(current_user)
         .where(Evaluation.id == evaluation_id)
         .options(selectinload(Evaluation.kpi_results))
     )
@@ -208,12 +233,15 @@ async def update_evaluation(
     evaluation_id: uuid.UUID,
     payload: EvaluationUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> Evaluation:
-    evaluation = await db.get(Evaluation, evaluation_id)
-    if evaluation is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Evaluation not found.")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    evaluation = await get_accessible_evaluation(db, current_user, evaluation_id)
+    changes = payload.model_dump(exclude_unset=True)
+    if "status" in changes and evaluation.status in PIPELINE_STATUSES:  # in the queue / running: cancel it instead
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="The evaluation is being processed; cancel it before changing its status."
+        )
+    for field, value in changes.items():
         setattr(evaluation, field, value)
     try:
         await db.commit()
@@ -227,13 +255,14 @@ async def update_evaluation(
 @router.delete("/{evaluation_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def delete_evaluation(
     evaluation_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> None:
-    evaluation = await db.get(Evaluation, evaluation_id)
-    if evaluation is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Evaluation not found.")
+    evaluation = await get_accessible_evaluation(db, current_user, evaluation_id)
     await db.delete(evaluation)
+    audit(db, request, actor_id=current_user.id, entity_type="evaluation", entity_id=evaluation_id,
+          action=AuditAction.DELETE)
     await db.commit()
 
 
@@ -242,8 +271,9 @@ async def delete_evaluation(
 
 @router.get("/{evaluation_id}/results", response_model=list[EvaluationKpiResultRead])
 async def list_evaluation_kpi_results(
-    evaluation_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+    evaluation_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> list[EvaluationKpiResult]:
+    await get_accessible_evaluation(db, current_user, evaluation_id)
     result = await db.execute(
         select(EvaluationKpiResult).where(EvaluationKpiResult.evaluation_id == evaluation_id)
     )
@@ -259,11 +289,13 @@ async def create_evaluation_kpi_result(
     evaluation_id: uuid.UUID,
     payload: EvaluationKpiResultCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> EvaluationKpiResult:
-    evaluation = await db.get(Evaluation, evaluation_id)
-    if evaluation is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Evaluation not found.")
+    evaluation = await get_accessible_evaluation(db, current_user, evaluation_id)
+    # The scored KPI must be a node of the evaluation's own scorecard version.
+    node = await db.get(KpiNode, payload.kpi_node_id)
+    if node is None or node.scorecard_version_id != evaluation.scorecard_version_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="KPI node not found.")
     kpi_result = EvaluationKpiResult(evaluation_id=evaluation_id, **payload.model_dump())
     db.add(kpi_result)
     try:
@@ -281,8 +313,9 @@ async def update_evaluation_kpi_result(
     result_id: uuid.UUID,
     payload: EvaluationKpiResultUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> EvaluationKpiResult:
+    await get_accessible_evaluation(db, current_user, evaluation_id)
     kpi_result = await db.get(EvaluationKpiResult, result_id)
     if kpi_result is None or kpi_result.evaluation_id != evaluation_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Evaluation KPI result not found.")
@@ -306,8 +339,9 @@ async def delete_evaluation_kpi_result(
     evaluation_id: uuid.UUID,
     result_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> None:
+    await get_accessible_evaluation(db, current_user, evaluation_id)
     kpi_result = await db.get(EvaluationKpiResult, result_id)
     if kpi_result is None or kpi_result.evaluation_id != evaluation_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Evaluation KPI result not found.")

@@ -22,14 +22,20 @@
   --lemon-ink: #6b6100;
   --lemon-soft: #fffce0;
 
-  /* Glass elevations: rgba(255,255,255, .55-.82) + blur(12-24px) */
-  --glass-1: rgba(255, 255, 255, 0.55);
-  --glass-1-blur: 12px;
-  --glass-2: rgba(255, 255, 255, 0.68);
+  /* Glass tiers (see the glass system comment below). Warm-white tint, alpha rises with tier so text on
+     stronger tiers keeps >= 4.5:1 over the brightest gold backdrop. */
+  --glass-1: rgba(255, 254, 247, 0.52);
+  --glass-1-blur: 10px;
+  --glass-2: rgba(255, 254, 247, 0.68);
   --glass-2-blur: 16px;
-  --glass-3: rgba(255, 255, 255, 0.82);
-  --glass-3-blur: 24px;
-  --glass-border: rgba(255, 255, 255, 0.6);
+  --glass-3: rgba(255, 254, 249, 0.84);
+  --glass-3-blur: 22px;
+  --glass-saturate: 160%;
+  --glass-border: rgba(255, 255, 255, 0.72);
+  --glass-ring: rgba(120, 88, 0, 0.09);
+  --glass-highlight: rgba(255, 255, 255, 0.85);
+  --glass-field: rgba(255, 255, 255, 0.74);
+  --glass-field-border: rgba(22, 22, 26, 0.2);
 
   /* Solid (dense-data) surfaces */
   --solid: #ffffff;
@@ -54,10 +60,17 @@
   --rag-critical: #7f0000;
 }
 
-/* Users who've asked the OS to reduce transparency effects get solid
-   surfaces everywhere instead of glass — accessibility requirement from
-   the plan. */
-@media (prefers-reduced-transparency: reduce) {
+/* Small screens: smaller blur radii (GPU budget); tiers keep their alpha. */
+@media (max-width: 767px) {
+  :root {
+    --glass-1-blur: 6px;
+    --glass-2-blur: 10px;
+    --glass-3-blur: 14px;
+  }
+}
+
+/* Users who asked the OS for reduced transparency or more contrast get opaque surfaces and no blur. */
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
   :root {
     --glass-1: #ffffff;
     --glass-2: #ffffff;
@@ -65,6 +78,9 @@
     --glass-1-blur: 0px;
     --glass-2-blur: 0px;
     --glass-3-blur: 0px;
+    --glass-field: #ffffff;
+    --glass-field-border: rgba(22, 22, 26, 0.55);
+    --glass-border: rgba(22, 22, 26, 0.35);
   }
 }
 
@@ -121,10 +137,6 @@ body {
 
 body {
   background-color: var(--bg);
-  background-image:
-    radial-gradient(600px 400px at 8% -5%, rgba(255, 247, 0, 0.16), transparent 60%),
-    radial-gradient(500px 380px at 100% 10%, rgba(255, 247, 0, 0.10), transparent 55%);
-  background-attachment: fixed;
   color: var(--ink);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
@@ -140,56 +152,170 @@ body {
 }
 
 /* ===========================================================================
-   Glass surfaces
-   Three elevation levels for chrome / cards / modals / hero elements.
-   Dense data surfaces (tables, matrices, forms) must use .solid-panel
-   instead — never glass — per the plan's design-system rule.
+   Glass system
+   Rules adopted (web research: glassmorphism CSS guides + backdrop-filter performance notes):
+   1. Recipe = translucent warm-white fill (alpha .5-.85) + backdrop-filter blur(10-22px) saturate(160%) + 1px
+      light border + inset top highlight + layered soft shadow. Blur only shows if something colourful sits
+      behind, so AppShell paints static yellow gradient blobs (.app-backdrop); they are never animated.
+   2. Always write -webkit-backdrop-filter next to backdrop-filter (Safari). @supports-not fallback = a
+      near-opaque fill so text never sits on raw transparency.
+   3. prefers-reduced-transparency / prefers-contrast: more -> opaque white, no blur, darker border (tokens above).
+   4. Contrast: alpha rises with tier; text is --ink / --ink-muted (>= 4.5:1 over the brightest gold blob).
+      Dense data (tables, matrices, forms) stays on .solid-panel / opaque cells.
+   5. Perf: never animate or transition backdrop-filter (only colour / shadow / transform); radii <= 22px, smaller
+      on phones; nested glass never re-blurs (the inner layer drops its filter and keeps only the tint), so blur
+      layers do not stack; only a handful of large layers per viewport (rail, bottom bar, cards, one modal).
+   Tiers (.glass-elev-1/2/3 stay as aliases): .glass-subtle = 1 (chrome, tab pills), .glass = 2 (cards, rail),
+   .glass-strong = 3 (modals, sheets, menus). .glass-tint = tint only, no blur (nested / inline use).
+   .glass-interactive adds hover / pressed states. .glass-field = inputs and selects (near-opaque, no blur).
    ========================================================================= */
 
+.glass-subtle,
+.glass,
+.glass-strong,
 .glass-elev-1,
 .glass-elev-2,
-.glass-elev-3 {
+.glass-elev-3,
+.glass-tint {
   border: 1px solid var(--glass-border);
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.15s ease;
 }
 
+.glass-subtle,
 .glass-elev-1 {
   background: var(--glass-1);
-  backdrop-filter: blur(var(--glass-1-blur));
-  -webkit-backdrop-filter: blur(var(--glass-1-blur));
-  box-shadow: var(--shadow-1);
+  -webkit-backdrop-filter: blur(var(--glass-1-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-1-blur)) saturate(var(--glass-saturate));
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 0 0 1px var(--glass-ring),
+    0 2px 8px rgba(120, 88, 0, 0.06);
 }
 
+.glass,
 .glass-elev-2 {
   background: var(--glass-2);
-  backdrop-filter: blur(var(--glass-2-blur));
-  -webkit-backdrop-filter: blur(var(--glass-2-blur));
-  box-shadow: var(--shadow-2);
+  -webkit-backdrop-filter: blur(var(--glass-2-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-2-blur)) saturate(var(--glass-saturate));
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 0 0 1px var(--glass-ring),
+    0 8px 24px rgba(120, 88, 0, 0.1),
+    0 2px 6px rgba(22, 22, 26, 0.05);
 }
 
+.glass-strong,
 .glass-elev-3 {
   background: var(--glass-3);
-  backdrop-filter: blur(var(--glass-3-blur));
-  -webkit-backdrop-filter: blur(var(--glass-3-blur));
-  box-shadow: var(--shadow-3);
+  -webkit-backdrop-filter: blur(var(--glass-3-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-3-blur)) saturate(var(--glass-saturate));
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 0 0 1px var(--glass-ring),
+    0 24px 56px rgba(120, 88, 0, 0.18),
+    0 6px 14px rgba(22, 22, 26, 0.08);
 }
 
-/* Browsers without backdrop-filter support fall back to a near-solid
-   surface so text stays legible instead of rendering as flat transparency. */
-@supports not (backdrop-filter: blur(1px)) {
+/* Tint only: for glass that sits inside other glass (no second blur) or on tiny elements. */
+.glass-tint {
+  background: rgba(255, 255, 255, 0.5);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 1px 3px rgba(120, 88, 0, 0.06);
+}
+
+/* Hover / pressed: colour and shadow only; the filter itself is never transitioned. */
+.glass-interactive:hover {
+  background-color: rgba(255, 255, 255, 0.82);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 0 0 1px rgba(120, 88, 0, 0.14),
+    0 10px 28px rgba(120, 88, 0, 0.14);
+}
+
+.glass-interactive:active {
+  background-color: rgba(255, 252, 224, 0.9);
+  transform: translateY(1px);
+  box-shadow:
+    inset 0 1px 2px rgba(120, 88, 0, 0.12),
+    0 0 0 1px rgba(120, 88, 0, 0.14);
+}
+
+/* Inputs / selects: translucent but nearly opaque (readability first), clear 1px border, strong focus. */
+.glass-field {
+  background: var(--glass-field);
+  border: 1px solid var(--glass-field-border);
+  box-shadow: inset 0 1px 2px rgba(22, 22, 26, 0.04);
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.glass-field:hover {
+  border-color: rgba(22, 22, 26, 0.35);
+}
+
+.glass-field:focus-visible,
+.glass-field:focus {
+  background: #ffffff;
+  border-color: var(--focus);
+}
+
+/* Blur budget: glass inside glass keeps its tint but never re-blurs. */
+:is(.glass-subtle, .glass, .glass-strong, .glass-elev-1, .glass-elev-2, .glass-elev-3)
+  :is(.glass-subtle, .glass, .glass-strong, .glass-elev-1, .glass-elev-2, .glass-elev-3) {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+/* Soft yellow light behind the app so the blur has something to show. Static (no animation, no filter). */
+.app-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(520px 420px at 4% 38%, rgba(255, 194, 26, 0.34), transparent 70%),
+    radial-gradient(700px 560px at 6% -4%, rgba(255, 194, 26, 0.42), transparent 70%),
+    radial-gradient(620px 520px at 98% 8%, rgba(255, 214, 90, 0.5), transparent 70%),
+    radial-gradient(760px 560px at 72% 104%, rgba(255, 190, 40, 0.38), transparent 70%),
+    radial-gradient(560px 460px at 0% 100%, rgba(255, 224, 120, 0.5), transparent 70%);
+}
+
+/* Browsers without backdrop-filter: near-opaque fills so text stays legible. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass-subtle,
+  .glass,
+  .glass-strong,
   .glass-elev-1,
   .glass-elev-2,
   .glass-elev-3 {
-    background: rgba(255, 255, 255, 0.94);
+    background: rgba(255, 254, 247, 0.95);
   }
 }
 
-@media (prefers-reduced-transparency: reduce) {
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  .glass-subtle,
+  .glass,
+  .glass-strong,
   .glass-elev-1,
   .glass-elev-2,
-  .glass-elev-3 {
+  .glass-elev-3,
+  .glass-tint {
     background: #ffffff;
-    backdrop-filter: none;
     -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .glass-interactive:active {
+    transform: none;
   }
 }
 

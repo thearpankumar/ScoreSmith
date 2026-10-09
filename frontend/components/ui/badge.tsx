@@ -9,11 +9,11 @@ const badgeVariants = cva(
     variants: {
       variant: {
         default: "border-transparent bg-ink text-white",
-        outline: "border-hairline text-ink",
+        outline: "border-hairline bg-white/60 text-ink",
         // Lemon used correctly: filled surface + dark ink text, never text-on-white.
         lemon: "border-transparent bg-lemon text-lemon-ink font-semibold",
         soft: "border-transparent bg-lemon-soft text-lemon-ink",
-        muted: "border-transparent bg-black/5 text-ink-muted",
+        muted: "border-white/70 bg-white/55 text-ink-muted",
       },
     },
     defaultVariants: {

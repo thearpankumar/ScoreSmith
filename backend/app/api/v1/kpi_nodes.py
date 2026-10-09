@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy_utils import Ltree
 
+from app.authz import get_owned_guideline, get_owned_kpi_node, get_owned_version
 from app.db import get_db
 from app.deps import get_current_user
 from app.models.kpi_guideline import KpiGuideline
@@ -43,7 +44,7 @@ router = APIRouter(tags=["kpi-nodes"])
 
 @router.get("/scorecard-versions/{version_id}", response_model=ScorecardVersionReadWithKpiNodes)
 async def get_scorecard_version_flat(
-    version_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+    version_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> ScorecardVersion:
     """Additive (Wave 3 integration): a scorecard-version lookup that doesn't require
     already knowing its parent `scorecard_id` (the existing route is nested under
@@ -51,6 +52,7 @@ async def get_scorecard_version_flat(
     resolve `evaluations.scorecard_version_id` -> its owning scorecard (an evaluation row
     only carries the version id), and to load a version's KPI tree directly from a chat
     session's `materialized_scorecard_version_id`."""
+    await get_owned_version(db, current_user, version_id)
     result = await db.execute(
         select(ScorecardVersion)
         .where(ScorecardVersion.id == version_id)
@@ -68,13 +70,13 @@ def _label_for(node_id: uuid.UUID) -> str:
 
 
 async def _compute_path_and_level(
-    db: AsyncSession, parent_id: uuid.UUID | None, node_id: uuid.UUID
+    db: AsyncSession, parent_id: uuid.UUID | None, node_id: uuid.UUID, version_id: uuid.UUID
 ) -> tuple[str, int]:
     label = _label_for(node_id)
     if parent_id is None:
         return label, 1
     parent = await db.get(KpiNode, parent_id)
-    if parent is None:
+    if parent is None or parent.scorecard_version_id != version_id:  # a parent must belong to the SAME version
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="parent_id not found.")
     if parent.level >= 4:
         raise HTTPException(
@@ -88,7 +90,10 @@ async def _compute_path_and_level(
     response_model=list[KpiNodeReadWithGuidelines],
     tags=["kpi-nodes"],
 )
-async def list_kpi_nodes(version_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> list[KpiNode]:
+async def list_kpi_nodes(
+    version_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
+) -> list[KpiNode]:
+    await get_owned_version(db, current_user, version_id)
     result = await db.execute(
         select(KpiNode)
         .where(KpiNode.scorecard_version_id == version_id)
@@ -115,14 +120,15 @@ async def bulk_create_kpi_nodes(
     version_id: uuid.UUID,
     payload: KpiNodeBulkCreateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> list[KpiNode]:
     """Create a full sibling group (plus their guidelines) in a single transaction, so the
     weight-sum-to-100 trigger evaluates once the whole group is present."""
+    await get_owned_version(db, current_user, version_id)
     created: list[KpiNode] = []
     for item in payload.nodes:
         node_id = uuid.uuid4()
-        path, level = await _compute_path_and_level(db, item.parent_id, node_id)
+        path, level = await _compute_path_and_level(db, item.parent_id, node_id, version_id)
         node = KpiNode(
             id=node_id,
             scorecard_version_id=version_id,
@@ -166,14 +172,12 @@ class KpiNodeWeightsBulkUpdateRequest(BaseModel):
 async def bulk_update_kpi_node_weights(
     payload: KpiNodeWeightsBulkUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> list[KpiNode]:
     """Rebalance several sibling weights atomically (e.g. the whole sibling group)."""
     nodes: list[KpiNode] = []
     for item in payload.weights:
-        node = await db.get(KpiNode, item.id)
-        if node is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"kpi_node {item.id} not found.")
+        node = await get_owned_kpi_node(db, current_user, item.id)
         node.weight = item.weight
         nodes.append(node)
     try:
@@ -190,7 +194,10 @@ async def bulk_update_kpi_node_weights(
 
 
 @router.get("/kpi-nodes/{node_id}", response_model=KpiNodeReadWithGuidelines)
-async def get_kpi_node(node_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> KpiNode:
+async def get_kpi_node(
+    node_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
+) -> KpiNode:
+    await get_owned_kpi_node(db, current_user, node_id)
     result = await db.execute(
         select(KpiNode).where(KpiNode.id == node_id).options(selectinload(KpiNode.guidelines))
     )
@@ -205,11 +212,9 @@ async def update_kpi_node(
     node_id: uuid.UUID,
     payload: KpiNodeUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> KpiNode:
-    node = await db.get(KpiNode, node_id)
-    if node is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="KPI node not found.")
+    node = await get_owned_kpi_node(db, current_user, node_id)
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(node, field, value)
     try:
@@ -228,11 +233,9 @@ async def update_kpi_node(
 async def delete_kpi_node(
     node_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> None:
-    node = await db.get(KpiNode, node_id)
-    if node is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="KPI node not found.")
+    node = await get_owned_kpi_node(db, current_user, node_id)
     await db.delete(node)
     try:
         await db.commit()
@@ -249,7 +252,10 @@ async def delete_kpi_node(
 
 
 @router.get("/kpi-nodes/{node_id}/guidelines", response_model=list[KpiGuidelineRead])
-async def list_guidelines(node_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> list[KpiGuideline]:
+async def list_guidelines(
+    node_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
+) -> list[KpiGuideline]:
+    await get_owned_kpi_node(db, current_user, node_id)
     result = await db.execute(
         select(KpiGuideline)
         .where(KpiGuideline.kpi_node_id == node_id)
@@ -267,8 +273,9 @@ async def create_guideline(
     node_id: uuid.UUID,
     payload: KpiGuidelineCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> KpiGuideline:
+    await get_owned_kpi_node(db, current_user, node_id)
     guideline = KpiGuideline(kpi_node_id=node_id, **payload.model_dump())
     db.add(guideline)
     try:
@@ -289,11 +296,9 @@ async def update_guideline(
     guideline_id: uuid.UUID,
     payload: KpiGuidelineUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> KpiGuideline:
-    guideline = await db.get(KpiGuideline, guideline_id)
-    if guideline is None or guideline.kpi_node_id != node_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Guideline not found.")
+    guideline = await get_owned_guideline(db, current_user, node_id, guideline_id)
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(guideline, field, value)
     await db.commit()
@@ -310,10 +315,8 @@ async def delete_guideline(
     node_id: uuid.UUID,
     guideline_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> None:
-    guideline = await db.get(KpiGuideline, guideline_id)
-    if guideline is None or guideline.kpi_node_id != node_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Guideline not found.")
+    guideline = await get_owned_guideline(db, current_user, node_id, guideline_id)
     await db.delete(guideline)
     await db.commit()

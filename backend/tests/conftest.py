@@ -33,7 +33,9 @@ Alembic will fail clearly (database does not exist) if it's missing.
 from __future__ import annotations
 
 import os
+import secrets
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -72,6 +74,12 @@ def _apply_test_database_url() -> None:
 
 _apply_test_database_url()
 
+# Secrets are never committed: the test session signs its JWTs with a fresh random key, and any admin / bootstrap /
+# signup / production switches from the developer's shell or .env are removed so tests start from a known state.
+os.environ["JWT_SECRET"] = secrets.token_urlsafe(48)
+for _name in ("ENV", "ENVIRONMENT", "ADMIN_EMAIL", "ADMIN_PASSWORD", "BOOTSTRAP_TOKEN", "SIGNUP_ENABLED"):
+    os.environ.pop(_name, None)
+
 # Chat turns default to BACKGROUND tasks (202 + polling) in production; the pre-existing API tests
 # assert on the inline 200/201 responses, so the suite runs inline by default and the background
 # tests (tests/test_chat_background_turns.py) opt in with `?wait=false`.
@@ -81,6 +89,10 @@ os.environ.setdefault("AI_EVAL_INLINE", "true")
 
 APP_TABLES = [
     "audit_log",
+    "refresh_tokens",
+    "password_reset_tokens",
+    "oauth_identities",
+    "idempotency_keys",
     "chat_messages",
     "chat_turn_events",
     "chat_sessions",
@@ -140,13 +152,82 @@ def db_session(_clean_tables: None) -> Session:
         session.close()
 
 
-@pytest.fixture()
-def client(_clean_tables: None):
+def make_access_token(user_id: str) -> str:
+    """A real, signed 15-minute access JWT for `user_id` (what /auth/login would hand out)."""
+    from app.auth.security import create_access_token
+
+    return create_access_token(uuid.UUID(str(user_id)))[0]
+
+
+def _auth_test_client_class():
     from fastapi.testclient import TestClient
 
+    class AuthTestClient(TestClient):
+        """TestClient that speaks the real auth protocol on behalf of the older tests.
+
+        - A request carrying `X-User-Id: <uuid>` is sent with `Authorization: Bearer <signed JWT for that user>`
+          instead (the header itself never reaches the app: the server ignores it). Tests therefore exercise
+          the production JWT path, and "acting as user B" stays a one-line header.
+        - A request with no credentials at all reuses the user of the most recent `X-User-Id` request ("sticky
+          acting user"), so the many read-after-write calls in older tests need not repeat the header. Send
+          `X-Test-Anonymous: 1` to make a genuinely unauthenticated request. Tests about isolation between users
+          always pass the header explicitly.
+        - `POST /api/v1/users` (a bootstrap helper: the public user-admin API was removed) inserts the user row
+          directly and answers like the old endpoint did.
+        """
+
+        _acting_user: str | None = None
+
+        def request(self, method, url, *args, headers=None, **kwargs):  # noqa: ANN001
+            headers = dict(headers or {})
+            uid = headers.pop("X-User-Id", None)
+            anonymous = headers.pop("X-Test-Anonymous", None)
+            if uid:
+                self._acting_user = uid
+            elif not anonymous and "Authorization" not in headers and self._acting_user:
+                uid = self._acting_user
+            if uid and "Authorization" not in headers:
+                headers["Authorization"] = f"Bearer {make_access_token(uid)}"
+            if method.upper() == "POST" and str(url).rstrip("/") == "/api/v1/users":
+                return self._create_user(kwargs.get("json") or {})
+            return super().request(method, url, *args, headers=headers, **kwargs)
+
+        @staticmethod
+        def _create_user(body: dict):
+            import httpx
+
+            from app.db import SyncSessionLocal
+            from app.models.user import User
+
+            with SyncSessionLocal() as session:
+                user = User(email=body["email"], name=body["name"], role=body.get("role", "member"))
+                session.add(user)
+                session.commit()
+                session.refresh(user)
+                data = {
+                    "id": str(user.id), "email": user.email, "name": user.name, "role": user.role,
+                    "org_id": None, "auth_provider_id": None,
+                    "created_at": user.created_at.isoformat(), "updated_at": user.updated_at.isoformat(),
+                }
+            return httpx.Response(201, json=data)
+
+    return AuthTestClient
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    from app.ratelimit import reset_rate_limits
+
+    reset_rate_limits()
+    yield
+    reset_rate_limits()
+
+
+@pytest.fixture()
+def client(_clean_tables: None):
     from app.main import app
 
-    with TestClient(app) as c:
+    with _auth_test_client_class()(app) as c:
         yield c
 
 

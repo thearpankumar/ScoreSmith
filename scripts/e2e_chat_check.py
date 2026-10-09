@@ -4,13 +4,14 @@
     python scripts/e2e_chat_check.py                       # all tests against http://localhost:8000
     python scripts/e2e_chat_check.py --test 1              # only the user-specified-KPI test
     python scripts/e2e_chat_check.py --test 2 --keep       # only the open-ended tests, keep sessions
-    python scripts/e2e_chat_check.py --base-url http://localhost:8000 --user-id <uuid>
+    QS_PASSWORD=... python scripts/e2e_chat_check.py --base-url http://localhost:8000 --email you@example.com
 
 Stdlib only (no pip install). Makes REAL model calls (Bedrock, web search, Jev) through the API, so
 it costs money and takes minutes; nothing secret is read or printed (the API holds the credentials).
 
-Auth: the API's dev auth stub (backend/app/deps.py) trusts an `X-User-Id: <user uuid>` header. The
-user id is taken from --user-id / $QS_USER_ID, else the first user returned by GET /api/v1/users.
+Auth: signs in with --email / $QS_EMAIL and the password in $QS_PASSWORD (or a hidden prompt), then sends the
+short-lived bearer token from POST /api/v1/auth/login. (Set a password for an existing account with
+`python -m app.scripts.set_password <email>`.)
 
 Flow per turn (backend/app/api/v1/chat.py): POST returns 202 immediately with turn_in_progress=true;
 this script then polls GET /chat/sessions/{id} (state: draft, assistant_message, turn_in_progress,
@@ -72,15 +73,25 @@ OPEN_ENDED_PROMPTS = [
 
 
 class Api:
-    def __init__(self, base_url: str, user_id: str | None) -> None:
+    def __init__(self, base_url: str, email: str | None, password: str | None) -> None:
         self.base = base_url.rstrip("/")
-        self.user_id = user_id
+        self.email, self.password = email, password
+        self.token: str | None = None
+        self.user_id: str | None = None
+
+    def login(self) -> bool:
+        status, body = self.call("POST", "/api/v1/auth/login", {"email": self.email, "password": self.password}, auth=False)
+        if status != 200:
+            return False
+        self.token = body["access_token"]
+        self.user_id = body["user"]["id"]
+        return True
 
     def call(self, method: str, path: str, body: Any = None, *, auth: bool = True, timeout: float = 60.0):
         data = json.dumps(body).encode() if body is not None else None
         headers = {"Content-Type": "application/json"}
-        if auth and self.user_id:
-            headers["X-User-Id"] = self.user_id
+        if auth and self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -386,23 +397,25 @@ def main() -> int:
     _make_output_encoding_safe()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base-url", default=os.environ.get("QS_API_URL", "http://localhost:8000"))
-    parser.add_argument("--user-id", default=os.environ.get("QS_USER_ID"))
+    parser.add_argument("--email", default=os.environ.get("QS_EMAIL"))
     parser.add_argument("--test", choices=["1", "2", "all"], default="all")
     parser.add_argument("--timeout", type=float, default=1800.0, help="seconds to wait per turn")
     parser.add_argument("--keep", action="store_true", help="do not delete the created chat sessions")
     args = parser.parse_args()
 
-    api = Api(args.base_url, args.user_id)
+    if not args.email:
+        print("Pass --email (or set $QS_EMAIL); the password comes from $QS_PASSWORD or a hidden prompt.")
+        return 2
+    import getpass
+
+    api = Api(args.base_url, args.email, os.environ.get("QS_PASSWORD") or getpass.getpass(f"Password for {args.email}: "))
     status, health = api.call("GET", "/health", auth=False, timeout=10)
     if status != 200:
         print(f"API not healthy at {args.base_url}: {status} {health}")
         return 2
-    if not api.user_id:
-        status, users = api.call("GET", "/api/v1/users", auth=False)
-        if status != 200 or not users:
-            print("No --user-id/$QS_USER_ID given and GET /api/v1/users returned no user. Create one first.")
-            return 2
-        api.user_id = users[0]["id"]
+    if not api.login():
+        print("Sign-in failed: check --email / the password (and that the account has one: app.scripts.set_password).")
+        return 2
     print(f"API {args.base_url} ok; acting as user {api.user_id}")
 
     report = Report()

@@ -1,25 +1,18 @@
-"""Shared FastAPI dependencies.
-
-`get_current_user` below is a DEV-ONLY auth stub. It trusts an `X-User-Id` header (a raw
-user UUID) or a trivial `Authorization: Bearer <user-id>` token, and loads that user from
-the DB. There is no signature verification, no token expiry, and no password/identity
-check of any kind — this is explicitly NOT production auth. Real OIDC/OAuth2 is deferred
-per the plan (see plan doc: "Security & deployability checklist" / "Explicitly deferred").
-"""
+"""Shared FastAPI dependencies. `get_current_user` is the real authentication dependency (see app/auth/)."""
 
 from __future__ import annotations
 
 import uuid
 
-from fastapi import Depends, Header, HTTPException, status
-from sqlalchemy import select
+from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.bedrock_client import BedrockClient, BedrockClientProtocol
 from app.ai.jev_client import JevClient, JevClientProtocol
 from app.ai.web_search import AgentCoreWebSearchClient, WebSearchClientProtocol
+from app.auth.security import SAFE_METHODS, decode_access_token, extract_access_token, verify_csrf
 from app.db import get_db
-from app.models.user import User
+from app.models.user import ROLE_ADMIN, User
 from app.pipeline.aws_jobs import AwsJobsProtocol, Boto3AwsJobs
 from app.pipeline.jev_scorer import JevScoreClient, JevScoreClientProtocol
 
@@ -80,32 +73,37 @@ def get_jev_client() -> JevClientProtocol:
     return _jev_client
 
 
-async def get_current_user(
-    db: AsyncSession = Depends(get_db),
-    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
-    authorization: str | None = Header(default=None),
-) -> User:
-    """DEV-ONLY stub auth dependency. See module docstring."""
-    raw_id = x_user_id
-    if raw_id is None and authorization and authorization.lower().startswith("bearer "):
-        raw_id = authorization.split(" ", 1)[1].strip()
+async def get_current_user(request: Request, db: AsyncSession = Depends(get_db)) -> User:
+    """The signed-in user, from a 15-minute access JWT (httpOnly cookie for the browser, or an
+    `Authorization: Bearer` header for scripts/tests).
 
-    if not raw_id:
+    Cookie-authenticated unsafe requests (POST/PATCH/PUT/DELETE) must also pass the CSRF double-submit check;
+    bearer-token requests are not ambient credentials and skip it. Raises 401 for a missing, malformed, expired
+    or revoked token and for an unknown / deactivated user."""
+    token, via_cookie = extract_access_token(request)
+    if not token:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing X-User-Id header or Bearer token (dev auth stub).",
+            status.HTTP_401_UNAUTHORIZED, detail="Not authenticated.", headers={"WWW-Authenticate": "Bearer"}
         )
-
+    claims = decode_access_token(token)
     try:
-        user_id = uuid.UUID(raw_id)
+        user_id = uuid.UUID(claims["sub"])
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="X-User-Id / bearer token must be a valid user UUID (dev auth stub).",
-        ) from exc
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired session.") from exc
+    user = await db.get(User, user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired session.")
+    issued_ms = int(claims.get("iatm") or int(claims["iat"]) * 1000)
+    if user.sessions_valid_after is not None and issued_ms <= int(user.sessions_valid_after.timestamp() * 1000):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Session expired. Please sign in again.")
+    if via_cookie and request.method not in SAFE_METHODS:
+        verify_csrf(request)
+    request.state.user_id = user.id
+    return user
 
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown user.")
+
+async def require_admin(user: User = Depends(get_current_user)) -> User:
+    """The signed-in user, who must have the admin role (403 otherwise)."""
+    if user.role != ROLE_ADMIN:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Administrator access required.")
     return user

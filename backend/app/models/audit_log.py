@@ -25,6 +25,11 @@ class AuditLog(UUIDPKMixin, Base):
     entity_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
     action: Mapped[AuditAction] = mapped_column(audit_action_enum, nullable=False)
     diff: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Request context (migration 0012). Auth events carry their name in `diff["event"]` (the `action` enum
+    # stays create/update/delete: login = create, logout = delete, password reset = update).
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

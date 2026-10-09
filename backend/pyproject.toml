@@ -33,6 +33,16 @@ dependencies = [
   "openpyxl>=3.1.5",
   # --- Excel export of evaluations (app/reporting/workbook.py): styled workbook writer ---
   "XlsxWriter>=3.2.0,<4",
+  # --- Horizontal scaling: cluster-wide LLM limits (app/limits/redis_semaphore.py) + production process manager ---
+  "redis>=5.0,<9",
+  "gunicorn>=22.0",
+  # --- Authentication / API security (app/auth/*, app/ratelimit.py) ---
+  # argon2-cffi: Argon2id password hashing. PyJWT: 15-minute access tokens. limits: sliding-window rate limiting
+  # (Redis-backed with an in-process fallback; the engine under slowapi, used directly because slowapi's route
+  # decorator is incompatible with `from __future__ import annotations` endpoints).
+  "argon2-cffi>=23.1",
+  "PyJWT>=2.8",
+  "limits>=3.13",
 ]
 
 [project.optional-dependencies]

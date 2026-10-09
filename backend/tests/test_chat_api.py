@@ -131,10 +131,10 @@ def test_start_session_asks_clarification_then_confirms(client: TestClient, seed
     assert r.json()["name"] == "Support Ticket Quality"
 
 
-def test_unknown_session_returns_404(client: TestClient) -> None:
+def test_unknown_session_returns_404(client: TestClient, seed_user_id: str) -> None:
     import uuid
 
-    r = client.get(f"/api/v1/chat/sessions/{uuid.uuid4()}")
+    r = client.get(f"/api/v1/chat/sessions/{uuid.uuid4()}", headers={"X-User-Id": seed_user_id})
     assert r.status_code == 404
 
 
@@ -890,7 +890,9 @@ def test_session_deleted_mid_turn_returns_409_not_500(client: TestClient, seed_u
     assert messages.status_code == 404
 
 
-def test_validate_formula_draft_endpoint_checks_against_given_kpi_names(client: TestClient) -> None:
+def test_validate_formula_draft_endpoint_checks_against_given_kpi_names(
+    client: TestClient, seed_user_id: str
+) -> None:
     """The generic, scorecard-less validator (Issue 2) that the chat live-preview panel's
     formula editor calls — same underlying `app/ai/scoring_formula.py::validate` the
     per-version endpoint uses, just given KPI names directly instead of looking them up
@@ -898,6 +900,7 @@ def test_validate_formula_draft_endpoint_checks_against_given_kpi_names(client: 
     r = client.post(
         "/api/v1/scorecards/validate-formula",
         json={"formula": 'min(kpi["Accuracy"], kpi["Tone"])', "kpi_names": ["Accuracy", "Tone"]},
+        headers={"X-User-Id": seed_user_id},
     )
     assert r.status_code == 200, r.text
     assert r.json() == {"valid": True, "error": None, "unused_kpis": []}
@@ -943,7 +946,7 @@ def test_delete_chat_session_requires_auth(client: TestClient, seed_user_id: str
     assert r.status_code == 201, r.text
     session_id = r.json()["session_id"]
 
-    r = client.delete(f"/api/v1/chat/sessions/{session_id}")
+    r = client.delete(f"/api/v1/chat/sessions/{session_id}", headers={"X-Test-Anonymous": "1"})
     assert r.status_code == 401
 
 

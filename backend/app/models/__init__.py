@@ -2,6 +2,7 @@
 autogenerate and by anything that calls `Base.metadata.create_all`)."""
 
 from app.models.audit_log import AuditLog
+from app.models.auth import OAuthIdentity, PasswordResetToken, RefreshToken
 from app.models.base import Base
 from app.models.chat_message import ChatMessage
 from app.models.chat_session import ChatSession
@@ -11,6 +12,7 @@ from app.models.evaluation_batch import EvaluationBatch
 from app.models.evaluation_event import EvaluationEvent
 from app.models.evaluation_kpi_result import EvaluationKpiResult
 from app.models.evaluation_source import EvaluationSource
+from app.models.idempotency_key import IdempotencyKey
 from app.models.kpi_guideline import KpiGuideline
 from app.models.kpi_node import KpiNode
 from app.models.scorecard import Scorecard
@@ -35,4 +37,8 @@ __all__ = [
     "ChatMessage",
     "ChatTurnEvent",
     "AuditLog",
+    "IdempotencyKey",
+    "RefreshToken",
+    "PasswordResetToken",
+    "OAuthIdentity",
 ]

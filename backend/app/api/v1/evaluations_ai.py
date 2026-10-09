@@ -12,11 +12,13 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import idempotency as idem
 from app.ai.bedrock_client import BedrockClientProtocol
+from app.authz import get_accessible_evaluation, get_owned_batch, get_owned_scorecard
 from app.config import get_settings
 from app.db import get_db
 from app.deps import get_aws_jobs, get_bedrock_client, get_current_user
@@ -36,6 +38,7 @@ from app.pipeline.dispatcher import Dispatcher, NotCancellableError, NotRetryabl
 from app.pipeline.drive import DriveUrlError, classify_drive_url
 from app.pipeline.events import emit_evaluation_event
 from app.pipeline.graph import PLACEHOLDER_NAME
+from app.ratelimit import rate_limit
 from app.schemas.evaluation import EvaluationRead
 from app.schemas.evaluation_ai import (
     BatchCounts,
@@ -98,10 +101,15 @@ def _initial_name(item: Any) -> str:
     return (name or email or PLACEHOLDER_NAME)[:255]
 
 
-@router.post("/ai/uploads", response_model=UploadInitResponse)
+@router.post(
+    "/ai/uploads",
+    response_model=UploadInitResponse,
+    dependencies=[Depends(rate_limit("uploads", lambda s: s.rate_limit_uploads, per_user=True))],
+)
 async def init_uploads(
     payload: UploadInitRequest,
     aws: AwsJobsProtocol = Depends(get_aws_jobs),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> UploadInitResponse:
     settings = get_settings()
@@ -123,6 +131,23 @@ async def init_uploads(
             errors.append(f"files[{i}] ({f.name}): larger than the {max_bytes // (1024 * 1024)} MiB limit.")
     if errors:
         raise _unprocessable(errors)
+    # Per-user quota: bytes uploaded for new evaluations in the last 24 h plus this request.
+    used = (
+        await db.execute(
+            select(func.coalesce(func.sum(EvaluationSource.size), 0))
+            .join(Evaluation, Evaluation.id == EvaluationSource.evaluation_id)
+            .where(
+                Evaluation.owner_id == current_user.id,
+                Evaluation.created_at > datetime.now(UTC) - timedelta(hours=24),
+            )
+        )
+    ).scalar_one()
+    if int(used) + sum(f.size for f in payload.files) > settings.upload_user_daily_bytes:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Daily upload limit reached. Try again later.",
+            headers={"Retry-After": "3600"},
+        )
 
     group_id = uuid.uuid4()
     part_size = up.part_size_for(max(f.size for f in payload.files), settings.upload_part_size)
@@ -220,7 +245,7 @@ async def parse_batch_sheet(
     bedrock: BedrockClientProtocol = Depends(get_bedrock_client),
     current_user: User = Depends(get_current_user),
 ) -> BatchParseResponse:
-    ext = up.key_extension(payload.s3_key, None, "batch_sheet")
+    ext = up.key_extension(payload.s3_key, current_user.id, "batch_sheet")
     if ext is None:
         raise _unprocessable("s3_key is not an uploaded batch sheet (.xlsx / .csv).")
     data = await _aws(aws.get_object_bytes, payload.s3_key, MAX_BATCH_SHEET_BYTES)
@@ -265,17 +290,41 @@ async def _resolve_version(db: AsyncSession, scorecard: Scorecard) -> ScorecardV
     return version
 
 
-@router.post("/ai/jobs", response_model=JobCreateResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/ai/jobs",
+    response_model=JobCreateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(rate_limit("ai_jobs", lambda s: s.rate_limit_ai_jobs, per_user=True))],
+)
 async def create_jobs(
     payload: JobCreateRequest,
     db: AsyncSession = Depends(get_db),
     dispatcher: Dispatcher = Depends(get_dispatcher),
     current_user: User = Depends(get_current_user),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> JobCreateResponse:
     settings = get_settings()
-    scorecard = await db.get(Scorecard, payload.scorecard_id)
-    if scorecard is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard not found.")
+    # `Idempotency-Key`: a retried POST (timeout, double click) returns the evaluations / batch created the
+    # first time instead of queueing - and paying for - them again.
+    key = idem.normalize_key(idempotency_key)
+    if key:
+        stored = await idem.begin(
+            db, current_user.id, "ai_jobs", key, idem.request_fingerprint(payload.model_dump_json())
+        )
+        if stored is not None:
+            ids = [uuid.UUID(x) for x in stored["evaluation_ids"]]
+            existing = (
+                await db.execute(
+                    select(Evaluation)
+                    .where(Evaluation.id.in_(ids))
+                    .order_by(Evaluation.queued_at, Evaluation.created_at)
+                )
+            ).scalars().all()
+            return JobCreateResponse(
+                batch_id=uuid.UUID(stored["batch_id"]) if stored.get("batch_id") else None,
+                evaluations=[EvaluationRead.model_validate(e) for e in existing],
+            )
+    scorecard = await get_owned_scorecard(db, current_user, payload.scorecard_id)
 
     errors: list[dict] = []
     for i, item in enumerate(payload.items):
@@ -315,6 +364,7 @@ async def create_jobs(
             scorecard_version_id=version.id,
             name=_initial_name(item),
             evaluated_by=current_user.id,
+            owner_id=current_user.id,
             input_reference={"origin": "ai_pipeline"},
             status=EvaluationStatus.QUEUED,
             domain=scorecard.domain,
@@ -342,6 +392,11 @@ async def create_jobs(
                 )
             )
         evaluations.append(ev)
+    if key:
+        await idem.remember(
+            db, current_user.id, "ai_jobs", key,
+            {"batch_id": str(batch.id) if batch else None, "evaluation_ids": [str(e.id) for e in evaluations]},
+        )
     await db.commit()
     for ev in evaluations:
         await db.refresh(ev)
@@ -360,9 +415,7 @@ async def create_jobs(
 async def get_batch(
     batch_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> BatchRead:
-    batch = await db.get(EvaluationBatch, batch_id)
-    if batch is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Batch not found.")
+    batch = await get_owned_batch(db, current_user, batch_id)
     evaluations = list(
         (
             await db.execute(
@@ -401,9 +454,7 @@ async def get_batch(
 async def get_progress(
     evaluation_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> ProgressResponse:
-    ev = await db.get(Evaluation, evaluation_id)
-    if ev is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Evaluation not found.")
+    ev = await get_accessible_evaluation(db, current_user, evaluation_id)
     position: int | None = None
     if ev.status == EvaluationStatus.QUEUED:
         ahead = (
@@ -452,6 +503,7 @@ async def cancel_evaluation(
     dispatcher: Dispatcher = Depends(get_dispatcher),
     current_user: User = Depends(get_current_user),
 ) -> Evaluation:
+    await get_accessible_evaluation(db, current_user, evaluation_id)
     try:
         await dispatcher.cancel(evaluation_id)
     except LookupError as exc:
@@ -469,6 +521,7 @@ async def retry_evaluation(
     dispatcher: Dispatcher = Depends(get_dispatcher),
     current_user: User = Depends(get_current_user),
 ) -> Evaluation:
+    await get_accessible_evaluation(db, current_user, evaluation_id)
     try:
         await dispatcher.retry(evaluation_id)
     except LookupError as exc:

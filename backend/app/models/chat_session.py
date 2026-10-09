@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import ENUM, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -74,6 +74,20 @@ class ChatSession(UUIDPKMixin, Base):
     # starts. Read back by the frontend through GET /chat/sessions/{id} (`turn_error`).
     last_turn_error: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     last_turn_error_code: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+
+    # --- Horizontal scaling: background-turn queue + lease (migration 0011_scaling_leases) ---
+    # `pending_turn_started_at` + `turn_message` make the turn a queued job any worker can run. A claim
+    # sets `turn_lease_owner` / `turn_lease_expires_at` (renewed ~every 15 s); a lease that expires means
+    # the worker died, and the turn is recorded as "interrupted". `turn_cancel_requested_at` is the
+    # cross-process cancel flag. All five are cleared whenever the in-progress marker is.
+    turn_message: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    turn_first: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
+    turn_lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True, default=None)
+    turn_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    turn_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    turn_cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
 
     messages: Mapped[list[ChatMessage]] = relationship(
         "ChatMessage", back_populates="session", cascade="all, delete-orphan",

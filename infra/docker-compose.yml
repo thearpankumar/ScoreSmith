@@ -1,13 +1,66 @@
+x-backend-env: &backend-env
+    # No password defaults anywhere: compose refuses to start until infra/.env defines these (see .env.example).
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-qs_app}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in infra/.env}@db:5432/${POSTGRES_DB:-quality_scorecard}
+    JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in infra/.env }
+    # This environment's AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (infra/.env) are, in
+    # practice, an AWS Bedrock long-term "API key" (bearer-token credential), not a
+    # SigV4 IAM access key/secret pair — using them as plain AWS_ACCESS_KEY_ID/
+    # AWS_SECRET_ACCESS_KEY makes every Bedrock call fail with
+    # `UnrecognizedClientException: The security token included in the request is
+    # invalid` (confirmed live against this account). botocore's bearer-auth support
+    # (see botocore/handlers.py::get_bearer_auth_supported_services, which lists
+    # "bedrock") looks for AWS_BEARER_TOKEN_BEDROCK and prefers it automatically for
+    # bedrock/bedrock-runtime calls when present; the value must be prefixed "A"
+    # (confirmed live: without it, Bedrock rejects with "Invalid API Key format: Must
+    # start with pre-defined prefix"). Standard AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
+    # are left in place too (via env_file above) since they're harmless when unused and
+    # some other AWS SDK call in this app (none currently) might still want them.
+    AWS_BEARER_TOKEN_BEDROCK: A${AWS_SECRET_ACCESS_KEY}
+    # OpenRouter Jev quality-gate key (see app/ai/jev_client.py / app/config.py's
+    # openrouter_jev_api field) — already present via env_file above (infra/.env), but
+    # listed explicitly here too, alongside the other AI-layer credentials, so a new
+    # container is guaranteed to pick it up on `docker compose up` without relying
+    # solely on env_file ordering/caching.
+    OPENROUTER_JEV_API: ${OPENROUTER_JEV_API:-}
+    # Shared Bedrock / Jev / web-search limits across every api + worker container (fails open to the
+    # per-process limits if Redis is down). Redis is on the compose network only - no host port.
+    REDIS_URL: redis://redis:6379/0
+    LOG_FORMAT: ${LOG_FORMAT:-json}
+    # --- Auth ---
+    # ENV=production enforces strong secrets, ignores ADMIN_EMAIL/ADMIN_PASSWORD and turns signup off by default.
+    ENV: ${ENV:-${ENVIRONMENT:-development}}
+    FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+    CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    # Browsers reach the API through the Next.js proxy (frontend container), so every request's TCP peer is that
+    # container. gunicorn/uvicorn only honour X-Forwarded-For from FORWARDED_ALLOW_IPS (default: 127.0.0.1 only);
+    # without this the per-IP rate limits and the audit log would see ONE client (the proxy) for all users. Private
+    # ranges only, and uvicorn takes the right-most UNTRUSTED hop, so a client-supplied header cannot spoof its IP.
+    FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+    DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+    DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+
+x-backend-base: &backend-base
+  image: quality-scorecard-backend:local
+  build:
+    context: ../backend
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  environment: *backend-env
+  volumes:
+    - ../backend:/app
+
 services:
   db:
     image: pgvector/pgvector:pg17
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-qs_app}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qs_dev_password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in infra/.env}
       POSTGRES_DB: ${POSTGRES_DB:-quality_scorecard}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      # Loopback only: reachable from the developer's machine (pytest, psql), never from the network.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - qs_pg_data:/var/lib/postgresql/data
       - ./db-init:/docker-entrypoint-initdb.d:ro
@@ -17,44 +70,77 @@ services:
       timeout: 5s
       retries: 10
 
-  backend:
-    build:
-      context: ../backend
-      dockerfile: Dockerfile
+  redis:
+    image: redis:7-alpine
     restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-qs_app}:${POSTGRES_PASSWORD:-qs_dev_password}@db:5432/${POSTGRES_DB:-quality_scorecard}
-      # This environment's AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (infra/.env) are, in
-      # practice, an AWS Bedrock long-term "API key" (bearer-token credential), not a
-      # SigV4 IAM access key/secret pair — using them as plain AWS_ACCESS_KEY_ID/
-      # AWS_SECRET_ACCESS_KEY makes every Bedrock call fail with
-      # `UnrecognizedClientException: The security token included in the request is
-      # invalid` (confirmed live against this account). botocore's bearer-auth support
-      # (see botocore/handlers.py::get_bearer_auth_supported_services, which lists
-      # "bedrock") looks for AWS_BEARER_TOKEN_BEDROCK and prefers it automatically for
-      # bedrock/bedrock-runtime calls when present; the value must be prefixed "A"
-      # (confirmed live: without it, Bedrock rejects with "Invalid API Key format: Must
-      # start with pre-defined prefix"). Standard AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
-      # are left in place too (via env_file above) since they're harmless when unused and
-      # some other AWS SDK call in this app (none currently) might still want them.
-      AWS_BEARER_TOKEN_BEDROCK: A${AWS_SECRET_ACCESS_KEY}
-      # OpenRouter Jev quality-gate key (see app/ai/jev_client.py / app/config.py's
-      # openrouter_jev_api field) — already present via env_file above (infra/.env), but
-      # listed explicitly here too, alongside the other AI-layer credentials, so a new
-      # container is guaranteed to pick it up on `docker compose up` without relying
-      # solely on env_file ordering/caching.
-      OPENROUTER_JEV_API: ${OPENROUTER_JEV_API:-}
-    ports:
-      - "${BACKEND_PORT:-8000}:8000"
+    # State is disposable (slot leases, the shared AIMD limit): no persistence. NO `ports:` on purpose -
+    # only containers on this compose network can reach it.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-off release job: Alembic migrations + LangGraph checkpoint tables, run ONCE before the api and the
+  # workers start (they wait for it to complete). Replaces `alembic upgrade head` in the container CMD, which
+  # raced when several replicas booted together. Re-run on its own: `docker compose run --rm migrate`.
+  migrate:
+    <<: *backend-base
+    restart: "no"
+    command: ["python", "-m", "app.scripts.migrate"]
     depends_on:
       db:
         condition: service_healthy
-    volumes:
-      - ../backend:/app
+
+  # HTTP API only (ROLE=api): gunicorn + uvicorn workers. Long jobs are queued in Postgres for the workers.
+  backend:
+    <<: *backend-base
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      ROLE: api
+    ports:
+      # Loopback only. Browsers do not call the API directly: the frontend proxies /api/v1/* to it (first-party
+      # cookies), so exposing it beyond localhost is only needed for scripts, and then behind a TLS proxy.
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Evaluation dispatcher + background chat turns (ROLE=worker). Scale with
+  # `docker compose up -d --scale worker=N` (default is 1): workers coordinate through Postgres leases and Redis limits.
+  # Redis is up and healthy before any worker starts, so the shared Bedrock limit is in force from the first call.
+  worker:
+    <<: *backend-base
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    # One worker by default. Raise it only on purpose: `docker compose up -d --scale worker=N` (the flag wins).
+    deploy:
+      replicas: 1
+    environment:
+      <<: *backend-env
+      ROLE: worker
+    # Long enough for the SIGTERM drain (worker_drain_grace_seconds) plus releasing leases.
+    stop_grace_period: 60s
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -64,16 +150,13 @@ services:
       context: ../frontend
       dockerfile: Dockerfile
     restart: unless-stopped
-    env_file:
-      - .env
+    # No env_file on purpose: the frontend needs none of the backend secrets (JWT_SECRET, DB password, AWS keys,
+    # ADMIN_PASSWORD), so it only gets the variables listed here.
     environment:
-      # Browser-side fetches (NEXT_PUBLIC_* is exposed to client bundles) must hit the
-      # backend the way the host machine sees it — localhost:8000 (the compose port map).
-      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
-      # Server-side fetches (Next.js Server Components / route handlers, which run
-      # *inside this container*) must instead use the Docker Compose service DNS name —
-      # "backend", not "localhost" — since each container has its own network namespace.
-      # Deliberately NOT prefixed NEXT_PUBLIC_ so it never leaks into the client bundle.
+      # The browser only ever talks to this app (same origin): Next.js proxies /api/v1/* to the backend, so the
+      # session cookies are first-party and no backend URL is exposed to client bundles.
+      # The proxy, the middleware's session renewal and Server Components all run *inside this container*, so
+      # they reach the backend by its Docker Compose service DNS name ("backend", not "localhost").
       INTERNAL_API_BASE_URL: ${INTERNAL_API_BASE_URL:-http://backend:8000}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"

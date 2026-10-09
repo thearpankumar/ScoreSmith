@@ -34,9 +34,9 @@ if still failing, return an **empty list** rather than raising. A failed web sea
 never kill the whole chat turn — the calling node falls back to proposing KPIs from the
 model's own knowledge, same as before this feature existed.
 
-**Concurrency guard**: a simple in-process `asyncio.Semaphore` (no Redis / cluster-wide
-rate limiting — disproportionate for this project's scale and this project's Docker
-Compose has no Redis service).
+**Concurrency guard**: an in-process `asyncio.Semaphore` plus, when `REDIS_URL` is set, a
+cluster-wide cap shared by every worker process (app/limits/redis_semaphore.py; fails open
+to the in-process cap if Redis is down).
 
 Structured behind `WebSearchClientProtocol`, mirroring exactly how
 `bedrock_client.py`'s `BedrockClientProtocol` is structured, so `AgentCoreWebSearchClient`
@@ -59,6 +59,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.config import get_settings
+from app.limits.redis_semaphore import get_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +249,15 @@ class AgentCoreWebSearchClient:
         )
         self._region = region or settings.aws_region
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._max_concurrency = max_concurrency
+
+    def _global_slot(self):
+        """Cluster-wide cap on concurrent searches (Redis; no-op without it - see app/limits)."""
+        return get_semaphore(
+            "web_search",
+            local_limit=None,  # the per-client asyncio.Semaphore above is the local cap
+            global_limit=lambda: get_settings().web_search_global_concurrency or self._max_concurrency,
+        ).slot()
 
     @property
     def is_configured(self) -> bool:
@@ -272,7 +282,7 @@ class AgentCoreWebSearchClient:
             }
         ).encode("utf-8")
 
-        async with self._semaphore:
+        async with self._semaphore, self._global_slot():
             for attempt in range(_MAX_ATTEMPTS):
                 try:
                     headers = _sigv4_headers(

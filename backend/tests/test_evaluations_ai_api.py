@@ -36,9 +36,8 @@ def aws():
         app.dependency_overrides.pop(dep, None)
 
 
-@pytest.fixture()
-def scorecard(db_session, seed_user_id):
-    owner_id = uuid.UUID(seed_user_id)
+def make_scorecard(db_session, owner_id: uuid.UUID) -> dict:
+    """A scorecard (two leaf KPIs with 11 rubric levels, a current version) owned by `owner_id`."""
     sc = Scorecard(name="API AI Scorecard", owner_id=owner_id, domain="Hackathon")
     db_session.add(sc)
     db_session.flush()
@@ -56,6 +55,11 @@ def scorecard(db_session, seed_user_id):
             db_session.add(KpiGuideline(kpi_node_id=nid, score_level=level, qualitative_text=f"L{level}"))
     db_session.commit()
     return {"id": str(sc.id), "version_id": str(version.id), "empty_id": _empty_scorecard(db_session, owner_id)}
+
+
+@pytest.fixture()
+def scorecard(db_session, seed_user_id):
+    return make_scorecard(db_session, uuid.UUID(seed_user_id))
 
 
 def _empty_scorecard(db_session, owner_id) -> str:
@@ -292,12 +296,18 @@ def test_job_validation_errors(client: TestClient, seed_user_id: str, scorecard,
                      ).status_code == 422
 
 
-def test_job_upload_key_must_belong_to_user(client: TestClient, seed_user_id: str, scorecard, aws) -> None:
+def test_job_upload_key_must_belong_to_user(client: TestClient, db_session, seed_user_id: str, scorecard, aws) -> None:
     f = init_uploads(client, seed_user_id, [{"name": "a.pdf", "size": 100}]).json()["files"][0]
     ok = post_jobs(client, seed_user_id, scorecard["id"], [{"sources": [{"kind": "upload", "s3_key": f["s3_key"]}]}])
     assert ok.status_code == 202
     other = client.post("/api/v1/users", json={"email": "other@x.com", "name": "Other"}, headers=H(seed_user_id)).json()
-    stolen = post_jobs(client, other["id"], scorecard["id"], [{"sources": [{"kind": "upload", "s3_key": f["s3_key"]}]}])
+    # The other user may not evaluate against this scorecard at all (404) ...
+    items = [{"sources": [{"kind": "upload", "s3_key": f["s3_key"]}]}]
+    foreign = post_jobs(client, other["id"], scorecard["id"], items)
+    assert foreign.status_code == 404
+    # ... and even against their OWN scorecard they cannot attach a file uploaded by someone else.
+    mine = make_scorecard(db_session, uuid.UUID(other["id"]))
+    stolen = post_jobs(client, other["id"], mine["id"], items)
     assert stolen.status_code == 422
 
 

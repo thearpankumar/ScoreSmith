@@ -71,7 +71,7 @@ def test_delete_scorecard_with_evaluations_removes_everything(
 
     assert client.get(f"/api/v1/scorecards/{scorecard_id}", headers=headers).status_code == 404
     assert client.get(f"/api/v1/evaluations/{evaluation_id}", headers=headers).status_code == 404
-    assert client.get(f"/api/v1/scorecards/{scorecard_id}/versions", headers=headers).json() == []
+    assert client.get(f"/api/v1/scorecards/{scorecard_id}/versions", headers=headers).status_code == 404
 
 
 def test_delete_scorecard_leaves_other_scorecards_evaluations_alone(

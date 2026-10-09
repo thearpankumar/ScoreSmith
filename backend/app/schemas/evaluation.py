@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.models.enums import EvaluationStatus, RagBand
 from app.schemas.common import ORMBase
@@ -41,13 +41,28 @@ class EvaluationKpiResultRead(ORMBase):
     updated_at: datetime
 
 
+# Statuses owned by the AI pipeline (dispatcher / workers). A client must never set them directly: a PATCH to
+# `queued` / `ingesting` / ... would make a worker pick up (and spend money on) an arbitrary row, or fake a
+# lease-less "active" evaluation. Use POST /evaluations/{id}/retry and /cancel instead.
+PIPELINE_STATUSES = frozenset(
+    {EvaluationStatus.QUEUED, EvaluationStatus.INGESTING, EvaluationStatus.PROCESSING, EvaluationStatus.SCORING}
+)
+
+
+def _client_settable(value: EvaluationStatus | None) -> EvaluationStatus | None:
+    if value in PIPELINE_STATUSES:
+        raise ValueError("status is managed by the evaluation pipeline; use the retry / cancel endpoints.")
+    return value
+
+
 class EvaluationCreate(BaseModel):
     scorecard_version_id: uuid.UUID
     name: str
-    evaluated_by: uuid.UUID
     input_reference: dict | None = None
     status: EvaluationStatus = EvaluationStatus.PENDING
     domain: str | None = None
+
+    _check_status = field_validator("status")(_client_settable)
 
 
 class EvaluationUpdate(BaseModel):
@@ -56,6 +71,8 @@ class EvaluationUpdate(BaseModel):
     final_weighted_score: float | None = Field(default=None, ge=0, le=10)
     rag_band: RagBand | None = None
     submitted_at: datetime | None = None
+
+    _check_status = field_validator("status")(_client_settable)
 
 
 class EvaluationRead(ORMBase):

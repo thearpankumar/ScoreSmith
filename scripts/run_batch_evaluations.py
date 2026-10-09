@@ -16,20 +16,25 @@ re-upload for upload failures). State is persisted after every change, so a re-r
     python scripts/run_batch_evaluations.py --check                        # preflight, uploads nothing
     python scripts/run_batch_evaluations.py                                # canary, then everything
     python scripts/run_batch_evaluations.py --resume                       # after Ctrl+C / a crash
-    python scripts/run_batch_evaluations.py --list-users | --list-scorecards
+    python scripts/run_batch_evaluations.py --list-scorecards
+
+Authentication: the script signs in as the evaluator with --email / EVAL_EMAIL and the password from the
+EVAL_PASSWORD environment variable (or a hidden prompt) - never on the command line. It uses the short-lived
+bearer token that POST /api/v1/auth/login returns and signs in again when it expires. The scorecard must belong
+to that account (set a password for an existing account with `python -m app.scripts.set_password <email>`).
 
 The scorecard is found by --scorecard-name (default: "Connected Vehicle Intelligence Hackathon Solution
-Document Evaluation"; --scorecard-id overrides) and the evaluator by --user-id / EVAL_USER_ID, else
-discovered from the API (the scorecard's owner, or the only user).
+Document Evaluation"; --scorecard-id overrides).
 
 Stdlib only. Nothing is read from any .env file; config comes from flags or the environment variables
-BACKEND_URL, EVAL_USER_ID and SCORECARD_ID.
+BACKEND_URL, EVAL_EMAIL, EVAL_PASSWORD and SCORECARD_ID.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import getpass
 import json
 import math
 import os
@@ -60,7 +65,6 @@ CONTENT_TYPES = {
 MAX_FILES = 10  # backend: upload_max_files per submission
 MAX_FILE_BYTES = 2 * 1024**3  # backend: upload_max_bytes
 DEFAULT_SCORECARD_NAME = "Connected Vehicle Intelligence Hackathon Solution Document Evaluation"
-NIL_UUID = "00000000-0000-0000-0000-000000000000"
 TERMINAL = frozenset({"completed", "failed"})
 MP4_BOXES = (b"moov", b"mdat", b"wide", b"free", b"skip")
 
@@ -412,18 +416,45 @@ def _detail(raw: str) -> str:
 
 
 class Api:
-    def __init__(self, base: str, user_id: str, timeout: float = 60.0, attempts: int = 4, ignore_stop: bool = False):
-        self.base, self.user_id, self.timeout, self.attempts = base.rstrip("/"), user_id, timeout, attempts
+    """Signs in with e-mail + password (POST /auth/login) and sends the short-lived bearer token; a 401 triggers one
+    re-login. Clones made by `clone()` share the credentials and token."""
+
+    def __init__(self, base: str, email: str, password: str, timeout: float = 60.0, attempts: int = 4,
+                 ignore_stop: bool = False, _shared: dict | None = None):
+        self.base, self.timeout, self.attempts = base.rstrip("/"), timeout, attempts
         self.ignore_stop = ignore_stop  # abort calls must still go out after Ctrl+C
+        self._auth = _shared if _shared is not None else {"email": email, "password": password, "token": None}
+        self.user_id: str | None = None
+
+    def clone(self, **kw) -> "Api":
+        return Api(self.base, "", "", _shared=self._auth, **kw)
+
+    def _login(self) -> None:
+        body = json.dumps({"email": self._auth["email"], "password": self._auth["password"]}).encode()
+        req = urllib.request.Request(
+            self.base + "/api/v1/auth/login", data=body, method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                self._auth["token"] = json.loads(r.read())["access_token"]
+        except urllib.error.HTTPError as e:
+            raise Fatal(f"Sign-in failed ({e.code}): {_detail(e.read().decode('utf-8', 'replace'))}") from e
+        except (urllib.error.URLError, OSError) as e:
+            raise Fatal(f"cannot reach {self.base} ({e})") from e
 
     def call(self, method: str, path: str, body: object | None = None):
         data = json.dumps(body).encode() if body is not None else None
-        headers = {"Accept": "application/json", "X-User-Id": self.user_id}
-        if data is not None:
-            headers["Content-Type"] = "application/json"
         for i in range(self.attempts):
             if STOP.is_set() and not self.ignore_stop:
                 raise Interrupted()
+            if path != "/health" and not self._auth["token"]:
+                self._login()
+            headers = {"Accept": "application/json"}
+            if self._auth["token"]:
+                headers["Authorization"] = f"Bearer {self._auth['token']}"
+            if data is not None:
+                headers["Content-Type"] = "application/json"
             try:
                 req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
                 with urllib.request.urlopen(req, timeout=self.timeout) as r:
@@ -431,6 +462,9 @@ class Api:
                     return json.loads(raw) if raw else None
             except urllib.error.HTTPError as e:
                 detail = _detail(e.read().decode("utf-8", "replace"))
+                if e.code == 401 and self._auth["token"] and i < self.attempts - 1:
+                    self._auth["token"] = None  # expired: sign in again and retry
+                    continue
                 if e.code == 503 and "not configured" in detail.lower():
                     raise Fatal(
                         f"{detail}\nThe backend has no S3/Step Functions configured (OR_S3_BUCKET, "
@@ -492,7 +526,7 @@ class Registry:
 
 def abort_upload(api: Api, key: str, upload_id: str) -> None:
     try:
-        Api(api.base, api.user_id, attempts=2, ignore_stop=True).post(
+        api.clone(attempts=2, ignore_stop=True).post(
             f"{API}/ai/uploads/abort", {"files": [{"upload_id": upload_id, "s3_key": key}]}
         )
     except Exception as e:  # noqa: BLE001 - best effort
@@ -652,7 +686,7 @@ def explain(e: Exception) -> str:
 
 def check_fatal(e: ApiError) -> None:
     if e.status in (401, 403):
-        raise Fatal(f"The backend rejected the user ({e.detail}). Check --user-id (try --list-users).") from e
+        raise Fatal(f"The backend rejected the request ({e.detail}). Check --email / EVAL_PASSWORD.") from e
 
 
 def fetch_diagnostics(ctx: Ctx, folder: str) -> None:
@@ -897,7 +931,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sheet", type=Path, default=None,
                    help="submissions .xlsx with Email/Name columns (default: first .xlsx in scripts/SampleFiles)")
     p.add_argument("--api-base", default=os.environ.get("BACKEND_URL", "http://localhost:8000"))
-    p.add_argument("--user-id", default=os.environ.get("EVAL_USER_ID"), help="evaluator user UUID (X-User-Id)")
+    p.add_argument("--email", default=os.environ.get("EVAL_EMAIL"), help="evaluator account e-mail (password: EVAL_PASSWORD)")
     p.add_argument("--scorecard-id", default=os.environ.get("SCORECARD_ID"), help="overrides --scorecard-name")
     p.add_argument("--scorecard-name", default=DEFAULT_SCORECARD_NAME,
                    help="resolved via GET /scorecards: exact (case-insensitive) match, else a unique 'contains'")
@@ -920,7 +954,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true", help="re-attach to evaluations the state file says are running")
     p.add_argument("--dry-run", action="store_true", help="print the plan; no network calls at all")
     p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
-    p.add_argument("--list-users", action="store_true")
     p.add_argument("--list-scorecards", action="store_true")
     return p
 
@@ -967,30 +1000,19 @@ def resolve_scorecard(api: Api, args: argparse.Namespace) -> dict:
 
 
 def resolve_user(api: Api, args: argparse.Namespace, scorecard: dict) -> str:
-    """--user-id / EVAL_USER_ID, else discover via GET /users (no auth): the scorecard's owner, or the only user."""
-    if args.user_id:
-        try:
-            api.get(f"/api/v1/users/{args.user_id}")
-        except ApiError as e:
-            if e.status == 404:
-                raise Fatal(f"User {args.user_id} does not exist (try --list-users).") from e
-            raise
-        return args.user_id
-    users = api.get("/api/v1/users?limit=200") or []
-    by_id = {u["id"]: u for u in users}
-    owner = scorecard.get("owner_id")
-    if owner in by_id:
-        o = by_id[owner]
-        log(f"No --user-id given: using the scorecard's owner {o.get('name')} <{o.get('email')}> {owner}")
-        return owner
-    if len(users) == 1:
-        u = users[0]
-        log(f"No --user-id given: using the only user {u.get('name')} <{u.get('email')}> {u['id']}")
-        return u["id"]
-    listing = "\n".join(f"  {u['id']}  {u.get('name')} <{u.get('email')}>" for u in users[:30]) or "  (no users yet)"
-    raise Fatal("Could not pick an evaluator automatically. Pass --user-id <uuid> (or set EVAL_USER_ID). "
-                "Users in the database:\n" + listing
-                + "\nIf empty: open the app once or POST /api/v1/users, or read the id from the `users` table.")
+    """The signed-in evaluator's id (GET /me). The scorecard must be one this account owns."""
+    me = api.get("/api/v1/me")
+    if scorecard.get("owner_id") not in (None, me["id"]):
+        raise Fatal(f"Scorecard {scorecard['id']} does not belong to {me['email']}.")
+    log(f"Signed in as {me.get('name')} <{me.get('email')}> {me['id']}")
+    return me["id"]
+
+
+def make_api(args: argparse.Namespace) -> Api:
+    if not args.email:
+        raise Fatal("Pass --email (or set EVAL_EMAIL); the password comes from EVAL_PASSWORD or a hidden prompt.")
+    password = os.environ.get("EVAL_PASSWORD") or getpass.getpass(f"Password for {args.email}: ")
+    return Api(args.api_base, args.email, password)
 
 
 def probe_storage(api: Api) -> None:
@@ -1010,9 +1032,8 @@ def run_check(ctx_args: argparse.Namespace, api: Api, selected: list[Student], n
         raise Fatal(f"Backend not reachable: {e}") from e
     sc = resolve_scorecard(api, ctx_args)
     log(f"OK  scorecard: {sc['name']} [{sc.get('domain')}] id={sc['id']} status={sc.get('status')}")
-    ctx_args.user_id = resolve_user(api, ctx_args, sc)
-    api.user_id = ctx_args.user_id
-    log(f"OK  evaluator user id: {ctx_args.user_id}")
+    api.user_id = resolve_user(api, ctx_args, sc)
+    log(f"OK  evaluator user id: {api.user_id}")
     try:
         probe_storage(api)
         log("OK  upload init + abort works (S3 multipart is configured); nothing was stored")
@@ -1034,14 +1055,10 @@ def run(args: argparse.Namespace) -> int:
     root: Path = args.gdrive_dir
     if args.batch_size < 1:
         raise Fatal("--batch-size must be >= 1")
-    if args.list_users or args.list_scorecards:
-        api = Api(args.api_base, args.user_id or NIL_UUID)
-        if args.list_users:
-            for u in api.get("/api/v1/users?limit=200"):
-                log(f"{u['id']}  {u.get('name')}  <{u.get('email')}>")
-        if args.list_scorecards:
-            for s in api.get("/api/v1/scorecards?limit=200"):
-                log(f"{s['id']}  {s.get('name')}  [{s.get('domain')}]  status={s.get('status')}")
+    if args.list_scorecards:
+        api = make_api(args)
+        for s in api.get("/api/v1/scorecards?limit=200"):
+            log(f"{s['id']}  {s.get('name')}  [{s.get('domain')}]  status={s.get('status')}")
         return 0
 
     students_all, not_downloaded = scan_all(root, args.sheet)
@@ -1064,14 +1081,13 @@ def run(args: argparse.Namespace) -> int:
         log("Dry run: nothing was uploaded or created.")
         return 0
 
-    api = Api(args.api_base, args.user_id or NIL_UUID)
+    api = make_api(args)
     if args.check:
         return run_check(args, api, selected, not_downloaded)
-    scorecard = resolve_scorecard(api, args)  # read-only calls; needs no evaluator identity
+    scorecard = resolve_scorecard(api, args)
     args.scorecard_id = scorecard["id"]
-    args.user_id = resolve_user(api, args, scorecard)
-    api.user_id = args.user_id
-    log(f"Scorecard: {scorecard['name']} [{scorecard.get('domain')}]  evaluator: {args.user_id}")
+    api.user_id = resolve_user(api, args, scorecard)
+    log(f"Scorecard: {scorecard['name']} [{scorecard.get('domain')}]  evaluator: {api.user_id}")
     state_path = args.state or root / ".batch_eval_state.json"
     report_path = args.report or root / ".batch_eval_report.json"
     state = State.load(state_path, args.scorecard_id)

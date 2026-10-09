@@ -48,6 +48,7 @@ async def find_similar_by_vector(
     *,
     top_n: int = 5,
     threshold: float = SIMILARITY_THRESHOLD,
+    owner_id: uuid.UUID | None = None,
 ) -> list[SimilarScorecardResult]:
     distance = ScorecardEmbedding.embedding.cosine_distance(query_vector)
     stmt = (
@@ -64,6 +65,8 @@ async def find_similar_by_vector(
         .order_by(distance)
         .limit(top_n)
     )
+    if owner_id is not None:  # only the caller's own scorecards are ever suggested
+        stmt = stmt.where(Scorecard.owner_id == owner_id)
     rows = (await db.execute(stmt)).all()
     results = [
         SimilarScorecardResult(
@@ -86,6 +89,7 @@ async def find_similar_scorecards(
     *,
     top_n: int = 5,
     threshold: float = SIMILARITY_THRESHOLD,
+    owner_id: uuid.UUID | None = None,
 ) -> list[SimilarScorecardResult]:
     query_vector = bedrock.embed(query_text)
-    return await find_similar_by_vector(db, query_vector, top_n=top_n, threshold=threshold)
+    return await find_similar_by_vector(db, query_vector, top_n=top_n, threshold=threshold, owner_id=owner_id)

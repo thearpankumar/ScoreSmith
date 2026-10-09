@@ -52,7 +52,7 @@ export function GuidelinesMatrix({ kpiNodes, evaluations }: { kpiNodes: KpiNode[
             id="highlight-eval"
             value={highlightEvalId}
             onChange={(e) => setHighlightEvalId(e.target.value)}
-            className="h-9 rounded-lg border border-hairline bg-solid px-2.5 text-sm text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
+            className="h-9 glass-field rounded-lg px-2.5 text-sm text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
           >
             <option value="none">None</option>
             {evaluations.map((ev) => (

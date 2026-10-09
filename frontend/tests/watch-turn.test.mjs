@@ -21,7 +21,7 @@ globalThis.fetch = async (url, init = {}) => {
   if (method === "POST" && u.endsWith("/chat/sessions")) return json(202, turn({ turn_in_progress: true }));
   if (method === "POST" && u.endsWith("/messages")) return json(202, turn({ turn_in_progress: true }));
   if (method === "POST" && u.endsWith("/cancel")) return { ok: true, status: 204, statusText: "", text: async () => "" };
-  if (u.includes("/users")) return json(200, [{ id: "u1", email: "designer@qualityscorecard.local", name: "A", role: "admin", created_at: "" }]);
+  if (/\/api\/v1\/me($|\?)/.test(u)) return json(200, { id: "u1", email: "designer@qualityscorecard.local", name: "A", role: "member", created_at: "" });
   const next = script.shift();
   if (next instanceof Error) throw next;
   return json(next.status ?? 200, next.body);
@@ -90,7 +90,7 @@ test("404 (deleted session) rejects; cancel hits POST /cancel; 409 is an ApiErro
   await api.cancelChatTurn("sid");
   assert.ok(calls.includes("POST /chat/sessions/sid/cancel"));
   const f = globalThis.fetch;
-  globalThis.fetch = async (u, i) => (String(u).includes("/users") ? f(u, i) : json(409, { detail: "busy" }));
+  globalThis.fetch = async (u, i) => (/\/api\/v1\/me($|\?)/.test(String(u)) ? f(u, i) : json(409, { detail: "busy" }));
   await assert.rejects(api.startChatTurn({ sessionId: "sid", message: "x" }), { status: 409 });
   globalThis.fetch = f;
 });

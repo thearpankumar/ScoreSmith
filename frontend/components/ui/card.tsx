@@ -3,16 +3,15 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 
 /**
- * Base Card primitive (shadcn convention). This renders as a solid,
- * `--hairline`-bordered surface by default — appropriate for most content
- * cards. For chrome/hero/modal surfaces that should use glassmorphism, wrap
- * content in `<GlassCard>` (components/design-system/GlassCard.tsx) instead.
+ * Base Card primitive (shadcn convention). Renders as a `.glass` surface (see globals.css).
+ * For dense data (tables, matrices) put a `.solid-panel` / `<SolidPanel>` inside or pass
+ * `className="solid-panel"` to opt out.
  */
 const Card = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
   ({ className, ...props }, ref) => (
     <div
       ref={ref}
-      className={cn("solid-panel rounded-2xl text-ink", className)}
+      className={cn("glass rounded-2xl text-ink", className)}
       {...props}
     />
   ),

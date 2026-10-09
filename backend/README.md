@@ -17,7 +17,8 @@ Phase 0 + Cycle 1 (Data Foundation + core CRUD API) of the Quality Scorecard Sys
    easiest is the same image the project uses everywhere else:
 
    ```bash
-   docker run -d --name qs_dev_pg -e POSTGRES_USER=qs_app -e POSTGRES_PASSWORD=qs_dev_password \
+   export PGPW="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"   # keep it; also used in step 3
+   docker run -d --name qs_dev_pg -e POSTGRES_USER=qs_app -e POSTGRES_PASSWORD="$PGPW" \
      -e POSTGRES_DB=quality_scorecard -p 5432:5432 pgvector/pgvector:pg17
    ```
 
@@ -34,10 +35,13 @@ Phase 0 + Cycle 1 (Data Foundation + core CRUD API) of the Quality Scorecard Sys
 3. **Environment variable** — everything reads `DATABASE_URL` (must be a `postgresql+psycopg://` URL):
 
    ```bash
-   export DATABASE_URL="postgresql+psycopg://qs_app:qs_dev_password@localhost:5432/quality_scorecard"
+   export DATABASE_URL="postgresql+psycopg://qs_app:${PGPW}@localhost:5432/quality_scorecard"
    ```
 
-   (Windows PowerShell: `$env:DATABASE_URL = "postgresql+psycopg://qs_app:qs_dev_password@localhost:5432/quality_scorecard"`)
+   (Windows PowerShell: `$env:DATABASE_URL = "postgresql+psycopg://qs_app:<your password>@localhost:5432/quality_scorecard"`)
+
+   There is no default database password and no default `JWT_SECRET` in the code. Outside production an unset
+   `JWT_SECRET` becomes an ephemeral random key (with a warning); set `JWT_SECRET` for anything long-lived.
 
 4. **Run migrations**:
 
@@ -129,24 +133,56 @@ printed report distinguishes `created` / `rejected_as_expected` / `flawed_but_in
 
 ## API
 
-All routes are mounted under `/api/v1` (see `app/api/v1/router.py`): `users`,
-`scorecards` (+ nested `versions`, and KPI node endpoints at `/api/v1/scorecard-versions/*`
-and `/api/v1/kpi-nodes/*`, since KPI nodes are addressed by their own id once created), and
-`evaluations` (+ nested `results`).
+All routes are mounted under `/api/v1` (see `app/api/v1/router.py`): `auth` (signup, login, refresh, logout,
+logout-all, forgot / reset password, verify e-mail, OAuth), `me`, `scorecards` (+ nested `versions`, and KPI node
+endpoints at `/api/v1/scorecard-versions/*` and `/api/v1/kpi-nodes/*`, since KPI nodes are addressed by their own id
+once created), `evaluations` (+ nested `results`, AI jobs / uploads / progress / export) and `chat`.
 
-**Auth is a dev-only stub** (`app/deps.py::get_current_user`): it trusts an `X-User-Id`
-header (a raw user UUID) or a `Authorization: Bearer <user-id>` token, with no signature
-verification. This is explicitly **not** production auth — real OIDC is deferred per the
-plan. It is applied uniformly to every mutating route (every `POST`/`PATCH`/`DELETE`)
-across every router — `users`, `scorecards` (+ versions), `kpi-nodes` (+ guidelines,
-including the bulk endpoints), `evaluations` (+ results, + `/run`), and `chat` (both
-starting and continuing a session) — so every write has an identity attached. The one
-deliberate exception is `POST /api/v1/scorecards/suggest-similar`, which is a read-only
-search/query endpoint (POST only because it takes a query body), not a create/update/delete.
-Note the bootstrap implication: since `POST /api/v1/users` itself now requires an existing
-authenticated user, the very first user in a fresh database must be created directly (the
-seed script does this — see "Seeding" below — it writes `User` rows directly via
-SQLAlchemy, never through the HTTP API) rather than through this endpoint.
+**Authentication** (`app/auth/`, `app/deps.py::get_current_user`): a 15-minute HS256 access JWT (`sub`, `exp`,
+`jti`) plus an opaque, rotating refresh token stored hashed (replaying an already-rotated token revokes the whole
+family). The browser gets them as httpOnly, SameSite=Lax cookies (`Secure` in production) plus a readable CSRF
+cookie: cookie-authenticated `POST`/`PATCH`/`PUT`/`DELETE` must send the same value in `X-CSRF-Token` and a friendly
+`Origin`. Scripts can use `Authorization: Bearer <access_token>` from `POST /auth/login` (no CSRF needed). Passwords
+are Argon2id (OWASP profile: 19 MiB, 2 iterations, 1 lane), minimum 12 characters. Failed logins lock the account
+with doubling backoff; auth routes are rate limited per IP (and logins per e-mail), expensive routes (chat, AI jobs,
+uploads, export) per user - Redis-backed when `REDIS_URL` is set, in-process otherwise. The old `X-User-Id` header
+and `Bearer <user-uuid>` are gone. Run with `ENV=production` the API and worker refuse to start with a
+missing/weak `JWT_SECRET`/DB password, `localhost`/`*` CORS or frontend URL, or `EMAIL_BACKEND=log`; `/docs` is off,
+cookies are `Secure` and HSTS is sent. (`ENVIRONMENT=production` is accepted as an alias of `ENV=production`.)
+
+**Ownership** (`app/authz.py`): every resource belongs to one user and every endpoint that takes an id loads it
+through an owner-scoped helper that answers **404** (never 403) for someone else's data. Scorecards, versions, KPI
+nodes and guidelines follow `scorecards.owner_id`; evaluations follow `evaluations.owner_id` *or* the owner of their
+scorecard (a scorecard owner sees every evaluation of it, an evaluator only their own); batches `created_by`; chat
+sessions `user_id`. Owner / evaluator ids are always taken from the token, never from the request body. Upload
+keys (`uploads/{user}/...`, `batches/{user}/...`) are bound to the user they were issued to. There is no public user
+directory: `GET`/`PATCH /api/v1/me` only.
+
+**First admin and user management** (`app/auth/bootstrap.py`, `POST /api/v1/auth/register-user`). Roles: `admin`
+and `member` (any other legacy value counts as an ordinary user). The role is never accepted from signup (a `role`
+field is a 422) or `PATCH /me` (ignored); only an admin can grant `admin`.
+
+- *Development* (`ENV` not `production`): set `ADMIN_EMAIL` + `ADMIN_PASSWORD` in `infra/.env`. On startup the api and
+  every worker replica create that admin (email-verified, Argon2id) if no user has the address - serialised by a
+  Postgres advisory lock, so replicas never create two, and an existing user is never touched (no password reset).
+  The password must meet the admin policy (14+ characters with 3 character classes, or a 20+ character passphrase)
+  and is never logged.
+- *Production* (`ENV=production`): `ADMIN_EMAIL`/`ADMIN_PASSWORD` are **ignored** (a warning is logged). Set a
+  one-time `BOOTSTRAP_TOKEN` (32+ random characters), then create the first admin once:
+  `curl -X POST https://HOST/api/v1/auth/register-user -H 'Content-Type: application/json' -H "X-Bootstrap-Token: $BOOTSTRAP_TOKEN" -d '{"email":"admin@corp.com","name":"Admin","password":"<strong>"}'`
+  (or open `/setup` in the web app). It only works while **zero** users exist, compares the token in constant
+  time, is rate limited (`RATE_LIMIT_REGISTER_USER`, 5/min per IP), audit logged (`bootstrap_token_rejected`,
+  `bootstrap_admin_created`) and answers 404 for good once any user exists. Remove `BOOTSTRAP_TOKEN` afterwards.
+- *Afterwards*: a signed-in admin creates users with the same endpoint (`{"email","name","password","role"}`, role
+  `member` by default). Public signup (and OAuth account creation) is controlled by `SIGNUP_ENABLED` - default on
+  in development, **off in production**; the web app hides "Sign up" when it is off.
+- `python -m app.scripts.set_password <email> [--create] [--role admin]` remains as an operator CLI (recover an
+  admin, claim an account that has no password, e.g. rows created by the seed script).
+
+**Existing data**: migration `0012` does not rewrite ownership. Rows created before login existed (such as the
+seed script's demo owner) belong to a user without a password: claim it with `set_password <that email>` and sign in
+as it; anyone else signs up (or is registered by an admin) and starts with an empty workspace. In local dev
+(`EMAIL_BACKEND=log`) reset / verification links are written to the API log.
 
 **Weight-sum trigger and the API**: because the weight-sum-to-100 rule is a *deferred*
 constraint trigger that only fires at transaction `COMMIT`, and each HTTP request is its

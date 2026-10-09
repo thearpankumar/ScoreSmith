@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 
 import { cn } from "@/lib/utils";
 import { NAV_ITEMS } from "./nav-items";
+import { SignOutTab } from "./UserMenu";
 
 /**
  * Mobile bottom bar (replaces `NavRail`, which is `md:`-and-up only). Glass chrome per
@@ -24,7 +25,7 @@ export function BottomBar() {
   return (
     <nav
       aria-label="Primary"
-      className="glass-elev-2 fixed inset-x-3 bottom-3 z-40 flex items-center justify-around rounded-2xl px-1 py-1.5 md:hidden"
+      className="glass-strong fixed inset-x-3 bottom-3 z-40 flex items-center justify-around rounded-2xl px-1 py-1.5 md:hidden"
     >
       {NAV_ITEMS.map((item) => {
         const active = pathname.startsWith(item.href);
@@ -45,6 +46,7 @@ export function BottomBar() {
           </Link>
         );
       })}
+      <SignOutTab />
     </nav>
   );
 }

@@ -18,10 +18,13 @@ RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
-# Applies pending Alembic migrations (idempotent; needs DATABASE_URL, which compose injects)
-# and then starts the API WITHOUT --reload: chat turns now run as long-lived background tasks
-# inside the server process, and an auto-reload (triggered by any edit under the bind-mounted
-# source) would kill them mid-run. After editing backend code, restart the container instead
-# (`docker compose restart backend`); startup recovery marks any interrupted turn as failed.
-# A failing migration is logged but does not stop the API from starting.
-CMD ["sh", "-c", "python -m alembic upgrade head || echo 'WARNING: alembic upgrade head failed - check DATABASE_URL/DB state'; exec python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# The image runs in three roles (see infra/docker-compose.yml):
+#   - migrate : `python -m app.scripts.migrate` - Alembic + checkpoint tables, a one-off job that runs ONCE per
+#               release before anything else starts (it is no longer part of this CMD: several replicas booting
+#               together raced on it).
+#   - backend : this default CMD with ROLE=api - gunicorn supervising uvicorn workers; HTTP only. WEB_CONCURRENCY
+#               sets the worker count; --graceful-timeout lets in-flight requests finish on SIGTERM.
+#   - worker  : `python -m app.worker` with ROLE=worker - evaluation dispatcher + background chat turns.
+# No --reload: long jobs must not be killed by a file change under the bind-mounted source. After editing
+# backend code, restart the containers (`docker compose restart backend worker`).
+CMD ["sh", "-c", "exec gunicorn app.main:app --worker-class uvicorn.workers.UvicornWorker --workers ${WEB_CONCURRENCY:-2} --bind 0.0.0.0:8000 --graceful-timeout 30 --timeout 120 --access-logfile -"]

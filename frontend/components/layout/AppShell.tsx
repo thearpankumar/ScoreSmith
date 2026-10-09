@@ -2,13 +2,18 @@ import type { ReactNode } from "react";
 
 import { NavRail } from "./NavRail";
 import { BottomBar } from "./BottomBar";
+import type { SessionUser } from "./UserMenu";
 
-export function AppShell({ children }: { children: ReactNode }) {
+export function AppShell({ children, user = null }: { children: ReactNode; user?: SessionUser | null }) {
   return (
-    <div className="mx-auto flex w-full max-w-[1400px] gap-4 p-4">
-      <NavRail />
-      <main className="min-w-0 flex-1 pb-20 md:pb-4">{children}</main>
-      <BottomBar />
-    </div>
+    <>
+      {/* Static yellow light behind everything so the glass surfaces have something to blur. */}
+      <div className="app-backdrop" aria-hidden="true" />
+      <div className="relative z-10 mx-auto flex w-full max-w-[1400px] gap-4 p-4">
+        <NavRail user={user} />
+        <main className="min-w-0 flex-1 pb-20 md:pb-4">{children}</main>
+        <BottomBar />
+      </div>
+    </>
   );
 }

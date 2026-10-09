@@ -7,12 +7,16 @@ from datetime import UTC, datetime
 from urllib.parse import quote
 
 import anyio
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.audit import audit
+from app.authz import accessible_evaluation_ids
 from app.db import get_db
 from app.deps import get_current_user
+from app.models.enums import AuditAction
 from app.models.user import User
+from app.ratelimit import rate_limit
 from app.reporting.export_data import load_export_bundle
 from app.reporting.workbook import ExportOptions, build_workbook
 from app.reporting.xlsx_safety import clean_text, slugify_filename
@@ -25,17 +29,27 @@ router = APIRouter(prefix="/evaluations", tags=["evaluations"])
 XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-@router.post("/export", response_class=Response, responses={200: {"content": {XLSX_MEDIA_TYPE: {}}}})
+@router.post(
+    "/export",
+    response_class=Response,
+    responses={200: {"content": {XLSX_MEDIA_TYPE: {}}}},
+    dependencies=[Depends(rate_limit("export", lambda s: s.rate_limit_export, per_user=True))],
+)
 async def export_evaluations(
     payload: EvaluationExportRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # dev auth stub — see app/deps.py
+    current_user: User = Depends(get_current_user),
 ) -> Response:
     """Builds the workbook (Summary with all insights first, Leaderboard when 2+ are exported, Evaluations, KPI
     matrices / detail, one sheet per student, reference sheets, Notes). Only evaluations that are completed with a
     final score are exported; deleted, failed, queued or unscored ones never appear in the workbook and are counted
     in `X-Export-Skipped` (and as one anonymous line on the Notes sheet)."""
-    bundle = await load_export_bundle(db, payload.evaluation_ids)
+    # Only evaluations the caller may access are loaded; ids belonging to someone else behave like missing ones.
+    allowed = await accessible_evaluation_ids(db, current_user, list(dict.fromkeys(payload.evaluation_ids)))
+    bundle = await load_export_bundle(db, allowed)
+    # Ids the caller may not access are reported exactly like ids that do not exist.
+    bundle.missing_ids.extend(i for i in dict.fromkeys(payload.evaluation_ids) if i not in set(allowed))
     scored = [e for e in bundle.evaluations if e.is_scored]
     if not scored:
         if bundle.evaluations or bundle.excluded_count:
@@ -57,7 +71,14 @@ async def export_evaluations(
     cards = {e.scorecard_name for e in scored}
     slug = slugify_filename(next(iter(cards))) if len(cards) == 1 else "multi"
     filename = f"evaluations_{slug}_{generated_at.strftime('%Y%m%d-%H%M')}.xlsx"
-    skipped = len(bundle.missing_ids) + bundle.excluded_count + (len(bundle.evaluations) - len(scored))
+    skipped = (
+        len(bundle.missing_ids)
+        + bundle.excluded_count
+        + (len(bundle.evaluations) - len(scored))
+    )
+    audit(db, request, actor_id=current_user.id, entity_type="evaluation_export", entity_id=current_user.id,
+          action=AuditAction.CREATE, event="export", diff={"count": len(scored)})
+    await db.commit()
     logger.info(
         "evaluation export: user=%s requested=%d found=%d scored=%d skipped=%d bytes=%d",
         current_user.id, len(payload.evaluation_ids), len(bundle.evaluations), len(scored), skipped, len(content),

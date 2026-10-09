@@ -18,7 +18,7 @@ class EvaluationBatch(UUIDPKMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("scorecards.id", ondelete="CASCADE"), nullable=False, index=True
     )
     created_by: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     source_filename: Mapped[str | None] = mapped_column(String(512), nullable=True)
     row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

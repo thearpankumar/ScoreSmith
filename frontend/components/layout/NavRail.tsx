@@ -6,9 +6,11 @@ import { PanelLeftClose, PanelLeftOpen, Plus } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { usePersistedState } from "@/lib/usePersistedState";
+import { BrandMark } from "@/components/auth/BrandLogo";
 import { useChatSessions } from "@/components/chat/ChatSessionsContext";
 import { ChatSessionNavList } from "@/components/chat/ChatSessionNavList";
 import { NAV_ITEMS } from "./nav-items";
+import { UserMenu, type SessionUser } from "./UserMenu";
 
 const STORAGE_KEY = "qs.navRailCollapsed";
 
@@ -51,7 +53,7 @@ const STORAGE_KEY = "qs.navRailCollapsed";
  * data source (`ChatSessionsContext`) instead of a second, competing one, while avoiding
  * chat-list clutter on unrelated pages.
  */
-export function NavRail() {
+export function NavRail({ user = null }: { user?: SessionUser | null }) {
   const pathname = usePathname();
   const [collapsed, setCollapsed] = usePersistedState(STORAGE_KEY, false);
   const { sessions } = useChatSessions();
@@ -65,15 +67,13 @@ export function NavRail() {
     <nav
       aria-label="Primary"
       className={cn(
-        "glass-elev-1 sticky top-4 hidden h-[calc(100vh-2rem)] shrink-0 flex-col gap-1 rounded-2xl p-4 transition-[width] duration-150 md:flex",
+        "glass sticky top-4 hidden h-[calc(100vh-2rem)] shrink-0 flex-col gap-1 rounded-2xl p-4 transition-[width] duration-150 md:flex",
         collapsed ? "w-[4.5rem] items-center px-2" : "w-60",
       )}
     >
       <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-hidden">
         <div className={cn("mb-4 flex shrink-0 items-center gap-2", collapsed ? "justify-center px-0" : "px-2")}>
-          <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-lemon text-sm font-bold text-lemon-ink">
-            QS
-          </span>
+          <BrandMark className="h-8 w-auto shrink-0" />
           {!collapsed && <span className="text-sm font-semibold text-ink">Quality Scorecards</span>}
         </div>
 
@@ -119,6 +119,7 @@ export function NavRail() {
             />
           ))}
         </div>
+        <UserMenu user={user} collapsed={collapsed} />
       </div>
 
       {/* Collapse toggle: straddles the rail's right edge at mid-height, so it reads as a
@@ -129,7 +130,7 @@ export function NavRail() {
         aria-expanded={!collapsed}
         aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
         title={collapsed ? "Expand navigation" : "Collapse navigation"}
-        className="absolute top-1/2 -right-3.5 z-10 flex size-7 -translate-y-1/2 items-center justify-center rounded-full border border-hairline bg-solid text-ink-muted shadow-sm transition-colors hover:bg-lemon hover:text-lemon-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
+        className="absolute top-1/2 -right-3.5 z-10 flex size-7 -translate-y-1/2 items-center justify-center rounded-full glass-tint glass-interactive text-ink-muted transition-colors hover:bg-lemon hover:text-lemon-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
       >
         {collapsed ? <PanelLeftOpen className="size-4" aria-hidden /> : <PanelLeftClose className="size-4" aria-hidden />}
       </button>
@@ -169,7 +170,7 @@ function NavItemLink({
         "flex shrink-0 items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors",
         "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]",
         collapsed && "w-full justify-center px-0",
-        active ? "bg-lemon text-lemon-ink font-semibold shadow-sm" : "text-ink-muted hover:bg-black/5 hover:text-ink",
+        active ? "bg-lemon text-lemon-ink font-semibold shadow-sm" : "text-ink-muted hover:bg-white/60 hover:text-ink",
       )}
     >
       <Icon className="size-4.5 shrink-0" aria-hidden />

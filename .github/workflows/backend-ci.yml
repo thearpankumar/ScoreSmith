@@ -20,8 +20,11 @@ env:
   # Real Postgres service below, real psycopg (v3) URL — schema needs the `vector` and
   # `ltree` extensions, which is why the service uses the pgvector/pgvector:pg17 image
   # (see backend/alembic/versions/0001_initial_schema.py) rather than plain `postgres`.
-  DATABASE_URL: postgresql+psycopg://qs_app:qs_ci_password@localhost:5432/quality_scorecard
-  TEST_DATABASE_URL: postgresql+psycopg://qs_app:qs_ci_password@localhost:5432/quality_scorecard_test
+  # The Postgres service container is throwaway and uses trust auth (see below), so no password exists at all.
+  DATABASE_URL: postgresql+psycopg://qs_app@localhost:5432/quality_scorecard
+  TEST_DATABASE_URL: postgresql+psycopg://qs_app@localhost:5432/quality_scorecard_test
+  # Real Redis (service below) for the cluster-wide limiter tests; they are skipped when this is unset.
+  TEST_REDIS_URL: redis://localhost:6379/0
   # No real AWS/Bedrock/AgentCore calls happen anywhere in the test suite (every AI-layer
   # test injects FakeBedrockClient / FakeWebSearchClient — see backend/tests/fakes.py), so
   # these are dummy/empty values, matching infra/.env.example's defaults.
@@ -42,7 +45,7 @@ jobs:
         image: pgvector/pgvector:pg17
         env:
           POSTGRES_USER: qs_app
-          POSTGRES_PASSWORD: qs_ci_password
+          POSTGRES_HOST_AUTH_METHOD: trust  # ephemeral CI database: no password to leak
           POSTGRES_DB: quality_scorecard
         ports:
           - 5432:5432
@@ -50,6 +53,16 @@ jobs:
           --health-cmd "pg_isready -U qs_app -d quality_scorecard"
           --health-interval 5s
           --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
           --health-retries 10
 
     steps:
@@ -68,7 +81,7 @@ jobs:
 
       - name: Create dedicated test database
         run: |
-          PGPASSWORD=qs_ci_password psql -h localhost -U qs_app -d quality_scorecard \
+          psql -h localhost -U qs_app -d quality_scorecard \
             -c "CREATE DATABASE quality_scorecard_test OWNER qs_app;"
 
       - name: Run Alembic migrations

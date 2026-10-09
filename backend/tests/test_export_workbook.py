@@ -232,8 +232,20 @@ def test_endpoint_with_stubbed_loader(monkeypatch) -> None:
     async def fake_loader(db, ids):
         return bundle
 
+    class _StubDb:  # records nothing; the endpoint only adds an audit row and commits
+        def add(self, *_args):
+            return None
+
+        async def commit(self):
+            return None
+
     async def fake_db():
-        yield None
+        yield _StubDb()
+
+    async def fake_access(db, user, ids):  # the stubbed DB cannot answer the ownership query: everything is allowed
+        return list(ids)
+
+    monkeypatch.setattr(mod, "accessible_evaluation_ids", fake_access)
 
     monkeypatch.setattr(mod, "load_export_bundle", fake_loader)
     app.dependency_overrides[get_db] = fake_db

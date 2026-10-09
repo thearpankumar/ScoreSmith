@@ -14,7 +14,9 @@ MAX_PARTS = 10_000
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _EXT = r"[a-z0-9]{2,5}"
 _UPLOAD_KEY_RE = re.compile(rf"^uploads/(?P<user>{_UUID})/(?P<group>{_UUID})/(?P<file>{_UUID})\.(?P<ext>{_EXT})$")
-_BATCH_KEY_RE = re.compile(rf"^batches/(?P<group>{_UUID})/(?P<file>{_UUID})\.(?P<ext>{_EXT})$")
+_BATCH_KEY_RE = re.compile(
+    rf"^batches/(?P<user>{_UUID})/(?P<group>{_UUID})/(?P<file>{_UUID})\.(?P<ext>{_EXT})$"
+)
 
 
 def file_extension(name: str) -> str:
@@ -28,7 +30,7 @@ def allowed_extensions(purpose: str) -> frozenset[str]:
 
 def build_key(purpose: str, user_id: uuid.UUID, group_id: uuid.UUID, ext: str) -> str:
     if purpose == "batch_sheet":
-        return f"batches/{group_id}/{uuid.uuid4()}.{ext}"
+        return f"batches/{user_id}/{group_id}/{uuid.uuid4()}.{ext}"
     return f"uploads/{user_id}/{group_id}/{uuid.uuid4()}.{ext}"
 
 
@@ -36,12 +38,12 @@ def key_extension(key: str, user_id: uuid.UUID | None = None, purpose: str | Non
     """The extension of a well-formed upload key, or None when the key is not one we could have issued
     (wrong prefix, other user's folder, path tricks). `purpose=None` accepts either layout."""
     if purpose in (None, "submission"):
-        m = _UPLOAD_KEY_RE.match(key)
+        m = _UPLOAD_KEY_RE.fullmatch(key)  # fullmatch: `$` alone would accept a trailing newline
         if m and (user_id is None or m.group("user") == str(user_id)) and m.group("ext") in SUBMISSION_EXTENSIONS:
             return m.group("ext")
     if purpose in (None, "batch_sheet"):
-        m = _BATCH_KEY_RE.match(key)
-        if m and m.group("ext") in BATCH_EXTENSIONS:
+        m = _BATCH_KEY_RE.fullmatch(key)
+        if m and (user_id is None or m.group("user") == str(user_id)) and m.group("ext") in BATCH_EXTENSIONS:
             return m.group("ext")
     return None
 

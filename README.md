@@ -15,6 +15,14 @@
 
 **ScoreSmith** (working title: Quality Scorecard System) is a generic scorecard creation & rating system — think Google Forms, but for quality scorecards. Instead of hard-coding one fixed rubric for one fixed type of work, ScoreSmith lets a user *define* what quality means for any domain (a weighted, hierarchical set of KPIs with 11-level qualitative + quantitative guidelines) through a chat-driven, research-grounded builder, then apply that definition consistently and repeatably — by a human, an ensemble LLM judge, or an AI pipeline that reads real submissions (videos, PDFs, Word documents, Google Drive folders, whole spreadsheets of them) — to rate real inputs and get a reasoned, evidence-cited, RAG-banded score. It is built directly against TalenciaGlobal's Quality Scorecard Framework and Data-Driven Development Framework (`References/`), and the current build is explicitly scoped to Phase 0 + Cycle 1 of that framework (see [Status & roadmap](#status--roadmap)).
 
+## Product view 
+
+### - Home Page
+![Home Page](docs/Assets/home-page.png)
+
+### -Login Page
+![Login Page](docs/Assets/login-page.png)
+
 ## Key features
 
 - **Chat-driven scorecard builder** — a [LangGraph](https://github.com/langchain-ai/langgraph) state machine, backed by AWS Bedrock (Z.ai GLM-5), asks clarifying questions, proposes KPIs "LLM first, human second," and checkpoints every step to Postgres so a session survives a server restart mid-question.
@@ -232,7 +240,7 @@ A turn can take from seconds (a follow-up edit) to a few minutes (research plus 
 | `POST /api/v1/chat/sessions/{id}/cancel` | Stops the running turn (the session is kept; `turn_error_code = "cancelled"`). |
 | `DELETE /api/v1/chat/sessions/{id}` | Cancels a running turn, then deletes the session. |
 
-- **The frontend polls** (every ~1.2 s while a turn runs, slower in a hidden tab, exponential backoff with jitter on errors, one sequential watcher per open chat, aborted on unmount). Polling was chosen over SSE/WebSockets because all state is durable in Postgres — a refresh, a second tab or a backend restart simply resumes polling — and `EventSource` cannot send the `X-User-Id` header.
+- **The frontend polls** (every ~1.2 s while a turn runs, slower in a hidden tab, exponential backoff with jitter on errors, one sequential watcher per open chat, aborted on unmount). Polling was chosen over SSE/WebSockets because all state is durable in Postgres — a refresh, a second tab or a backend restart simply resumes polling — and `EventSource` cannot send the CSRF header / custom headers the cookie-authenticated API expects.
 - **Safety nets:** a turn is capped at `CHAT_TURN_TIMEOUT_SECONDS` (default 900 s); on startup the server marks any turn that was running when it stopped as `interrupted`, and a graceful shutdown cancels running turns the same way.
 - **Tests / scripts:** `?wait=true` (or `CHAT_TURNS_INLINE=true`) runs a turn inline and returns the final result, which is what the older API tests use.
 
@@ -478,7 +486,7 @@ ScoreSmith/
 │   ├── app/
 │   │   ├── ai/                Bedrock client, Jev/OpenRouter client (quality gate + routing), request routing, scorecard-builder graph, judge, scoring-formula engine, web search
 │   │   ├── pipeline/          AI evaluation of submissions: dispatcher (queue), scoring graph, Maverick master agent, Jev scorer, adaptive limiter, batch-sheet parser, Drive URL validation, S3/Step Functions client, upload helpers
-│   │   ├── api/v1/             REST routers: users, scorecards, kpi_nodes, evaluations, evaluations_ai (uploads, jobs, batches, progress), chat
+│   │   ├── api/v1/             REST routers: auth, oauth, me, scorecards, kpi_nodes, evaluations, evaluations_ai (uploads, jobs, batches, progress), chat
 │   │   ├── models/             SQLAlchemy ORM models (scorecards, kpi_nodes, evaluations, chat_*, ...)
 │   │   ├── schemas/            Pydantic request/response schemas
 │   │   └── scripts/            seed.py (idempotent Cycle 1 scenario catalogue), generate_scenarios.py
@@ -503,7 +511,8 @@ Requires Docker + Docker Compose, and AWS Bedrock access (a Bedrock "API key" be
 ```bash
 cd infra
 cp .env.example .env
-# Fill in at minimum: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (see the note below), AWS_REGION.
+# Fill in at minimum: POSTGRES_PASSWORD and JWT_SECRET (no defaults - generate with `python -c "import secrets; print(secrets.token_urlsafe(48))"`),
+# ADMIN_EMAIL + ADMIN_PASSWORD (your first admin in development), AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (see the note below), AWS_REGION.
 # Optionally fill in AGENTCORE_GATEWAY_* to enable real web search in the research fan-out —
 # left blank, web_search.py just returns no results rather than failing the chat turn.
 # Optionally fill in OPENROUTER_JEV_API to enable the Jev quality-gate self-critique layer —
@@ -533,7 +542,7 @@ docker compose exec backend python -m app.scripts.seed
 
 | Variable | Purpose |
 |---|---|
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / `POSTGRES_PORT` | Local Postgres container |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / `POSTGRES_PORT` | Local Postgres container. **`POSTGRES_PASSWORD` has no default**: compose refuses to start until you set one (`python -c "import secrets; print(secrets.token_urlsafe(32))"`). An existing local volume keeps the password it was created with, so put that same value in your `.env` |
 | `TEST_DATABASE_URL` | Sibling test database, kept separate so `pytest`'s per-test `TRUNCATE` never touches seeded dev data |
 | `BACKEND_PORT` / `FRONTEND_PORT` | Compose host port mappings |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Bedrock credentials. **Note**: if your credential is a Bedrock long-term "API key" (bearer token) rather than a real SigV4 IAM pair, plain `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` fails with `UnrecognizedClientException`; `docker-compose.yml` auto-derives `AWS_BEARER_TOKEN_BEDROCK` from `AWS_SECRET_ACCESS_KEY` (prefixed `A`) to work around this — see the comments in `infra/docker-compose.yml` and `infra/.env.example` for the full story |
@@ -542,7 +551,11 @@ docker compose exec backend python -m app.scripts.seed
 | `OPENROUTER_JEV_API` | OpenRouter API key for the Jev quality-gate layer (`app/ai/jev_client.py`) — a separate provider from Bedrock. Left blank, every gate check degrades to "passed" rather than blocking the chat turn |
 | `NEXT_PUBLIC_API_BASE_URL` | Backend URL as seen by the *browser* (client-side fetches) |
 | `INTERNAL_API_BASE_URL` | Backend URL as seen *inside* the frontend container (server components / route handlers), via the Compose service name |
-| `JWT_SECRET` | Present in `.env.example` for future real auth; not currently read anywhere in the backend — see [Current limitations](#current-limitations) |
+| `JWT_SECRET` | **Required** (compose fails without it). Signs the 15-minute access tokens: `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Production refuses to start with a short / placeholder value. There is no separate CSRF secret (random double-submit cookie) |
+| `ENV` | `development` (default) or `production` (`ENVIRONMENT` also works). Production: strict startup checks (strong JWT secret + DB password, `COOKIE_SECURE`, explicit https `CORS_ORIGINS` / `FRONTEND_URL`, `EMAIL_BACKEND=ses`), `/docs` off, public signup off, `ADMIN_*` ignored |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Development only: the api / worker create this admin on startup if the email has no account yet (never changes an existing user). 14+ character strong password |
+| `BOOTSTRAP_TOKEN` | Production only: one-time token (32+ random chars) that lets `POST /api/v1/auth/register-user` (or the `/setup` page) create the FIRST admin while zero users exist. Remove it afterwards |
+| `SIGNUP_ENABLED` | Public self-signup. Default `true` in development, `false` in production (admins then create users via `register-user`) |
 | `REQUEST_ROUTER` | `auto` (default) · `jev` · `small_model` · `off` — how the cheap mode router decides between open-ended / user-specified / hybrid |
 | `CHAT_TURN_TIMEOUT_SECONDS` | Wall-clock cap for one chat turn (default `900`) |
 | `CHAT_TURNS_INLINE` | `false` (default): turns run in the background and the POST returns 202. `true`: run inline (used by the test suite) |
@@ -653,7 +666,7 @@ See `docs/cloud_deployment_plan.md` for the (also planning-only) path from today
 
 Documented honestly rather than glossed over:
 
-- **Auth is a dev-only stub.** `app/deps.py::get_current_user` trusts a raw `X-User-Id` header or an unsigned `Authorization: Bearer <user-id>` token — there is no signature verification, no token expiry, and no password/identity check of any kind. Real OIDC/OAuth2 auth is explicitly deferred.
+- **Auth**: password sign-in (Argon2id) with a 15-minute access JWT + rotating refresh token in httpOnly cookies, CSRF protection, rate limiting, lockout, per-user ownership on every resource (404 for other users' data) and an audit trail - see `backend/README.md`. OAuth buttons (Google, GitHub, Microsoft) stay disabled until `OAUTH_*` client ids are configured; the provider round-trips have not been exercised against live providers.
 - **No RBAC / multi-tenancy yet.** `users.org_id` and `users.role` exist as plain scalar columns with no enforcement; a `role` string is a documented convention, not a DB-enforced permission.
 - **The weight-sum-to-100 rule is DB-enforced but only at commit time** (a deferred trigger over all leaf KPIs of a scorecard version; category nodes store a NULL weight and are excluded), which is why KPIs must be created via the bulk endpoints rather than one node at a time — see `backend/app/api/v1/kpi_nodes.py`'s module docstring.
 - **No automated regression coverage for the Cycle 2 failure scenarios yet** (concurrent edits, partial materialization failure, etc.) — they're scoped, not built.

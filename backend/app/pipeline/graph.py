@@ -30,6 +30,7 @@ from app.ai.bedrock_client import BedrockClientProtocol
 from app.ai.judge import compute_final_score, effective_leaf_weights, leaf_nodes
 from app.config import get_settings
 from app.db import AsyncSessionLocal
+from app.limits.redis_semaphore import get_semaphore
 from app.models.enums import EvaluationStatus, rag_band_for_score
 from app.models.evaluation import Evaluation
 from app.models.evaluation_kpi_result import EvaluationKpiResult
@@ -49,10 +50,16 @@ JEV_CONCURRENCY = 6
 
 
 class PipelineError(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, transient: bool = False) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        # True for a temporary condition (model unavailable / throttled): the dispatcher may re-run scoring.
+        self.transient = transient
+
+
+class EvaluationCancelled(Exception):
+    """The evaluation was cancelled (DB flag or terminal status set by another process) mid-scoring."""
 
 
 @dataclass
@@ -100,6 +107,26 @@ async def _patiently(call, failed, waits: tuple[float, ...]):
         await asyncio.sleep(wait * (0.7 + 0.6 * random.random()))
         result = await call()
     return result
+
+
+def _jev_global_slot():
+    """Cluster-wide cap on concurrent Jev scoring calls (Redis; no-op unless `JEV_GLOBAL_CONCURRENCY` is set)."""
+    return get_semaphore(
+        "jev", local_limit=None, global_limit=lambda: get_settings().jev_global_concurrency
+    ).slot()
+
+
+async def _check_cancel(evaluation_id: uuid.UUID) -> None:
+    """Raises `EvaluationCancelled` when the evaluation was cancelled or removed - possibly by ANOTHER process
+    (the API container), which can only reach this driver through the database."""
+    async with AsyncSessionLocal() as db:
+        row = (
+            await db.execute(
+                select(Evaluation.status, Evaluation.cancel_requested_at).where(Evaluation.id == evaluation_id)
+            )
+        ).first()
+    if row is None or row[0] != EvaluationStatus.SCORING or row[1] is not None:
+        raise EvaluationCancelled(str(evaluation_id))
 
 
 async def _set_stage(evaluation_id: uuid.UUID, stage: str) -> None:
@@ -242,6 +269,7 @@ def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Lo
 
     async def score_kpi_node(payload: dict[str, Any]) -> dict[str, Any]:
         kpi = leaf_by_id[payload["kpi_id"]]
+        await _check_cancel(evaluation_id)  # between KPIs: stop spending as soon as a cancel is requested
         corpus: Corpus = payload["corpus"]
         media_note = corpus.media_note() or None
         await emit_evaluation_event(evaluation_id, "kpi_evidence", f"Selecting evidence for '{kpi.name}'.")
@@ -258,7 +286,7 @@ def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Lo
             jev_kwargs["retry_delays"] = deps.jev_retry_delays
 
         async def jev_score(evidence: list[str]):
-            async with jev_sem:
+            async with jev_sem, _jev_global_slot():
                 return await score_kpi(
                     deps.jev, deps.bedrock, kpi=kpi, guidelines=kpi.guidelines, evidence=evidence,
                     direction=loaded.direction, fallback_model_id=deps.fallback_model_id,
@@ -272,6 +300,7 @@ def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Lo
         # replaces the first only if clearly higher, so a KPI that really has nothing keeps its low score.
         second: dict[str, Any] | None = None
         if ks.score <= SECOND_LOOK_MAX_SCORE and not ks.fallback_reasoning and ev.reason != "unavailable":
+            await _check_cancel(evaluation_id)
             extra = await _patiently(
                 lambda: master.second_look(
                     deps.bedrock, model, kpi, kpi.guidelines, corpus, ev.snippets, loaded.direction
@@ -381,6 +410,8 @@ def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Lo
             ev.error_message = None
             ev.submitted_at = now
             ev.finished_at = now
+            ev.lease_owner = None
+            ev.lease_expires_at = None
             await db.commit()
         await emit_evaluation_event(evaluation_id, "completed", f"Final score {final:.2f}/10.")
         return {}
@@ -414,12 +445,12 @@ async def run_scoring(evaluation_id: uuid.UUID, deps: ScoringDeps) -> None:
     graph = build_scoring_graph(evaluation_id, deps, loaded)
     try:
         await graph.ainvoke({"results": []})
-    except PipelineError:
+    except (PipelineError, EvaluationCancelled):
         raise
     except asyncio.CancelledError:
         raise
     except BedrockUnavailableError as exc:
-        raise PipelineError("scoring_failed", f"The AI model was unavailable: {exc}") from exc
+        raise PipelineError("scoring_failed", f"The AI model was unavailable: {exc}", transient=True) from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("scoring graph failed for evaluation %s", evaluation_id)
         raise PipelineError("scoring_failed", f"Scoring failed: {exc}") from exc

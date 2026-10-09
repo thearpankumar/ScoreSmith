@@ -20,6 +20,7 @@ from app.ai.bedrock_client import BedrockUnavailableError
 from app.config import get_settings
 from app.deps import get_bedrock_client, get_jev_client, get_web_search_client
 from app.main import app
+from tests.conftest import make_access_token
 from tests.fakes import FakeBedrockClient, FakeJevClient, full_rubric, text_result, tool_use_result
 
 _DRAFT_PATCH = {
@@ -211,20 +212,34 @@ def test_turn_exceeding_the_time_limit_is_stopped_and_reported(
     assert final["turn_error_code"] == "timeout" and final["turn_in_progress"] is False
 
 
-def test_startup_recovers_turns_left_in_progress_by_a_dead_process(db_session, seed_user_id: str) -> None:
-    from datetime import UTC, datetime
+def test_startup_recovers_turns_whose_lease_expired_but_leaves_live_ones(db_session, seed_user_id: str) -> None:
+    """A turn whose worker died (lease expired) is recorded as interrupted at the next worker start; a turn whose
+    owner is alive (unexpired lease) must NOT be touched - the old "clear every marker at boot" recovery could
+    not tell the two apart once more than one process existed."""
+    from datetime import UTC, datetime, timedelta
 
     from app.models.chat_session import ChatSession
 
-    session = ChatSession(user_id=uuid.UUID(seed_user_id), pending_turn_started_at=datetime.now(UTC))
-    db_session.add(session)
+    now = datetime.now(UTC)
+    dead = ChatSession(
+        user_id=uuid.UUID(seed_user_id), pending_turn_started_at=now, turn_message="hi", turn_first=True,
+        turn_lease_owner="dead-worker", turn_lease_expires_at=now - timedelta(seconds=5),
+    )
+    alive = ChatSession(
+        user_id=uuid.UUID(seed_user_id), pending_turn_started_at=now, turn_message="hi", turn_first=True,
+        turn_lease_owner="live-worker", turn_lease_expires_at=now + timedelta(seconds=300),
+    )
+    db_session.add_all([dead, alive])
     db_session.commit()
-    assert session.turn_in_progress is True
+    assert dead.turn_in_progress is True and alive.turn_in_progress is True
 
-    with TestClient(app) as fresh:  # entering the app runs the lifespan startup recovery
-        body = fresh.get(f"/api/v1/chat/sessions/{session.id}").json()
-    assert body["turn_in_progress"] is False
-    assert body["turn_error_code"] == "interrupted" and "restarted" in body["turn_error"]
+    with TestClient(app) as fresh:  # entering the app runs the lifespan startup (reaps expired leases)
+        auth = {"Authorization": f"Bearer {make_access_token(seed_user_id)}"}
+        dead_body = fresh.get(f"/api/v1/chat/sessions/{dead.id}", headers=auth).json()
+        alive_body = fresh.get(f"/api/v1/chat/sessions/{alive.id}", headers=auth).json()
+    assert dead_body["turn_in_progress"] is False
+    assert dead_body["turn_error_code"] == "interrupted" and "restarted" in dead_body["turn_error"]
+    assert alive_body["turn_in_progress"] is True and alive_body["turn_error"] is None
 
 
 def test_shutdown_cancels_running_turns_and_records_interruption(db_session, seed_user_id: str) -> None:
@@ -237,7 +252,7 @@ def test_shutdown_cancels_running_turns_and_records_interruption(db_session, see
     with TestClient(app) as c:
         r = c.post(
             "/api/v1/chat/sessions?wait=false", json={"message": "hi", "session_id": sid},
-            headers={"X-User-Id": seed_user_id},
+            headers={"Authorization": f"Bearer {make_access_token(seed_user_id)}"},
         )
         assert r.status_code == 202
         time.sleep(0.3)  # the task is now inside the (sleeping) model call
