@@ -200,7 +200,8 @@ def test_blank_idempotency_key_is_treated_as_absent(
     aws,  # noqa: F811
 ) -> None:
     a = _post_jobs_keyed(client, seed_user_id, scorecard["id"], _items(1), "   ")
-    b = _post_jobs_keyed(client, seed_user_id, scorecard["id"], _items(1), "   ")
+    client.post(f"/api/v1/evaluations/{a.json()['evaluations'][0]['id']}/cancel", headers=H(seed_user_id))
+    b = _post_jobs_keyed(client, seed_user_id, scorecard["id"], _items(1), "   ")  # one running job per user
     assert a.status_code == b.status_code == 202
     assert a.json()["evaluations"][0]["id"] != b.json()["evaluations"][0]["id"]
 

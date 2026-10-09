@@ -15,9 +15,11 @@ from app.models.evaluation_source import EvaluationSource
 from app.models.idempotency_key import IdempotencyKey
 from app.models.kpi_guideline import KpiGuideline
 from app.models.kpi_node import KpiNode
+from app.models.notification import Notification
 from app.models.scorecard import Scorecard
 from app.models.scorecard_embedding import ScorecardEmbedding
 from app.models.scorecard_version import ScorecardVersion
+from app.models.sharing import ChatShare, ScorecardActivity, ScorecardCollaborator, ScorecardInvitation
 from app.models.user import User
 
 __all__ = [
@@ -41,4 +43,9 @@ __all__ = [
     "RefreshToken",
     "PasswordResetToken",
     "OAuthIdentity",
+    "Notification",
+    "ScorecardCollaborator",
+    "ScorecardInvitation",
+    "ScorecardActivity",
+    "ChatShare",
 ]

@@ -69,7 +69,10 @@ def test_idempotency_keys_are_per_user_and_optional(
     b = _post_jobs_keyed(client, other["id"], mine["id"], _items(1), "same-key")
     assert a.json()["evaluations"][0]["id"] != b.json()["evaluations"][0]["id"]
     # No header: every call creates new evaluations, exactly as before.
+    # one running job per user: cancel the keyed one first, then un-keyed requests create new evaluations
+    client.post(f"/api/v1/evaluations/{a.json()['evaluations'][0]['id']}/cancel", headers=H(seed_user_id))
     c = post_jobs(client, seed_user_id, scorecard["id"], _items(1))
+    client.post(f"/api/v1/evaluations/{c.json()['evaluations'][0]['id']}/cancel", headers=H(seed_user_id))
     d = post_jobs(client, seed_user_id, scorecard["id"], _items(1))
     assert c.json()["evaluations"][0]["id"] != d.json()["evaluations"][0]["id"]
 

@@ -30,14 +30,14 @@ export const MOCK_CURRENT_USER: User = {
   id: "user-1",
   name: "Arpan Kumar",
   email: "arpankumar1119@gmail.com",
-  role: "designer",
+  role: "user",
 };
 
 export const MOCK_USERS: User[] = [
   MOCK_CURRENT_USER,
-  { id: "user-2", name: "Priya Nair", email: "priya.nair@talenciaglobal.example", role: "evaluator" },
-  { id: "user-3", name: "Marcus Chen", email: "marcus.chen@talenciaglobal.example", role: "designer" },
-  { id: "user-4", name: "Sofia Alvarez", email: "sofia.alvarez@talenciaglobal.example", role: "evaluator" },
+  { id: "user-2", name: "Priya Nair", email: "priya.nair@talenciaglobal.example", role: "user" },
+  { id: "user-3", name: "Marcus Chen", email: "marcus.chen@talenciaglobal.example", role: "user" },
+  { id: "user-4", name: "Sofia Alvarez", email: "sofia.alvarez@talenciaglobal.example", role: "user" },
 ];
 
 function userName(id: string): string {

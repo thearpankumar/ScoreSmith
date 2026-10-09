@@ -2,7 +2,7 @@ import { GlassCard } from "@/components/design-system/GlassCard";
 import { ChatSessionNavList } from "@/components/chat/ChatSessionNavList";
 import { PromptBox } from "@/components/home/PromptBox";
 import { QuickStartTiles } from "@/components/home/QuickStartTiles";
-import { MOCK_CURRENT_USER } from "@/lib/mock-data";
+import { getCurrentUser } from "@/lib/api-client";
 
 // This page itself does no fetching (see the docstring below) — the root `app/layout.tsx`
 // already forces the whole app dynamic (`dynamic = "force-dynamic"`), which per Next.js's
@@ -24,7 +24,10 @@ import { MOCK_CURRENT_USER } from "@/lib/mock-data";
  * `app/layout.tsx`), not a prop fetched here — it's already loaded (and kept live) at the
  * shared root-layout level, so this page doesn't need its own copy.
  */
-export default function ChatIndexPage() {
+export default async function ChatIndexPage() {
+  // The signed-in user's own first name (never a placeholder identity).
+  const me = await getCurrentUser().catch(() => null);
+  const firstName = me?.name?.trim().split(/\s+/)[0];
   return (
     <div className="flex flex-col gap-4">
       <div className="md:hidden">
@@ -34,7 +37,7 @@ export default function ChatIndexPage() {
       </div>
       <div className="mx-auto flex w-full min-w-0 max-w-3xl flex-1 flex-col gap-6 py-2">
         <div>
-          <p className="text-sm text-ink-muted">Welcome back, {MOCK_CURRENT_USER.name.split(" ")[0]}</p>
+          <p className="text-sm text-ink-muted">{firstName ? `Welcome back, ${firstName}` : "Welcome back"}</p>
           <h1 className="mt-1 text-2xl font-semibold text-ink">What do you want to rate today?</h1>
         </div>
         <PromptBox />

@@ -4,11 +4,13 @@ import { useEffect, useId, useMemo, useState, type FormEvent } from "react";
 import { ChevronDown, FileSpreadsheet, Link2, Loader2, Sparkles, UploadCloud } from "lucide-react";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
+import { JobBusyNotice, activeJobLink } from "@/components/live/JobBusyNotice";
+import { requestLiveRefresh, useLiveStatus } from "@/components/live/LiveStatusProvider";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { createAiJobs } from "@/lib/api-client";
+import { ApiError, createAiJobs } from "@/lib/api-client";
 import { parseDriveLinks } from "@/lib/ai-upload";
 import { leafKpiNodes } from "@/lib/kpi-tree";
 import { cn } from "@/lib/utils";
@@ -103,6 +105,10 @@ function AiJudgeForm({
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [blockedLink, setBlockedLink] = useState<string | null>(null);
+  // One running evaluation job per user (a batch counts as one): the form is disabled while the slot is busy.
+  const { slots } = useLiveStatus();
+  const slotBusy = Boolean(slots.job);
 
   // Per-tab count + validity.
   const driveValid = driveEntries.filter((e) => e.valid);
@@ -167,11 +173,13 @@ function AiJudgeForm({
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!valid || submitting) return;
+    if (!valid || submitting || slotBusy) return;
     setSubmitting(true);
     setError(null);
+    setBlockedLink(null);
     try {
       const res = await createAiJobs({ scorecardId, directionPrompt: direction, items: buildItems() });
+      requestLiveRefresh(); // the slot is busy from now on: disable the other forms right away
       if (res.batchId && res.evaluations.length > 1) {
         onQueued({ kind: "batch", batchId: res.batchId, evaluations: res.evaluations });
       } else if (res.evaluations[0]) {
@@ -181,6 +189,15 @@ function AiJudgeForm({
       }
     } catch (err) {
       setSubmitting(false);
+      if (err instanceof ApiError && err.code === "user_job_active") {
+        const ev = typeof err.data?.evaluation_id === "string" ? err.data.evaluation_id : null;
+        const sc = typeof err.data?.scorecard_id === "string" ? err.data.scorecard_id : null;
+        const batch = typeof err.data?.batch_id === "string" ? err.data.batch_id : null;
+        setBlockedLink(activeJobLink({ evaluationId: ev ?? "", batchId: batch, status: "", scorecardId: sc }));
+        setError(err.message);
+        requestLiveRefresh();
+        return;
+      }
       setError(err instanceof Error && err.message ? err.message : "Could not queue the evaluation. Please try again.");
     }
   }
@@ -258,9 +275,15 @@ function AiJudgeForm({
           )}
         </div>
 
+        <JobBusyNotice />
         {error && (
           <p className="text-sm text-[var(--rag-poor)]" role="alert">
-            {error}
+            {error}{" "}
+            {blockedLink && (
+              <a href={blockedLink} className="font-semibold underline underline-offset-2">
+                View it
+              </a>
+            )}
           </p>
         )}
 
@@ -270,7 +293,7 @@ function AiJudgeForm({
               ? `${leaves.length} KPI${leaves.length === 1 ? "" : "s"} will be scored. You can leave the page; progress is saved.`
               : why}
           </p>
-          <Button type="submit" size="lg" disabled={!valid || submitting || leaves.length === 0} className="w-full sm:w-auto">
+          <Button type="submit" size="lg" disabled={!valid || submitting || leaves.length === 0 || slotBusy} className="w-full sm:w-auto">
             {submitting ? (
               <>
                 <Loader2 className="size-4 animate-spin" aria-hidden /> Queuing...

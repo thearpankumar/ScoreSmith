@@ -84,10 +84,17 @@ export const API_BASE_URL = apiBase();
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(message: string, status: number) {
+  /** Machine-readable error code for `{ detail: { code, message, ... } }` answers (e.g. `user_job_active`,
+   * `stale_edit`, `user_not_found`). */
+  readonly code?: string;
+  /** The rest of a structured `detail` object (e.g. the id of the blocking job). */
+  readonly data?: Record<string, unknown>;
+  constructor(message: string, status: number, extra?: { code?: string; data?: Record<string, unknown> }) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = extra?.code;
+    this.data = extra?.data;
   }
 }
 
@@ -129,7 +136,10 @@ function formatErrorDetail(detail: unknown): string {
       })
       .join("; ");
   }
-  if (detail && typeof detail === "object") return JSON.stringify(detail);
+  if (detail && typeof detail === "object") {
+    const message = (detail as Record<string, unknown>).message;
+    return typeof message === "string" ? message : JSON.stringify(detail);
+  }
   return String(detail);
 }
 
@@ -287,6 +297,11 @@ async function apiFetch<T>(path: string, opts: RequestOptions = {}): Promise<T> 
     if (res.status === 502) {
       throw new BedrockUnavailableError(detail);
     }
+    const raw = payload && typeof payload === "object" ? (payload as Record<string, unknown>).detail : undefined;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const { code, ...data } = raw as Record<string, unknown>;
+      throw new ApiError(detail, res.status, { code: typeof code === "string" ? code : undefined, data });
+    }
     throw new ApiError(detail, res.status);
   }
 
@@ -305,6 +320,7 @@ interface BeUser {
   email: string;
   name: string;
   role: string;
+  username?: string | null;
   email_verified?: boolean;
   created_at: string;
 }
@@ -313,6 +329,10 @@ interface BeScorecard {
   id: string;
   name: string;
   owner_id: string;
+  owner_name?: string | null;
+  my_role?: string;
+  is_shared?: boolean;
+  collaborator_count?: number;
   domain: string | null;
   purpose_statement: string | null;
   scope: string | null;
@@ -374,6 +394,7 @@ interface BeEvaluation {
   scorecard_version_id: string;
   name: string;
   evaluated_by: string;
+  runner_name?: string | null;
   input_reference: Record<string, unknown> | null;
   status: string;
   final_weighted_score: number | null;
@@ -405,6 +426,9 @@ interface BeChatSession {
   title: string | null;
   context_summary: string | null;
   target_scorecard_id: string | null;
+  /** none | active | trashed | deleted; a trashed chart's id is only sent to its owner (chart_can_restore). */
+  chart_state?: "none" | "active" | "trashed" | "deleted";
+  chart_can_restore?: boolean;
   created_at: string;
   last_activity_at: string;
   /** True while a background turn runs for this session (sidebar "working" badge). */
@@ -518,6 +542,7 @@ function mapUser(be: BeUser): User {
     // union. Cast rather than validate: there is no RBAC yet (see SettingsForm), so an
     // unrecognized role just displays as-is via `String(role)`.
     role: be.role as UserRole,
+    username: be.username ?? null,
     orgId: null,
   };
 }
@@ -562,7 +587,10 @@ function mapScorecard(be: BeScorecard, ownerName: string, kpiCount: number): Sco
     name: be.name,
     domain: be.domain ?? "General",
     ownerId: be.owner_id,
-    ownerName,
+    ownerName: be.owner_name || ownerName,
+    myRole: be.my_role === "editor" ? "editor" : "owner",
+    isShared: Boolean(be.is_shared),
+    collaboratorCount: be.collaborator_count ?? 0,
     purposeStatement: be.purpose_statement ?? "",
     scope: be.scope ?? "",
     targetScore: be.target_score ?? 0,
@@ -1043,7 +1071,7 @@ function mapEvaluation(be: BeEvaluation, ctx: EnrichmentContext): Evaluation {
     domain: be.domain ?? scorecard?.domain ?? "General",
     name: be.name,
     evaluatedBy: be.evaluated_by,
-    evaluatedByName: ctx.userNameById.get(be.evaluated_by) ?? "Unknown",
+    evaluatedByName: be.runner_name ?? ctx.userNameById.get(be.evaluated_by) ?? "Unknown",
     inputSummary,
     status: be.status as EvaluationStatus,
     finalWeightedScore: be.final_weighted_score ?? 0,
@@ -1076,9 +1104,11 @@ export interface EvaluationsExport {
  * Not routed through `apiFetch`, which is JSON-only; shares its session handling (`apiRequest`) and error formatting.
  */
 export async function exportEvaluationsXlsx(
-  ids: string[],
+  // Either explicit ids, or a server-side "everything matching this filter except these ids" selection.
+  selection: string[] | { filter: Record<string, unknown>; excludeIds: string[] },
   opts: { includeReasoning: boolean; filterSummary?: string; signal?: AbortSignal },
 ): Promise<EvaluationsExport> {
+  const ids = Array.isArray(selection) ? selection : [];
   const path = "/api/v1/evaluations/export";
   let res: Response;
   try {
@@ -1086,7 +1116,9 @@ export async function exportEvaluationsXlsx(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        evaluation_ids: ids,
+        ...(Array.isArray(selection)
+          ? { evaluation_ids: selection }
+          : { filter: selection.filter, exclude_ids: selection.excludeIds }),
         include_reasoning: opts.includeReasoning,
         filter_summary: opts.filterSummary ?? null,
       }),
@@ -1582,7 +1614,10 @@ function mapChatSession(be: BeChatSession): ChatSession {
     title: titleOrFallback(be),
     status: mapChatSessionStatus(be.status),
     contextSummary: be.context_summary ?? "",
-    targetScorecardId: be.target_scorecard_id,
+    // a trashed chart is NOT a link target: the owner gets `trashedChartId` to restore it instead
+    targetScorecardId: be.chart_state === "trashed" ? null : be.target_scorecard_id,
+    chartState: be.chart_state ?? (be.target_scorecard_id ? "active" : "none"),
+    trashedChartId: be.chart_state === "trashed" && be.chart_can_restore ? be.target_scorecard_id : null,
     createdAt: be.created_at,
     lastActivityAt: be.last_activity_at,
     turnInProgress: !!be.turn_in_progress,

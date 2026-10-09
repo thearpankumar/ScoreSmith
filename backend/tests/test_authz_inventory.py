@@ -52,6 +52,30 @@ NO_FOREIGN_ID = {
     ("POST", "/api/v1/evaluations/ai/uploads/abort"),
     ("POST", "/api/v1/evaluations/ai/batches/parse"),
     ("POST", "/api/v1/chat/sessions"),  # creates a session for the caller (+ foreign target covered in the matrix)
+    # --- sharing / notifications / RBAC (tests/test_sharing.py, test_notifications.py, test_eval_page.py,
+    # test_admin_users.py, test_user_slots.py): scoped to the caller, or admin-only (403) ---
+    ("GET", "/api/v1/invitations"),  # the caller's own pending invitations
+    ("GET", "/api/v1/notifications"),  # test_inbox_is_scoped_to_its_owner
+    ("GET", "/api/v1/notifications/unread-count"),
+    ("POST", "/api/v1/notifications/read-all"),
+    ("GET", "/api/v1/me/slots"),
+    ("POST", "/api/v1/me/password"),  # own password only (test_users_change_their_own_password)
+    ("GET", "/api/v1/chat/shared"),  # the caller's own shared-with-me list (test_chat_shares.py)
+    ("GET", "/api/v1/evaluations/page"),  # test_access_follows_the_chart
+    ("POST", "/api/v1/evaluations/refresh"),  # test_refresh_returns_current_state_of_visible_rows_only
+    ("POST", "/api/v1/evaluations/bulk-delete"),  # test_bulk_delete_skips_running_and_foreign_rows
+    # --- chart trash (tests/test_chart_trash.py): only ever the caller's OWN trashed charts; foreign ids -> 404 ---
+    ("GET", "/api/v1/scorecards/trash"),
+    ("POST", "/api/v1/scorecards/trash/restore"),
+    ("POST", "/api/v1/scorecards/trash/purge"),
+    ("POST", "/api/v1/scorecards/trash/empty"),
+    ("GET", "/api/v1/admin/users"),  # admin-only: test_every_admin_endpoint_is_403_for_a_normal_user
+    ("POST", "/api/v1/admin/users"),
+    ("PATCH", "/api/v1/admin/users/{user_id}"),
+    ("POST", "/api/v1/admin/users/{user_id}/password"),
+    ("POST", "/api/v1/admin/users/{user_id}/deactivate"),
+    ("POST", "/api/v1/admin/users/{user_id}/reactivate"),
+    ("DELETE", "/api/v1/admin/users/{user_id}"),
 }
 
 

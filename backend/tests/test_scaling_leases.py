@@ -23,7 +23,14 @@ from app.models.evaluation import Evaluation
 from app.models.evaluation_event import EvaluationEvent
 from app.models.evaluation_kpi_result import EvaluationKpiResult
 from app.pipeline.dispatcher import Dispatcher
-from tests.ai_eval_helpers import get_eval, seed_queued, seed_scorecard, wait_status, wait_until
+from tests.ai_eval_helpers import (
+    get_eval,
+    seed_queued,
+    seed_scorecard,
+    wait_execution_recorded,
+    wait_status,
+    wait_until,
+)
 from tests.fakes import FakeAwsJobs, FakeBedrockClient, FakeJevScoreClient, default_corpus, master_converse_fn
 
 _CREATED: list[Dispatcher] = []
@@ -66,6 +73,19 @@ async def _set_lease_expiry(eid, seconds_from_now: float) -> None:
         await db.commit()
 
 
+async def _until_adopted(d: Dispatcher, eid, *, via: str = "recover", timeout: float = 30.0) -> int:
+    """Adoption uses `FOR UPDATE SKIP LOCKED`, so a row whose previous owner's cancelled transaction is still being
+    rolled back is skipped for a moment (correct behaviour). Poll the adopting call until it takes the row instead of
+    assuming the first call lands after that rollback; returns what the successful call returned."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        result = await d.recover() if via == "recover" else len(await d.tick())
+        if (await get_eval(eid)).lease_owner == d.worker_id:
+            return result
+        assert asyncio.get_running_loop().time() < deadline, "the expired lease was never adopted"
+        await asyncio.sleep(0.05)
+
+
 async def _kill(d: Dispatcher) -> None:
     """kill -9: the drivers vanish and NOTHING is released or cleaned up."""
     tasks = list(d._tasks.values())
@@ -85,7 +105,7 @@ async def test_claim_stamps_a_lease_and_a_live_lease_is_never_adopted_only_an_ex
 
     await d1.tick()
     await wait_until(lambda: len(aws.start_names) == 1)
-    row = await get_eval(ev.id)
+    row = await wait_execution_recorded(ev.id)
     assert row.lease_owner == d1.worker_id and row.heartbeat_at is not None
     assert row.lease_expires_at > datetime.now(UTC) + timedelta(seconds=30)
 
@@ -97,7 +117,7 @@ async def test_claim_stamps_a_lease_and_a_live_lease_is_never_adopted_only_an_ex
     assert not d2._tasks and (await get_eval(ev.id)).lease_owner == d1.worker_id
 
     await _set_lease_expiry(ev.id, -1)  # ... and now it has expired
-    assert await d2.recover() == 1
+    assert await _until_adopted(d2, ev.id) == 1
     assert (await get_eval(ev.id)).lease_owner == d2.worker_id
     events = await _events(ev.id)
     assert "resumed" in events
@@ -115,13 +135,15 @@ async def test_expired_lease_is_adopted_by_a_running_peer_on_its_next_tick(async
     d1, d2 = make_dispatcher(aws), make_dispatcher(aws)
     await d1.tick()
     await wait_until(lambda: len(aws.start_names) == 1)
+    await wait_execution_recorded(ev.id)  # the crash happens AFTER the execution was recorded (else a restart is right)
     await _kill(d1)
     await _set_lease_expiry(ev.id, -1)
 
-    await d2.tick()  # no restart needed: the periodic claim also adopts expired leases
+    await _until_adopted(d2, ev.id, via="tick")  # no restart needed: the periodic claim also adopts expired leases
     assert (await get_eval(ev.id)).lease_owner == d2.worker_id and ev.id in d2._tasks
-    aws.finish(str(ev.id))
-    await wait_status(ev.id, EvaluationStatus.COMPLETED)
+    aws.finish(str(ev.id))  # the survivor resumes the recorded execution, so one finish() is enough
+    await wait_status(ev.id, EvaluationStatus.COMPLETED, timeout=30)
+    assert aws.start_names == [str(ev.id)]
 
 
 async def test_heartbeat_renews_the_lease_and_a_driver_that_lost_its_lease_stops(async_db_session) -> None:
@@ -131,6 +153,7 @@ async def test_heartbeat_renews_the_lease_and_a_driver_that_lost_its_lease_stops
     d1 = make_dispatcher(aws)
     await d1.tick()
     await wait_until(lambda: len(aws.start_names) == 1)
+    await wait_execution_recorded(ev.id)
 
     await _set_lease_expiry(ev.id, 3)
     assert await d1.heartbeat() == 1
@@ -154,10 +177,11 @@ async def test_clean_shutdown_releases_leases_so_a_peer_adopts_immediately(async
     d1, d2 = make_dispatcher(aws), make_dispatcher(aws)
     await d1.tick()
     await wait_until(lambda: len(aws.start_names) == 1)
+    await wait_execution_recorded(ev.id)
     await d1.stop()  # SIGTERM drain
     row = await get_eval(ev.id)
     assert row.lease_owner is None and row.lease_expires_at is None and row.status == EvaluationStatus.INGESTING
-    assert await d2.recover() == 1  # no waiting for a lease to expire
+    assert await _until_adopted(d2, ev.id) == 1  # no waiting for a lease to expire
 
 
 # --- cancel is a DB flag, effective across processes ---------------------------------------------------------

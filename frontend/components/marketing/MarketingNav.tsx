@@ -18,10 +18,10 @@ export function MarketingNav({ startHref }: { startHref: string }) {
         Skip to content
       </a>
       <div className="mk-nav">
-        <Link href="/" className="mk-logo" aria-label="KPI Metrics home">
+        <Link href="/" className="mk-logo" aria-label="Score Smith home">
           <BrandMark className="mk-logo-mark" />
           <span>
-            <span className="mk-logo-name">KPI Metrics</span>
+            <span className="mk-logo-name">Score Smith</span>
             <span className="mk-logo-sub">Designer &amp; Evaluator</span>
           </span>
         </Link>

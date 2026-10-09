@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     worker_health_port: int = 8001
     # On SIGTERM a worker waits this long for running chat turns to finish before cancelling them.
     worker_drain_grace_seconds: float = 20.0
+    # Charts stay in the owner's trash this many days before the housekeeping purge deletes them for good.
+    trash_retention_days: int = Field(default=30, ge=1)
     # "text" (default, local dev) or "json" (one JSON object per line, with evaluation_id / session_id).
     log_format: str = "text"
 
@@ -266,6 +268,11 @@ class Settings(BaseSettings):
     rate_limit_ai_jobs: str = "20/minute"
     rate_limit_uploads: str = "30/minute"
     rate_limit_export: str = "10/minute"
+    # Chart sharing: every invite attempt counts against the SENDER (not the target), which bounds how fast one
+    # signed-in user can probe which usernames / emails exist (the "no such user" answer is deliberate).
+    rate_limit_share_lookup: str = "20/hour"
+    rate_limit_share: str = "60/minute"
+    rate_limit_admin: str = "60/minute"
     # Transactional email. "log" (default) prints the link to the server log; "ses" sends through Amazon SES.
     email_backend: str = "log"
     email_from: str = ""

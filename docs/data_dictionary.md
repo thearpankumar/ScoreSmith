@@ -29,11 +29,11 @@ place of `updated_at`) since they are append-mostly logs, not mutable records.
 | Field | Data type | Length/format | Business rule | Nullability | Keys/Identity | Validation rule |
 |---|---|---|---|---|---|---|
 | `id` | UUID | v4 | Unique identifier for a person who can own scorecards, evaluate, or design. | NOT NULL | Primary key | Generated client-side (`uuid.uuid4`). |
-| `email` | VARCHAR | max 320 chars (RFC 5321 mailbox limit) | Used for login/identification and dev-auth-stub lookups. | NOT NULL | Unique (`uq_users_email`), indexed | Application-layer: Pydantic `EmailStr` format check on the API's `UserCreate` schema. DB: uniqueness only. |
+| `email` | VARCHAR | max 320 chars (RFC 5321 mailbox limit) | Sign-in identifier and the address for reset / verification mail. | NOT NULL | Unique (`uq_users_email`), indexed | Application-layer format check (plain string, not `EmailStr`, because seed accounts use a reserved TLD); normalised to lower case. |
 | `name` | VARCHAR | max 200 chars | Display name. | NOT NULL | — | Non-empty enforced by Pydantic (`str`, no blank-check at DB level — left to app layer). |
 | `org_id` | UUID | v4 | Reserved for future multi-tenant/org scoping. No `organizations` table exists yet in Cycle 1 (full RBAC/org model is deferred per the plan), so this is a plain scalar, not a FK. | NULL | — | None at DB level (deliberately deferred; documented gap). |
-| `role` | VARCHAR | max 50 chars, default `'member'` | Coarse role label (`designer`, `evaluator`, `member`, `system`, ...). Full RBAC is explicitly deferred (plan: "Explicitly deferred to next iterations... OIDC/Cognito production auth, RLS policies"), so this is intentionally a free-text field rather than a rigid enum, to avoid a migration every time the role vocabulary evolves. | NOT NULL | — | None at DB level (documented convention only, not DB-enforced, by design). |
-| `auth_provider_id` | VARCHAR | max 255 chars | External OIDC subject id, for when real auth (deferred) is wired in. | NULL | Unique (`uq_users_auth_provider_id`) | Uniqueness only; format is provider-specific and unvalidated in Cycle 1. |
+| `role` | VARCHAR | max 50 chars, default `'user'` (migration 0013) | `admin` or `user` for people; `system` marks the internal marker row. Legacy `member` / `designer` / `evaluator` were normalised to `user`. | NOT NULL | — | Validated in the API (`admin\|user`); not a DB enum. See `docs/plan-sharing-rbac.md`. |
+| `auth_provider_id` | VARCHAR | max 255 chars | External OIDC subject id, reserved; OAuth links live in `oauth_identities`. | NULL | Unique (`uq_users_auth_provider_id`) | Uniqueness only; format is provider-specific and unvalidated in Cycle 1. |
 | `created_at` | TIMESTAMPTZ | — | Row creation time. | NOT NULL | — | `server_default = now()`. |
 | `updated_at` | TIMESTAMPTZ | — | Last row modification time. | NOT NULL | — | `server_default = now()`, `ON UPDATE now()`. |
 
@@ -222,6 +222,23 @@ Everything in the table above is proven against a real Postgres instance by
 97%/103%, duplicate sibling names, cross-version KPI reference, out-of-range score) and by
 `backend/tests/test_weight_trigger.py`.
 
+## Tables and columns added after migration 0001
+
+Summary only; the ORM models in `backend/app/models/` and the migrations in `backend/alembic/versions/` are the source of truth. Diagram: [architecture.md](architecture.md#6-data-model).
+
+| Migration | Change |
+|---|---|
+| `0002`-`0009` | Judge ensemble fields and review flag on `evaluation_kpi_results`; chat turn marker, `chat_turn_events` (live trace), session title, turn error columns; scoring formula and KPI flags; category nodes carry no weight |
+| `0010_ai_eval_pipeline` | `evaluation_status` gains `queued`, `ingesting`, `processing` (unused), `scoring`; `evaluations` gains queue / progress / subject columns (`stage`, `progress`, `error_code`, `sfn_execution_arn`, `queued_at`, `started_at`, `finished_at`, `attempt`, ...); tables `evaluation_batches`, `evaluation_sources`, `evaluation_events`; `evaluation_kpi_results.jev_raw` |
+| `0011_scaling_leases` | `evaluations.lease_owner`, `lease_expires_at`, `heartbeat_at`, `cancel_requested_at`; the same lease / cancel fields on `chat_sessions` prefixed `turn_`, plus `turn_message`, `turn_first` (the in-progress marker becomes a queued job); table `idempotency_keys` (PK `user_id, scope, key`) |
+| `0012_auth_ownership` | `users`: `password_hash`, `email_verified_at`, `is_active`, `failed_logins`, `locked_until`, `sessions_valid_after`; tables `refresh_tokens` (hashed, `family_id`, `used_at`, `revoked_at`), `password_reset_tokens` (reset and verify tokens), `oauth_identities`; `evaluations.owner_id` (the owning user, distinct from `lease_owner`); `audit_log.ip`, `user_agent`, `request_id` |
+| `0013_sharing_rbac` | `users.username` (unique on `lower()`), `users.deleted_at`; roles normalised to `admin`/`user`; tables `scorecard_collaborators` (unique `scorecard_id, user_id`), `scorecard_invitations` (status `pending/accepted/declined/revoked`, partial unique on pending), `scorecard_activity` (append-only: an UPDATE trigger raises), `notifications` (unique per-user `dedupe_key`); list and job-slot indexes on `evaluations` |
+| `0014_chat_shares` | table `chat_shares` (unique `session_id, recipient_id`; `shared_by`, `with_chart`, `saved_scorecard_id`) |
+| `0015_chart_trash` | `scorecards.deleted_at`, `deleted_by`; partial indexes for the trash listing and the retention purge |
+| `0016_eval_cancel_reason` | `evaluations.cancel_reason` (`cancelled_by_trash` marks jobs to resume on restore) |
+
+Evaluation statuses are `pending`, `in_progress`, `completed`, `failed`, `queued`, `ingesting`, `processing`, `scoring`; a cancelled evaluation is `failed` with `error_code = 'cancelled'`.
+
 ## Documented gaps (intentionally out of scope for Cycle 1, per the plan)
 
 - `users.role` vocabulary, `kpi_nodes.path`/`level` internal consistency, `evaluations.domain`
@@ -229,6 +246,5 @@ Everything in the table above is proven against a real Postgres instance by
   actual existing `kpi_guidelines` row are all enforced by the application/seed layer, not
   the database, in Cycle 1. Candidates for Cycle 2/3 hardening if evidence from real usage
   shows they need DB-level enforcement.
-- Row-Level Security (RLS) keyed on `owner_id`/`org_id`, real OIDC auth, and org-level
-  multi-tenancy are explicitly deferred per the plan's "Explicitly deferred to next
-  iterations" section.
+- Row-Level Security (RLS) and org-level multi-tenancy are still not implemented: access control is enforced in the application layer (`backend/app/authz.py`), and `users.org_id` is an unused scalar.
+  Authentication (password + rotating refresh tokens, optional OAuth) and two-role RBAC were added later; see `docs/plan-sharing-rbac.md`.

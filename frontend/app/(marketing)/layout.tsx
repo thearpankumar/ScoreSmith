@@ -15,17 +15,17 @@ const inter = Inter({
 export const viewport: Viewport = { width: "device-width", initialScale: 1, viewportFit: "cover", themeColor: "#fffaf0" };
 
 export const metadata: Metadata = {
-  title: { absolute: "KPI Metrics: Design Better KPIs. Evaluate Smarter." },
+  title: { absolute: "Score Smith: Design Better KPIs. Evaluate Smarter." },
   description:
     "A modern platform to design, track and evaluate KPIs that align teams, improve performance and turn data into meaningful outcomes.",
   alternates: { canonical: "/" },
   openGraph: {
     type: "website",
-    siteName: "KPI Metrics",
-    title: "KPI Metrics: Design Better KPIs. Evaluate Smarter.",
+    siteName: "Score Smith",
+    title: "Score Smith: Design Better KPIs. Evaluate Smarter.",
     description: "Design, track and evaluate KPIs that align teams and drive real progress.",
   },
-  twitter: { card: "summary", title: "KPI Metrics", description: "Design Better KPIs. Evaluate Smarter." },
+  twitter: { card: "summary", title: "Score Smith", description: "Design Better KPIs. Evaluate Smarter." },
 };
 
 /**

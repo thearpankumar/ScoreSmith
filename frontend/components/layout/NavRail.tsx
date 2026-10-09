@@ -9,7 +9,7 @@ import { usePersistedState } from "@/lib/usePersistedState";
 import { BrandMark } from "@/components/auth/BrandLogo";
 import { useChatSessions } from "@/components/chat/ChatSessionsContext";
 import { ChatSessionNavList } from "@/components/chat/ChatSessionNavList";
-import { NAV_ITEMS } from "./nav-items";
+import { navItemsFor, type NavItem } from "./nav-items";
 import { UserMenu, type SessionUser } from "./UserMenu";
 
 const STORAGE_KEY = "qs.navRailCollapsed";
@@ -71,7 +71,7 @@ export function NavRail({ user = null }: { user?: SessionUser | null }) {
         collapsed ? "w-[4.5rem] items-center px-2" : "w-60",
       )}
     >
-      <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-hidden">
+      <div className="thin-scrollbar flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden">
         <div className={cn("mb-4 flex shrink-0 items-center gap-2", collapsed ? "justify-center px-0" : "px-2")}>
           <BrandMark className="h-8 w-auto shrink-0" />
           {!collapsed && <span className="text-sm font-semibold text-ink">Quality Scorecards</span>}
@@ -108,7 +108,7 @@ export function NavRail({ user = null }: { user?: SessionUser | null }) {
         </div>
 
         <div className="flex shrink-0 flex-col gap-1">
-          {NAV_ITEMS.map((item) => (
+          {navItemsFor(user?.role).map((item) => (
             <NavItemLink
               key={item.href}
               item={item}
@@ -145,7 +145,7 @@ function NavItemLink({
   sessionCount,
   onChatRoute,
 }: {
-  item: (typeof NAV_ITEMS)[number];
+  item: NavItem;
   pathname: string;
   collapsed: boolean;
   /** Chat item only: folded into its collapsed tooltip so the session count isn't just

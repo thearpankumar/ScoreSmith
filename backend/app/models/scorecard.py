@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, ForeignKey, Numeric, String, Text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Numeric, String, Text, text
 from sqlalchemy.dialects.postgresql import ENUM, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -24,6 +25,8 @@ class Scorecard(UUIDPKMixin, TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint("target_score IS NULL OR (target_score >= 0 AND target_score <= 10)",
                          name="ck_scorecards_target_score_range"),
+        Index("ix_scorecards_trash_owner", "owner_id", postgresql_where=text("deleted_at IS NOT NULL")),
+        Index("ix_scorecards_trash_deleted_at", "deleted_at", postgresql_where=text("deleted_at IS NOT NULL")),
     )
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -45,6 +48,13 @@ class Scorecard(UUIDPKMixin, TimestampMixin, Base):
         ForeignKey("scorecard_versions.id", ondelete="SET NULL", use_alter=True,
                    name="fk_scorecards_current_version_id"),
         nullable=True,
+    )
+
+    # Trash (migration 0015): a non-null `deleted_at` means "in the owner's trash"; every access path treats the
+    # chart as non-existent until it is restored, and `app.trash.purge_expired` removes it for good after the retention.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
 
     owner: Mapped[User] = relationship("User", back_populates="owned_scorecards", foreign_keys=[owner_id])

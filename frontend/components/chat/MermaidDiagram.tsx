@@ -28,7 +28,7 @@ function loadMermaid() {
         theme: "base",
         themeVariables: {
           background: "#ffffff",
-          primaryColor: "#fffce0",
+          primaryColor: "#fff3cf",
           primaryBorderColor: "rgba(22, 22, 26, 0.18)",
           primaryTextColor: "#16161a",
           secondaryColor: "#fafaf5",

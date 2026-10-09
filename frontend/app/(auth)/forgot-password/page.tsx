@@ -3,7 +3,7 @@ import type { Metadata } from "next";
 import { AuthCard } from "@/components/auth/AuthCard";
 import { ForgotForm } from "@/components/auth/ForgotForm";
 
-export const metadata: Metadata = { title: "Reset password · KPI Metrics" };
+export const metadata: Metadata = { title: "Reset password · Score Smith" };
 
 export default function ForgotPasswordPage() {
   return (

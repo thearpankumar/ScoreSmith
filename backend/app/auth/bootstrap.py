@@ -46,6 +46,11 @@ async def user_count(db: AsyncSession) -> int:
     return (await db.execute(select(func.count()).select_from(User))).scalar_one()
 
 
+async def any_username(db: AsyncSession) -> bool:
+    """True once at least one account has a username: the sign-in form then offers 'Email or username'."""
+    return (await db.execute(select(User.id).where(User.username.is_not(None)).limit(1))).first() is not None
+
+
 def token_matches(provided: str, expected: str) -> bool:
     """Constant-time comparison (digests first, so the lengths do not leak either). An unset token never matches."""
     if not expected:

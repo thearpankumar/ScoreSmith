@@ -17,9 +17,13 @@ if TYPE_CHECKING:
 # Role model. "admin" may manage users (POST /auth/register-user); every other value is an ordinary user. Legacy
 # rows may carry other free-text roles (e.g. "designer"): they are treated as ordinary users. The role is never
 # accepted from signup / PATCH /me - only an admin (or the one-time bootstrap) can grant "admin".
+# Exactly two roles for people: admin and user (migration 0013 normalised legacy member/designer/evaluator to user).
+# The seeded system marker row is not a person and is never assignable.
 ROLE_ADMIN = "admin"
-ROLE_MEMBER = "member"
-ASSIGNABLE_ROLES = (ROLE_ADMIN, ROLE_MEMBER)
+ROLE_USER = "user"
+ROLE_MEMBER = ROLE_USER  # legacy alias
+ROLE_SYSTEM = "system"
+ASSIGNABLE_ROLES = (ROLE_ADMIN, ROLE_USER)
 
 
 class User(UUIDPKMixin, TimestampMixin, Base):
@@ -32,9 +36,15 @@ class User(UUIDPKMixin, TimestampMixin, Base):
     # Full RBAC is deferred (see plan); kept as a free-text role rather than a rigid DB
     # enum so the role vocabulary can evolve without a migration. Convention documented
     # in docs/data_dictionary.md.
-    role: Mapped[str] = mapped_column(String(50), nullable=False, default="member")
+    role: Mapped[str] = mapped_column(String(50), nullable=False, default=ROLE_USER)
     auth_provider_id: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
 
+
+    # --- Sharing / RBAC (migration 0013_sharing_rbac) ---
+    # Optional handle, unique case-insensitively; sign-in and chart invitations accept it as well as the email.
+    username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Set when an admin deleted the account: the row stays as an anonymised tombstone (FKs keep working).
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # --- Authentication (migration 0012_auth_ownership) ---
     # Argon2id PHC string. NULL for accounts that have never set a password (seeded rows, OAuth-only sign-ups);

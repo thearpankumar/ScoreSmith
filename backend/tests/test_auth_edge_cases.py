@@ -433,8 +433,8 @@ def test_signup_new_user_is_a_member_with_unverified_email(client: TestClient, d
     r = client.post(
         "/api/v1/auth/signup", json={"email": "m@example.com", "name": "M", "password": PASSWORD}, headers=ANON
     )
-    assert r.json()["user"]["role"] == "member" and r.json()["user"]["email_verified"] is False
-    assert db_session.execute(select(User)).scalar_one().role == "member"
+    assert r.json()["user"]["role"] == "user" and r.json()["user"]["email_verified"] is False
+    assert db_session.execute(select(User)).scalar_one().role == "user"
 
 
 # --- /me ----------------------------------------------------------------------------------------------
@@ -450,9 +450,9 @@ def test_me_patch_validates_and_ignores_privileged_fields(client: TestClient, db
         json={"name": " Newname ", "role": "admin", "email": "hacker@example.com", "is_active": False},
         headers=h,
     )
-    assert r.status_code == 200 and r.json()["name"] == "Newname" and r.json()["role"] == "member"
+    assert r.status_code == 200 and r.json()["name"] == "Newname" and r.json()["role"] == "user"
     db_session.refresh(user)
-    assert user.role == "member" and user.email == "alice@example.com" and user.is_active is True
+    assert user.role == "user" and user.email == "alice@example.com" and user.is_active is True
     assert client.get("/api/v1/me", headers=h).json() == client.get("/api/v1/auth/me", headers=h).json()
 
 
@@ -473,7 +473,7 @@ def test_auth_responses_are_not_cacheable(client: TestClient, db_session: Sessio
 def test_me_response_never_contains_credentials(client: TestClient, db_session: Session) -> None:
     user = make_user(db_session)
     body = client.get("/api/v1/me", headers=bearer(user)).json()
-    assert set(body) == {"id", "email", "name", "role", "email_verified", "created_at"}
+    assert set(body) == {"id", "email", "name", "role", "username", "email_verified", "created_at"}
 
 
 # --- forgot / reset / verify abuse ---------------------------------------------------------------------
@@ -640,7 +640,7 @@ def reg(client: TestClient, headers: dict, **body):
 def test_admin_can_create_members_and_admins_and_audit_it(client: TestClient, db_session: Session) -> None:
     admin, _ = _admin_and_member(db_session)
     default = reg(client, bearer(admin))
-    assert default.status_code == 201 and default.json()["role"] == "member" and default.json()["email_verified"]
+    assert default.status_code == 201 and default.json()["role"] == "user" and default.json()["email_verified"]
     as_admin = reg(client, bearer(admin), email="second.admin@example.com", role="admin")
     assert as_admin.status_code == 201 and as_admin.json()["role"] == "admin"
     events = db_session.execute(select(AuditLog).where(AuditLog.diff["event"].astext == "user_registered_by_admin"))
@@ -745,7 +745,7 @@ def test_auth_config_reports_setup_only_while_empty_and_configured(
     assert client.get("/api/v1/auth/config", headers=ANON).json() == {
         "signup_enabled": True,
         "setup_required": False,
-        "username_login": False,  # no ADMIN_EMAIL configured in tests
+        "username_login": True,  # handles (username / email local part) always sign in
     }
     monkeypatch.setattr(get_settings(), "bootstrap_token", SecretStr(secrets.token_urlsafe(30)))
     assert client.get("/api/v1/auth/config", headers=ANON).json()["setup_required"] is True

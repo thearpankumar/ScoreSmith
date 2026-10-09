@@ -62,6 +62,7 @@ async def find_similar_by_vector(
         )
         .join(ScorecardVersion, ScorecardVersion.id == ScorecardEmbedding.scorecard_version_id)
         .join(Scorecard, Scorecard.id == ScorecardVersion.scorecard_id)
+        .where(Scorecard.deleted_at.is_(None))  # trashed charts are never suggested
         .order_by(distance)
         .limit(top_n)
     )

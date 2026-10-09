@@ -11,10 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app import idempotency as idem
+from app.activity import log_edit
 from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
 from app.ai.judge import compute_final_score, effective_leaf_weights, leaf_nodes, run_judge
 from app.audit import audit
-from app.authz import accessible_evaluations, get_accessible_evaluation, get_owned_version
+from app.authz import accessible_evaluations, get_accessible_evaluation, get_accessible_version
 from app.config import get_settings
 from app.db import get_db
 from app.deps import get_bedrock_client, get_current_user
@@ -195,7 +196,7 @@ async def create_evaluation(
             existing = await db.get(Evaluation, uuid.UUID(stored["evaluation_id"]))
             if existing is not None:
                 return existing
-    await get_owned_version(db, current_user, payload.scorecard_version_id)  # may only evaluate one's own scorecards
+    version = await get_accessible_version(db, current_user, payload.scorecard_version_id)  # owner or collaborator
     # The evaluator / owner is always the authenticated user, never a client-supplied id.
     evaluation = Evaluation(**payload.model_dump(), evaluated_by=current_user.id, owner_id=current_user.id)
     db.add(evaluation)
@@ -203,6 +204,10 @@ async def create_evaluation(
         await db.flush()
         audit(db, request, actor_id=current_user.id, entity_type="evaluation", entity_id=evaluation.id,
               action=AuditAction.CREATE)
+        await log_edit(
+            db, version.scorecard_id, current_user, "evaluation_created", f"Created evaluation “{evaluation.name}”",
+            entity_type="evaluation", entity_id=evaluation.id, detail={"key": f"{evaluation.id}:1"},
+        )
         if key:
             await idem.remember(db, current_user.id, "evaluation", key, {"evaluation_id": str(evaluation.id)})
         await db.commit()

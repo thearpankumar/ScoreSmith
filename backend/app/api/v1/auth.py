@@ -11,7 +11,8 @@ import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,11 +20,12 @@ from app import mailer
 from app.audit import audit
 from app.auth import bootstrap, service
 from app.auth import security as sec
+from app.auth.handles import find_user_by_handle
 from app.config import get_settings
 from app.db import get_db
 from app.deps import get_current_user
 from app.models.enums import AuditAction
-from app.models.user import ROLE_ADMIN, ROLE_MEMBER, User
+from app.models.user import ROLE_ADMIN, ROLE_USER, User
 from app.ratelimit import rate_limit, within_limit
 from app.schemas.user import (
     AuthConfigResponse,
@@ -53,6 +55,12 @@ def _email_key(email: str) -> str:
 
 async def _find_user(db: AsyncSession, email: str) -> User | None:
     return (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
+
+
+async def _find_user_by_username(db: AsyncSession, username: str) -> User | None:
+    return (
+        await db.execute(select(User).where(func.lower(User.username) == username, User.deleted_at.is_(None)))
+    ).scalar_one_or_none()
 
 
 def _auth_response(user: User, access: str, expires_in: int) -> AuthResponse:
@@ -94,7 +102,7 @@ async def signup(
     user = User(
         email=email,
         name=payload.name.strip(),
-        role=ROLE_MEMBER,
+        role=ROLE_USER,
         password_hash=await sec.hash_password(payload.password),
     )
     db.add(user)
@@ -118,7 +126,7 @@ async def _verification_mail_task(email: str, name: str, raw: str) -> None:
     await mailer.send_email(
         email,
         "Verify your email address",
-        f"Hi {name},\n\nConfirm your email address to finish setting up your KPI Metrics account:\n\n{link}\n\n"
+        f"Hi {name},\n\nConfirm your email address to finish setting up your Score Smith account:\n\n{link}\n\n"
         f"This link works once and expires in {get_settings().email_verify_ttl_hours} hours. If you did not create "
         "an account you can ignore this message.\n",
     )
@@ -145,7 +153,8 @@ async def login(
             detail="Too many sign-in attempts. Try again in a few minutes.",
             headers={"Retry-After": "60"},
         )
-    user = await _find_user(db, email)
+    # Sign-in accepts the email or (since migration 0013) the account's username.
+    user = await find_user_by_handle(db, email)
     if user is not None:
         remaining = service.lockout_remaining_seconds(user)
         if remaining > 0:
@@ -270,7 +279,9 @@ async def auth_config(db: AsyncSession = Depends(get_db)) -> AuthConfigResponse:
     s = get_settings()
     setup = bool(s.bootstrap_token.get_secret_value()) and await bootstrap.user_count(db) == 0
     return AuthConfigResponse(
-        signup_enabled=s.signup_allowed, setup_required=setup, username_login=s.dev_username_login
+        signup_enabled=s.signup_allowed,
+        setup_required=setup,
+        username_login=True,  # handles (username, or the part of the email before the @) always sign in
     )
 
 
@@ -307,7 +318,7 @@ async def register_user(payload: RegisterUserRequest, request: Request, db: Asyn
     if actor is not None:
         if actor.role != ROLE_ADMIN:
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Administrator access required.")
-        role = payload.role or ROLE_MEMBER
+        role = payload.role or ROLE_USER
     else:
         expected = s.bootstrap_token.get_secret_value()
         if not expected or await bootstrap.user_count(db) > 0:
@@ -525,3 +536,37 @@ async def update_me(
     await db.commit()
     await db.refresh(user)
     return user
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=1, max_length=1024)
+
+
+@me_router.post(
+    "/password",
+    response_model=MessageResponse,
+    dependencies=[Depends(rate_limit("change-password", lambda s: "10/hour", per_user=True))],
+)
+async def change_my_password(
+    payload: ChangePasswordRequest,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> MessageResponse:
+    """Own password change (the Account dialog in the user menu - normal users have no Settings page). Needs the
+    current password; every session, including this one, is signed out afterwards."""
+    if not await sec.verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="The current password is not correct.")
+    policy = sec.admin_password_problem if user.role == ROLE_ADMIN else sec.password_problem
+    problem = policy(payload.new_password, user.email)
+    if problem:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problem)
+    user.password_hash = await sec.hash_password(payload.new_password)
+    await service.revoke_all_sessions(db, user)
+    audit(db, request, actor_id=user.id, entity_type="auth", entity_id=user.id, action=AuditAction.UPDATE,
+          event="password_changed")
+    await db.commit()
+    sec.clear_auth_cookies(response)
+    return MessageResponse(detail="Password changed. Please sign in again.")

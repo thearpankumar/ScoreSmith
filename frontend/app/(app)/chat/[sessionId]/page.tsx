@@ -2,7 +2,6 @@ import { notFound } from "next/navigation";
 
 import { ChatWorkspace } from "@/components/chat/ChatWorkspace";
 import { getChatSession } from "@/lib/api-client";
-import { MOCK_CURRENT_USER } from "@/lib/mock-data";
 import type { ChatSession, ScorecardDraft } from "@/lib/types";
 
 // Forced dynamic: live backend fetch on every request (see lib/api-client.ts apiFetch docstring).
@@ -26,7 +25,7 @@ export default async function ChatSessionPage({
     const now = new Date().toISOString();
     const session: ChatSession = {
       id: "new",
-      userId: MOCK_CURRENT_USER.id,
+      userId: "",
       title: "New scorecard",
       status: "active",
       contextSummary: "Just started.",

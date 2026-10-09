@@ -5,7 +5,7 @@ import { AuthCard } from "@/components/auth/AuthCard";
 import { SignupForm } from "@/components/auth/SignupForm";
 import { getAuthConfig } from "@/lib/auth-client";
 
-export const metadata: Metadata = { title: "Create account · KPI Metrics" };
+export const metadata: Metadata = { title: "Create account · Score Smith" };
 
 export default async function SignupPage() {
   const config = await getAuthConfig();

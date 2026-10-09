@@ -130,7 +130,7 @@ def hash_token(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def create_access_token(user_id: uuid.UUID) -> tuple[str, int]:
+def create_access_token(user_id: uuid.UUID, role: str | None = None) -> tuple[str, int]:
     s = get_settings()
     now = utcnow()
     expires = now + timedelta(minutes=s.access_token_minutes)
@@ -142,6 +142,10 @@ def create_access_token(user_id: uuid.UUID) -> tuple[str, int]:
         "jti": uuid.uuid4().hex,
         "typ": "access",
     }
+    if role:
+        # Advisory only: lets the Next.js middleware send a non-admin away from /admin early. The backend never
+        # trusts it - every admin API re-reads the role from the database (`require_admin`).
+        claims["rol"] = role
     return jwt.encode(claims, s.jwt_secret, algorithm=s.jwt_algorithm), s.access_token_minutes * 60
 
 

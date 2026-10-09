@@ -10,6 +10,7 @@ import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.evaluations_page import resolve_selection
 from app.audit import audit
 from app.authz import accessible_evaluation_ids
 from app.db import get_db
@@ -21,6 +22,7 @@ from app.reporting.export_data import load_export_bundle
 from app.reporting.workbook import ExportOptions, build_workbook
 from app.reporting.xlsx_safety import clean_text, slugify_filename
 from app.schemas.evaluation_export import EvaluationExportRequest
+from app.schemas.evaluation_page import MAX_FILTER_EXPORT, BulkSelection
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +48,19 @@ async def export_evaluations(
     final score are exported; deleted, failed, queued or unscored ones never appear in the workbook and are counted
     in `X-Export-Skipped` (and as one anonymous line on the Notes sheet)."""
     # Only evaluations the caller may access are loaded; ids belonging to someone else behave like missing ones.
-    allowed = await accessible_evaluation_ids(db, current_user, list(dict.fromkeys(payload.evaluation_ids)))
+    if payload.filter is not None:
+        # Server-side "select all matching": completed rows of the filter, access-checked, minus the exclusions.
+        flt = payload.filter.model_copy(update={"status": "completed"})
+        requested = await resolve_selection(
+            db, current_user, BulkSelection(filter=flt, exclude_ids=payload.exclude_ids), cap=MAX_FILTER_EXPORT
+        )
+        allowed = requested
+    else:
+        requested = list(dict.fromkeys(payload.evaluation_ids or []))
+        allowed = await accessible_evaluation_ids(db, current_user, requested)
     bundle = await load_export_bundle(db, allowed)
     # Ids the caller may not access are reported exactly like ids that do not exist.
-    bundle.missing_ids.extend(i for i in dict.fromkeys(payload.evaluation_ids) if i not in set(allowed))
+    bundle.missing_ids.extend(i for i in requested if i not in set(allowed))
     scored = [e for e in bundle.evaluations if e.is_scored]
     if not scored:
         if bundle.evaluations or bundle.excluded_count:
@@ -81,7 +92,7 @@ async def export_evaluations(
     await db.commit()
     logger.info(
         "evaluation export: user=%s requested=%d found=%d scored=%d skipped=%d bytes=%d",
-        current_user.id, len(payload.evaluation_ids), len(bundle.evaluations), len(scored), skipped, len(content),
+        current_user.id, len(requested), len(bundle.evaluations), len(scored), skipped, len(content),
     )
     return Response(
         content=content,

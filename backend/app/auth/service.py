@@ -50,7 +50,7 @@ async def start_session(
             **{k: v for k, v in request_context(request).items() if k in ("ip", "user_agent")},
         )
     )
-    access, expires_in = sec.create_access_token(user.id)
+    access, expires_in = sec.create_access_token(user.id, user.role)
     sec.set_access_cookie(response, access, expires_in)
     sec.set_refresh_cookie(response, raw, remember)
     csrf = request.cookies.get(sec.CSRF_COOKIE) if family_id else None
@@ -102,7 +102,7 @@ async def rotate_refresh(db: AsyncSession, request: Request, response: Response,
         if (now - row.used_at).total_seconds() <= s.refresh_reuse_grace_seconds:
             # Concurrent refresh (another tab already rotated this token): hand out an access token only; the
             # browser's cookie jar already holds the newer refresh token from the winning response.
-            access, expires_in = sec.create_access_token(user.id)
+            access, expires_in = sec.create_access_token(user.id, user.role)
             sec.set_access_cookie(response, access, expires_in)
             return user, access, expires_in
         await revoke_family(db, row.family_id)
@@ -157,6 +157,7 @@ async def register_failed_login(db: AsyncSession, user: User) -> None:
             update(User)
             .where(User.id == user.id)
             .values(failed_logins=User.failed_logins + 1)
+            .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
             .returning(User.failed_logins)
         )
     ).scalar_one()
@@ -205,6 +206,7 @@ async def consume_email_token(db: AsyncSession, raw: str, purpose: str) -> User 
                 PasswordResetToken.expires_at > now,
             )
             .values(used_at=now)
+            .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
             .returning(PasswordResetToken.user_id)
         )
     ).scalar_one_or_none()

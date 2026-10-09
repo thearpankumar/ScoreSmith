@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
 import Link from "next/link";
-import { AlertTriangle, ChevronRight, Loader2, Trash2 } from "lucide-react";
+import { AlertTriangle, ChevronRight, Loader2, RefreshCw, Trash2, Users } from "lucide-react";
 
-import { SolidPanel } from "@/components/design-system/SolidPanel";
 import { RagBadge } from "@/components/design-system/RagBadge";
+import { SolidPanel } from "@/components/design-system/SolidPanel";
+import { showToast, useLiveStatus } from "@/components/live/LiveStatusProvider";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -16,162 +17,280 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { EvaluationStatusBadge } from "./EvaluationStatusBadge";
-import { EvaluationSelectionBar, type ExportStatus } from "./EvaluationSelectionBar";
-import { deleteEvaluation, exportEvaluationsXlsx, listEvaluations } from "@/lib/api-client";
+import { deleteEvaluation, exportEvaluationsXlsx } from "@/lib/api-client";
+import {
+  bulkDeleteEvaluations,
+  DEFAULT_EVAL_QUERY,
+  evalFilterBody,
+  fetchEvaluationsPage,
+  listScorecardChoices,
+  refreshEvaluationRows,
+  type EvalPage,
+  type EvalQuery,
+  type EvalRow,
+} from "@/lib/collab-client";
 import { saveBlob } from "@/lib/download";
 import {
-  counts,
-  deselectMany,
-  describeFilters,
-  exportableSelection,
+  EMPTY_SELECTION,
+  exportableCount,
+  exportByFilter,
+  exportCap,
   headerState,
-  isSelectable,
-  previewNames,
-  prune,
-  rangeSelect,
-  selectMany,
-  selectableIds,
-  selectionInOrder,
-  toggle,
-} from "@/lib/eval-selection";
-import { runBulkDelete, summarizeFailures } from "@/lib/bulk-delete";
-import { usePersistedState } from "@/lib/usePersistedState";
-import {
-  ALL,
-  NO_FILTERS,
-  STATUS_OPTIONS,
-  filterEvaluations,
-  hasActiveFilters,
-  sanitizeScorecardFilter,
-  scorecardOptions,
-  type EvaluationFilters,
-  type StatusFilter,
-} from "@/lib/eval-filters";
+  hiddenCount,
+  isSelectableRow,
+  isSelected,
+  mergeRows,
+  patchRows,
+  pruneIds,
+  selectAllMatching,
+  selectedCount,
+  setRows,
+  toggleRow,
+  type BulkSelection,
+} from "@/lib/eval-bulk";
 import { isActiveStatus } from "@/lib/eval-status";
-import { useAdaptivePoll } from "@/lib/useAdaptivePoll";
+import { usePersistedState } from "@/lib/usePersistedState";
 import { cn, formatDateTime } from "@/lib/utils";
-import type { Evaluation } from "@/lib/types";
+import type { EvaluationStatus } from "@/lib/types";
+import { EvalFiltersBar, describeQuery } from "./EvalFiltersBar";
+import { EvaluationSelectionBar, type ExportStatus } from "./EvaluationSelectionBar";
+import { EvaluationStatusBadge } from "./EvaluationStatusBadge";
+
+type Phase = "loading" | "idle" | "more" | "error";
 
 /**
- * Client-side wrapper for the Evaluations list (moved out of `app/evaluations/page.tsx`,
- * a Server Component, so a hover-delete can remove a row from the visible list
- * immediately on success, matching the Charts library grid / chat SessionList pattern).
+ * The Evaluations list with INFINITE SCROLL. Rows come from `GET /evaluations/page`: server-side keyset pages (stable
+ * `(sort key, id)` order, so rows arriving while you scroll never duplicate or skip), every filter applied by the
+ * server, and a total count. An IntersectionObserver sentinel loads the next page; changing a filter or the sort
+ * resets the list. Selection is either explicit ids or a SERVER-SIDE "all N matching this filter" selection
+ * (bulk delete / Excel export resolve it themselves), so it works for thousands of rows that were never loaded.
+ * Running rows are refreshed in place by id (progress badges) and new arrivals are announced instead of shifting rows.
  */
 export function EvaluationsListClient({
-  evaluations: initialEvaluations,
-  batchId,
-  initialFilters = NO_FILTERS,
+  initialPage,
+  initialQuery,
 }: {
-  evaluations: Evaluation[];
-  /** When set, only that batch's evaluations are listed. */
-  batchId?: string;
-  /** Filters from the URL (`?scorecard=&status=`), so a filtered view can be bookmarked or shared. */
-  initialFilters?: EvaluationFilters;
+  initialPage: EvalPage | null;
+  initialQuery: EvalQuery;
 }) {
-  const [all, setAll] = useState<Evaluation[]>(initialEvaluations);
-  const deletedIds = useRef(new Set<string>());
-  const evaluations = useMemo(() => (batchId ? all.filter((e) => e.batchId === batchId) : all), [all, batchId]);
-  const setEvaluations = setAll;
+  const [query, setQuery] = useState<EvalQuery>(initialQuery);
+  const [searchText, setSearchText] = useState(initialQuery.q);
+  const [rows, setRows_] = useState<EvalRow[]>(initialPage?.items ?? []);
+  const [cursor, setCursor] = useState<string | null>(initialPage?.nextCursor ?? null);
+  const [counts, setCounts] = useState({
+    total: initialPage?.total ?? 0,
+    selectable: initialPage?.selectable ?? 0,
+    exportable: initialPage?.exportable ?? 0,
+    capped: initialPage?.totalCapped ?? false,
+    cap: initialPage?.countCap ?? 10000,
+  });
+  const [phase, setPhase] = useState<Phase>(initialPage ? "idle" : "loading");
+  const [error, setError] = useState<string | null>(null);
+  const [newCount, setNewCount] = useState(0);
+  const [scorecards, setScorecards] = useState<Array<{ id: string; name: string }>>([]);
 
-  // Filter by workflow (the scorecard an evaluation ran against) and by status.
-  const options = useMemo(() => scorecardOptions(evaluations), [evaluations]);
-  const [filters, setFilters] = useState<EvaluationFilters>(initialFilters);
-  // A scorecard that no longer has evaluations (deleted) must not leave the list empty behind a stale filter.
-  const effective = useMemo<EvaluationFilters>(
-    () => ({ ...filters, scorecardId: sanitizeScorecardFilter(filters.scorecardId, options) }),
-    [filters, options],
-  );
-  const visible = useMemo(() => filterEvaluations(evaluations, effective), [evaluations, effective]);
+  const requestId = useRef(0);
+  const sentinel = useRef<HTMLDivElement>(null);
+  const loadedTotal = useRef(initialPage?.total ?? 0);
+  const firstRun = useRef(true);
+  const { slots } = useLiveStatus();
 
-  // ---- Multi-select + Excel export ----------------------------------------------------------------------
-  // The whole list is one page (capped at 200), so "select all" over the filtered view is every selectable
-  // visible row. Selection survives filter changes (hidden selected rows stay selected and are counted).
-  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  // ---- loading -------------------------------------------------------------------------------------------------
+  const loadFirst = useCallback(async (q: EvalQuery) => {
+    const mine = ++requestId.current;
+    setPhase("loading");
+    setError(null);
+    try {
+      const page = await fetchEvaluationsPage(q, { limit: 40 });
+      if (mine !== requestId.current) return; // a newer filter change superseded this answer
+      setRows_(page.items);
+      setCursor(page.nextCursor);
+      setCounts({ total: page.total, selectable: page.selectable, exportable: page.exportable, capped: page.totalCapped, cap: page.countCap });
+      loadedTotal.current = page.total;
+      setNewCount(0);
+      setPhase("idle");
+    } catch (err) {
+      if (mine !== requestId.current) return;
+      setError(err instanceof Error ? err.message : "Could not load evaluations.");
+      setPhase("error");
+    }
+  }, []);
+
+  const loadMore = useCallback(async () => {
+    if (!cursor) return;
+    const mine = requestId.current;
+    setPhase("more");
+    try {
+      const page = await fetchEvaluationsPage(query, { cursor, limit: 40 });
+      if (mine !== requestId.current) return;
+      setRows_((prev) => mergeRows(prev, page.items));
+      setCursor(page.nextCursor);
+      setPhase("idle");
+    } catch (err) {
+      if (mine !== requestId.current) return;
+      setError(err instanceof Error ? err.message : "Could not load more evaluations.");
+      setPhase("error");
+    }
+  }, [cursor, query]);
+
+  // Filters / sort changed -> reset and reload (the server-rendered first page covers the initial query).
+  useEffect(() => {
+    if (firstRun.current) {
+      firstRun.current = false;
+      if (initialPage) return;
+    }
+    void loadFirst(query);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, loadFirst]);
+
+  // Typing in the search box applies after a short pause.
+  useEffect(() => {
+    if (searchText === query.q) return;
+    const t = setTimeout(() => setQuery((q) => ({ ...q, q: searchText })), 300);
+    return () => clearTimeout(t);
+  }, [searchText, query.q]);
+
+  useEffect(() => {
+    void listScorecardChoices()
+      .then(setScorecards)
+      .catch(() => undefined);
+  }, []);
+
+  // Keep the address bar in step (bookmarkable), without a navigation.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const set = (k: string, v: string | null) => (v ? url.searchParams.set(k, v) : url.searchParams.delete(k));
+    set("scorecard", query.scorecardId);
+    set("status", query.status === "all" ? null : query.status);
+    set("q", query.q.trim() || null);
+    set("batch", query.batchId);
+    window.history.replaceState(null, "", url.toString());
+  }, [query.scorecardId, query.status, query.q, query.batchId]);
+
+  // ---- infinite scroll sentinel --------------------------------------------------------------------------------
+  const hasMore = cursor !== null;
+  useEffect(() => {
+    const el = sentinel.current;
+    if (!el || !hasMore || phase !== "idle") return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) void loadMore();
+      },
+      { rootMargin: "600px 0px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+    // `rows.length` re-arms the observer after each page, so a sentinel that is still on screen loads the next one.
+  }, [hasMore, phase, loadMore, rows.length]);
+
+  // ---- live progress + arrivals --------------------------------------------------------------------------------
+  const activeIds = useMemo(() => rows.filter((r) => isActiveStatus(r.status as EvaluationStatus)).map((r) => r.id), [rows]);
+  const activeRef = useRef(activeIds);
+  useEffect(() => {
+    activeRef.current = activeIds;
+  });
+  const queryRef = useRef(query);
+  useEffect(() => {
+    queryRef.current = query;
+  });
+  const busyRunner = Boolean(slots.job);
+  useEffect(() => {
+    const interval = activeIds.length > 0 || busyRunner ? 4000 : 20000;
+    const id = setInterval(async () => {
+      if (document.hidden) return;
+      try {
+        const ids = activeRef.current.slice(0, 100);
+        if (ids.length) {
+          const fresh = await refreshEvaluationRows(ids);
+          setRows_((prev) => patchRows(prev, fresh));
+          const gone = ids.filter((i) => !fresh.some((f) => f.id === i)); // deleted meanwhile
+          if (gone.length) setRows_((prev) => prev.filter((r) => !gone.includes(r.id)));
+        }
+        const head = await fetchEvaluationsPage(queryRef.current, { limit: 1 });
+        setNewCount(Math.max(0, head.total - loadedTotal.current));
+        setCounts((c) => ({ ...c, selectable: head.selectable, exportable: head.exportable }));
+      } catch {
+        /* polling is best effort */
+      }
+    }, interval);
+    return () => clearInterval(id);
+  }, [activeIds.length > 0, busyRunner]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---- selection ------------------------------------------------------------------------------------------------
+  const [selection, setSelection] = useState<BulkSelection>(EMPTY_SELECTION);
   const [includeReasoning, setIncludeReasoning] = usePersistedState("evaluations.export.includeReasoning", true);
   const [exportStatus, setExportStatus] = useState<ExportStatus>({ kind: "idle" });
   const [bulkOpen, setBulkOpen] = useState(false);
-  const anchorRef = useRef<string | null>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const exportAbort = useRef<AbortController | null>(null);
   const headerRef = useRef<HTMLInputElement>(null);
+  const anchor = useRef<string | null>(null);
 
-  const allSelectable = useMemo(() => selectableIds(evaluations), [evaluations]);
-  const visibleSelectable = useMemo(() => selectableIds(visible), [visible]);
-  const hState = headerState(visibleSelectable, selected);
-  const sel = counts(selected, visibleSelectable);
-  const hiddenSelectable = allSelectable.length - visibleSelectable.length;
-  const exportableCount = exportableSelection(selected, evaluations).length;
-  const bulkBusy = exportStatus.kind === "exporting" || exportStatus.kind === "deleting";
-  const allVisibleSelected = hState === "all";
-
-  // Drop ids that vanished or stopped being selectable (list refresh, delete).
+  // A server-side "all matching" selection belongs to ONE filter: a different filter starts a fresh selection.
+  const filterKey = JSON.stringify(evalFilterBody(query));
   useEffect(() => {
-    setSelected((prev) => prune(prev, allSelectable));
-  }, [allSelectable]);
+    setSelection((s) => (s.all ? EMPTY_SELECTION : s));
+    anchor.current = null;
+  }, [filterKey]);
+
+  const loadedSelectable = useMemo(() => rows.filter(isSelectableRow).map((r) => r.id), [rows]);
+  const hState = headerState(selection, loadedSelectable);
+  const nSelected = selectedCount(selection, counts.selectable);
+  const nExportable = exportableCount(selection, rows, counts.exportable);
+  const busyBulk = exportStatus.kind === "exporting" || exportStatus.kind === "deleting";
 
   useEffect(() => {
     if (headerRef.current) headerRef.current.indeterminate = hState === "some";
   }, [hState]);
-
-  // The success note fades after a few seconds.
   useEffect(() => {
     if (exportStatus.kind !== "success") return;
     const t = setTimeout(() => setExportStatus({ kind: "idle" }), 6000);
     return () => clearTimeout(t);
   }, [exportStatus]);
-
   useEffect(() => () => exportAbort.current?.abort(), []);
 
-  function onHeaderToggle() {
-    setSelected((prev) => (hState === "all" ? deselectMany(prev, visibleSelectable) : selectMany(prev, visibleSelectable)));
-    anchorRef.current = null;
-  }
-
   function onRowToggle(id: string, shift: boolean) {
-    setSelected((prev) => {
-      const willSelect = !prev.has(id);
-      return shift && anchorRef.current
-        ? rangeSelect(prev, visibleSelectable, anchorRef.current, id, willSelect)
-        : toggle(prev, id);
+    setSelection((prev) => {
+      if (shift && anchor.current) {
+        const a = loadedSelectable.indexOf(anchor.current);
+        const b = loadedSelectable.indexOf(id);
+        if (a !== -1 && b !== -1) {
+          const [from, to] = [Math.min(a, b), Math.max(a, b)];
+          return setRows(prev, loadedSelectable.slice(from, to + 1), !isSelected(prev, id));
+        }
+      }
+      return toggleRow(prev, id);
     });
-    anchorRef.current = id;
+    anchor.current = id;
   }
 
-  function clearSelection() {
-    setSelected(new Set());
-    anchorRef.current = null;
-  }
-
-  function filterSummary(): string | undefined {
-    return describeFilters({
-      workflow: effective.scorecardId === ALL ? null : (options.find((o) => o.id === effective.scorecardId)?.name ?? null),
-      status: effective.status === ALL ? null : (STATUS_OPTIONS.find((o) => o.value === effective.status)?.label ?? null),
-    });
-  }
+  const scorecardName = (id: string) => scorecards.find((s) => s.id === id)?.name ?? null;
+  const filterSummary = describeQuery(query, scorecardName).join(" · ").slice(0, 300) || undefined;
 
   async function runExport() {
-    const ids = exportableSelection(selected, evaluations);
-    if (ids.length === 0 || bulkBusy) return;
+    if (nExportable === 0 || busyBulk) return;
     const controller = new AbortController();
     exportAbort.current = controller;
-    const timeout = setTimeout(() => controller.abort(), 90_000);
+    const timeout = setTimeout(() => controller.abort(), 120_000);
     setExportStatus({ kind: "exporting" });
     try {
-      const result = await exportEvaluationsXlsx(ids, {
-        includeReasoning,
-        filterSummary: filterSummary(),
-        signal: controller.signal,
-      });
+      const target = exportByFilter(selection)
+        ? {
+            filter: evalFilterBody(query),
+            excludeIds: selection.all ? [...selection.excluded] : [],
+          }
+        : rows.filter((r) => selection.ids.has(r.id)).map((r) => r.id);
+      const result = await exportEvaluationsXlsx(target, { includeReasoning, filterSummary, signal: controller.signal });
       saveBlob(result.blob, result.filename);
       const skipped =
-        result.skipped > 0
-          ? ` ${result.skipped} evaluation${result.skipped === 1 ? " was" : "s were"} skipped (deleted or not completed).`
-          : "";
-      setExportStatus({
-        kind: "success",
-        message: `Downloaded ${result.filename} (${result.count} evaluation${result.count === 1 ? "" : "s"}).${skipped}`,
-      });
+        result.skipped > 0 ? ` ${result.skipped} evaluation${result.skipped === 1 ? " was" : "s were"} skipped (deleted or not completed).` : "";
+      const message = `Downloaded ${result.filename} (${result.count} evaluation${result.count === 1 ? "" : "s"}).${skipped}`;
+      // Only a successful export gets here (a failure jumps to the catch below and keeps the selection so the user can
+      // retry). The toast carries the message, so the selection bar goes away with the selection (status back to idle).
+      setExportStatus({ kind: "idle" });
+      setSelection(EMPTY_SELECTION);
+      anchor.current = null;
+      showToast({ kind: "success", title: "Export complete", body: message });
     } catch (err) {
       const message = controller.signal.aborted
         ? "The export took too long and was cancelled. Try a smaller selection."
@@ -184,75 +303,45 @@ export function EvaluationsListClient({
     }
   }
 
-  /** Deletes the whole selection (completed + failed rows) after the confirmation dialog. */
-  async function runBulkDeleteSelection() {
-    const ids = selectionInOrder(selected, evaluations.map((e) => e.id));
+  async function runBulkDelete() {
     setBulkOpen(false);
-    if (ids.length === 0 || bulkBusy) return;
-    setExportStatus({ kind: "deleting", done: 0, total: ids.length });
-    const result = await runBulkDelete(ids, deleteEvaluation, {
-      concurrency: 4,
-      onProgress: (done, total) => setExportStatus({ kind: "deleting", done, total }),
-    });
-    // Drop what was deleted from the list and the selection right away; failures stay listed AND selected.
-    if (result.succeeded.length > 0) {
-      const gone = new Set(result.succeeded);
-      for (const id of gone) deletedIds.current.add(id);
-      setEvaluations((prev) => prev.filter((e) => !gone.has(e.id)));
-      setSelected((prev) => deselectMany(prev, result.succeeded));
-    }
-    if (result.failed.length === 0) {
+    if (nSelected === 0 || busyBulk) return;
+    setExportStatus({ kind: "deleting", done: 0, total: nSelected });
+    try {
+      const result = await bulkDeleteEvaluations(
+        selection.all
+          ? { filter: query, excludeIds: [...selection.excluded] }
+          : { ids: [...selection.ids] },
+      );
+      const gone = new Set(selection.all ? [] : selection.ids);
+      setRows_((prev) => (selection.all ? prev.filter((r) => !isSelectableRow(r) || selection.excluded.has(r.id)) : prev.filter((r) => !gone.has(r.id))));
+      setSelection(EMPTY_SELECTION);
       setExportStatus({
         kind: "success",
-        message: `Deleted ${result.succeeded.length} evaluation${result.succeeded.length === 1 ? "" : "s"}.`,
+        message:
+          `Deleted ${result.deleted} evaluation${result.deleted === 1 ? "" : "s"}.` +
+          (result.skipped > 0 ? ` ${result.skipped} still running or unavailable were kept.` : ""),
       });
-    } else {
-      const ok = result.succeeded.length > 0 ? `Deleted ${result.succeeded.length}. ` : "";
-      setExportStatus({ kind: "error", action: "delete", message: `${ok}${summarizeFailures(result.failed)} They are still selected.` });
+      await loadFirst(query);
+    } catch (err) {
+      setExportStatus({ kind: "error", action: "delete", message: err instanceof Error ? err.message : "Couldn't delete the evaluations." });
     }
   }
 
-  function changeFilters(next: EvaluationFilters) {
-    setFilters(next);
-    // Keep the address bar in step without a navigation (no re-fetch, no scroll jump).
-    const url = new URL(window.location.href);
-    if (next.scorecardId === ALL) url.searchParams.delete("scorecard");
-    else url.searchParams.set("scorecard", next.scorecardId);
-    if (next.status === ALL) url.searchParams.delete("status");
-    else url.searchParams.set("status", next.status);
-    window.history.replaceState(null, "", url.toString());
-  }
-
-  // Poll while anything is queued / running so badges and scores fill in live.
-  const hasActive = all.some((e) => isActiveStatus(e.status));
-  useAdaptivePoll(
-    async () => {
-      const rows = await listEvaluations();
-      setAll(rows.filter((e) => !deletedIds.current.has(e.id)).sort((a, b) => b.submittedAt.localeCompare(a.submittedAt)));
-    },
-    hasActive,
-    2,
-  );
-
-  // 1-based position among queued rows, oldest queued first.
-  const queuePositions = useMemo(() => {
-    const queued = all
-      .filter((e) => e.status === "queued")
-      .sort((a, b) => (a.queuedAt ?? a.submittedAt).localeCompare(b.queuedAt ?? b.submittedAt));
-    return new Map(queued.map((e, i) => [e.id, i + 1]));
-  }, [all]);
-  const [pendingDelete, setPendingDelete] = useState<Evaluation | null>(null);
+  // ---- single delete ---------------------------------------------------------------------------------------------
+  const [pendingDelete, setPendingDelete] = useState<EvalRow | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-
   async function confirmDelete() {
     if (!pendingDelete) return;
     setDeleting(true);
     setDeleteError(null);
     try {
       await deleteEvaluation(pendingDelete.id);
-      deletedIds.current.add(pendingDelete.id);
-      setEvaluations((prev) => prev.filter((e) => e.id !== pendingDelete.id));
+      setRows_((prev) => prev.filter((r) => r.id !== pendingDelete.id));
+      setCounts((c) => ({ ...c, total: Math.max(0, c.total - 1), selectable: Math.max(0, c.selectable - 1) }));
+      loadedTotal.current = Math.max(0, loadedTotal.current - 1);
+      setSelection((s) => pruneIds(toggleIfSelected(s, pendingDelete.id), new Set(rows.map((r) => r.id))));
       setPendingDelete(null);
     } catch (err) {
       setDeleteError(err instanceof Error ? err.message : "Couldn't delete this evaluation. Try again.");
@@ -261,81 +350,64 @@ export function EvaluationsListClient({
     }
   }
 
-  if (evaluations.length === 0) {
-    return <SolidPanel className="p-6 text-sm text-ink-muted">No evaluations yet.</SolidPanel>;
-  }
+  const filtered = describeQuery(query, scorecardName).length > 0;
+  const showEmpty = phase !== "loading" && rows.length === 0 && phase !== "error";
 
   return (
     <>
-      <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Filter evaluations">
-        <FilterSelect
-          label="Workflow (scorecard)"
-          value={effective.scorecardId}
-          onChange={(scorecardId) => changeFilters({ ...effective, scorecardId })}
-          options={[
-            { value: ALL, label: `All workflows (${evaluations.length})` },
-            ...options.map((o) => ({ value: o.id, label: `${o.name} (${o.count})` })),
-          ]}
-        />
-        <FilterSelect
-          label="Status"
-          value={effective.status}
-          onChange={(status) => changeFilters({ ...effective, status: status as StatusFilter })}
-          options={STATUS_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
-        />
-        {hasActiveFilters(effective) && (
-          <>
-            <span className="text-xs text-ink-muted tabular-nums" aria-live="polite">
-              Showing {visible.length} of {evaluations.length}
-            </span>
-            <Button type="button" variant="ghost" size="sm" onClick={() => changeFilters(NO_FILTERS)}>
-              Clear filters
-            </Button>
-          </>
-        )}
-      </div>
-
-      {visible.length === 0 && (
-        <SolidPanel className="p-6 text-sm text-ink-muted">
-          No evaluations match these filters.{" "}
-          <button type="button" className="underline underline-offset-2 hover:text-ink" onClick={() => changeFilters(NO_FILTERS)}>
-            Clear filters
-          </button>
-        </SolidPanel>
+      <EvalFiltersBar
+        query={query}
+        searchText={searchText}
+        onSearchText={setSearchText}
+        onChange={setQuery}
+        scorecards={scorecards}
+        total={phase === "loading" && rows.length === 0 ? null : counts.total}
+      />
+      {counts.capped && (
+        <p className="text-xs text-ink-muted">Counting stops at {counts.cap.toLocaleString()}; narrow the filters for an exact number.</p>
       )}
 
-      {allSelectable.length > 0 && visible.length > 0 && (
+      {newCount > 0 && (
+        <div role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-lemon-soft px-3 py-2 text-sm text-lemon-ink">
+          <span>
+            {newCount} new evaluation{newCount === 1 ? "" : "s"} matching these filters.
+          </span>
+          <Button type="button" size="sm" className="min-h-11 sm:min-h-8" onClick={() => void loadFirst(query)}>
+            <RefreshCw aria-hidden /> Show
+          </Button>
+        </div>
+      )}
+
+      {rows.length > 0 && counts.selectable > 0 && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 py-0.5 text-xs text-ink-muted">
-          <label className="flex cursor-pointer items-center gap-2">
+          <label className="flex min-h-11 cursor-pointer items-center gap-2">
             <input
               ref={headerRef}
               type="checkbox"
-              checked={allVisibleSelected}
-              aria-checked={hState === "some" ? "mixed" : allVisibleSelected}
-              onChange={onHeaderToggle}
-              disabled={visibleSelectable.length === 0}
-              aria-label={`Select all ${visibleSelectable.length} completed or failed evaluations in this view`}
+              checked={hState === "all" || selection.all}
+              aria-checked={hState === "some" ? "mixed" : hState === "all" || selection.all}
+              onChange={() =>
+                setSelection((prev) => (hState === "all" ? setRows(prev, loadedSelectable, false) : setRows(prev, loadedSelectable, true)))
+              }
+              disabled={loadedSelectable.length === 0}
+              aria-label={`Select the ${loadedSelectable.length} completed or failed evaluations loaded so far`}
               className="size-4 accent-[var(--ink)]"
             />
-            <span>Select all in view ({visibleSelectable.length})</span>
+            <span>Select loaded ({loadedSelectable.length})</span>
           </label>
-          {evaluations.length >= 200 && <span>Showing your 200 most recent evaluations</span>}
-          {allVisibleSelected && hiddenSelectable > 0 && sel.hidden < hiddenSelectable && (
+          {!selection.all && hState === "all" && counts.selectable > loadedSelectable.length && (
             <span aria-live="polite" className="min-w-0">
-              All {visibleSelectable.length} selectable evaluations in this view are selected.{" "}
-              <button
-                type="button"
-                className="underline underline-offset-2 hover:text-ink"
-                onClick={() => setSelected((prev) => selectMany(prev, allSelectable))}
-              >
-                Select all {allSelectable.length} evaluations
+              {loadedSelectable.length} selected.{" "}
+              <button type="button" className="min-h-11 underline underline-offset-2 hover:text-ink sm:min-h-0" onClick={() => setSelection(selectAllMatching())}>
+                Select all {counts.selectable.toLocaleString()}
+                {counts.capped ? "+" : ""} matching this filter
               </button>
             </span>
           )}
-          {selected.size === allSelectable.length && hiddenSelectable > 0 && (
-            <span aria-live="polite">
-              All {allSelectable.length} selectable evaluations are selected.{" "}
-              <button type="button" className="underline underline-offset-2 hover:text-ink" onClick={clearSelection}>
+          {selection.all && (
+            <span aria-live="polite" className="min-w-0">
+              All {nSelected.toLocaleString()} matching evaluations are selected{selection.excluded.size > 0 ? ` (${selection.excluded.size} unticked)` : ""}.{" "}
+              <button type="button" className="min-h-11 underline underline-offset-2 hover:text-ink sm:min-h-0" onClick={() => setSelection(EMPTY_SELECTION)}>
                 Clear selection
               </button>
             </span>
@@ -343,98 +415,97 @@ export function EvaluationsListClient({
         </div>
       )}
 
-      <SolidPanel
-        className={cn("divide-y divide-hairline", visible.length === 0 && "hidden")}
-        onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => {
-          if (e.key === "Escape" && selected.size > 0) clearSelection();
-        }}
-      >
-        {visible.map((evaluation) => {
-          const selectable = isSelectable(evaluation);
-          const isSelected = selected.has(evaluation.id);
-          return (
-          // `group relative` wraps the row's Link + its hover-reveal delete button as
-          // SIBLINGS, not delete-button-inside-Link — nesting a <button> inside the <a> a
-          // Link renders would be invalid, click-ambiguous HTML. The selection checkbox is a sibling too.
-          <div
-            key={evaluation.id}
-            // Always reserve the 4px accent edge (transparent when unselected) so selecting never shifts the row content.
-            className={cn("group relative border-l-4 border-l-transparent", isSelected && "border-l-[var(--ink)] bg-[var(--lemon-soft)]")}
-          >
-            <input
-              type="checkbox"
-              checked={isSelected}
-              disabled={!selectable}
-              onChange={() => undefined}
-              onClick={(e) => onRowToggle(evaluation.id, e.shiftKey)}
-              aria-label={`Select evaluation “${evaluation.name}”`}
-              title={selectable ? undefined : "Only completed or failed evaluations can be selected"}
-              className="absolute left-3 top-1/2 z-10 size-4 -translate-y-1/2 accent-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-40"
-            />
-            <Link
-              href={`/charts/${evaluation.scorecardId}/evaluations/${evaluation.id}`}
-              className="flex items-center justify-between gap-3 py-4 pl-11 pr-10 transition-colors sm:pr-12 hover:bg-bg focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--focus)]"
-            >
-              <div className="min-w-0 flex-1">
-                <div className="flex min-w-0 items-center gap-2">
-                  <p className="min-w-0 truncate text-sm font-medium text-ink">{evaluation.name}</p>
-                  <Badge variant="muted" className="shrink-0">{evaluation.domain}</Badge>
-                </div>
-                <p className="mt-0.5 truncate text-xs text-ink-muted" suppressHydrationWarning>
-                  {[evaluation.subjectName, evaluation.subjectEmail].filter(Boolean).length > 0 &&
-                    `${[evaluation.subjectName, evaluation.subjectEmail].filter(Boolean).join(" · ")} · `}
-                  {evaluation.scorecardName} · {evaluation.evaluatedByName} · {formatDateTime(evaluation.submittedAt)}
-                </p>
-              </div>
-              <div className="flex shrink-0 items-center gap-2 sm:gap-3">
-                {/* An evaluation that never finished scoring has no real score — don't show it as "0.0 Critical". */}
-                {evaluation.status === "completed" ? (
-                  <RagBadge score={evaluation.finalWeightedScore} size="sm" target={evaluation.targetScore} />
-                ) : (
-                  <EvaluationStatusBadge evaluation={evaluation} queuePosition={queuePositions.get(evaluation.id)} />
-                )}
-                <ChevronRight className="hidden size-4 text-ink-muted sm:block" aria-hidden />
-              </div>
-            </Link>
-            <button
-              type="button"
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
+      {phase === "loading" && rows.length === 0 && (
+        <SolidPanel className="flex items-center gap-2 p-6 text-sm text-ink-muted" aria-busy>
+          <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden /> Loading evaluations…
+        </SolidPanel>
+      )}
+
+      {showEmpty && (
+        <SolidPanel className="p-6 text-sm text-ink-muted" data-testid="eval-empty">
+          {filtered ? (
+            <>
+              No evaluations match these filters.{" "}
+              <button
+                type="button"
+                className="min-h-11 underline underline-offset-2 hover:text-ink"
+                onClick={() => {
+                  setSearchText("");
+                  setQuery({ ...DEFAULT_EVAL_QUERY, batchId: query.batchId, sort: query.sort });
+                }}
+              >
+                Clear filters
+              </button>
+            </>
+          ) : (
+            "No evaluations yet."
+          )}
+        </SolidPanel>
+      )}
+
+      {rows.length > 0 && (
+        <SolidPanel
+          className={cn("divide-y divide-hairline transition-opacity", phase === "loading" && "opacity-60")}
+          aria-busy={phase === "loading"}
+          data-testid="eval-list"
+          onKeyDown={(e: KeyboardEvent<HTMLDivElement>) => {
+            if (e.key === "Escape" && nSelected > 0) setSelection(EMPTY_SELECTION);
+          }}
+        >
+          {rows.map((row) => (
+            <EvalRowView
+              key={row.id}
+              row={row}
+              selected={isSelected(selection, row.id) && isSelectableRow(row)}
+              onToggle={onRowToggle}
+              onDelete={(r) => {
                 setDeleteError(null);
-                setPendingDelete(evaluation);
+                setPendingDelete(r);
               }}
-              aria-label={`Delete evaluation “${evaluation.name}”`}
-              title="Delete evaluation"
-              className={cn(
-                "absolute right-2 top-1/2 -translate-y-1/2 rounded-full p-1.5 text-ink-muted sm:right-4",
-                "opacity-0 transition-opacity hover:bg-[var(--rag-poor)]/10 hover:text-[var(--rag-poor)]",
-                // Hover-reveal, but visible on keyboard focus too (group-focus-within /
-                // focus-visible — hover-only is unreachable without a mouse) and always
-                // visible on touch/coarse-pointer devices (no hover concept there).
-                "group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100",
-                "[@media(hover:none)]:opacity-100",
-                "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]",
-              )}
-            >
-              <Trash2 className="size-3.5" aria-hidden />
-            </button>
-          </div>
-          );
-        })}
-      </SolidPanel>
+            />
+          ))}
+        </SolidPanel>
+      )}
+
+      {/* The sentinel + the four end-of-list states: loading more, error with retry, end, (empty handled above). */}
+      <div ref={sentinel} aria-hidden className="h-px" />
+      <div className="flex min-h-11 items-center justify-center text-xs text-ink-muted" aria-live="polite" data-testid="eval-footer">
+        {phase === "more" && (
+          <span className="flex items-center gap-2">
+            <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden /> Loading more…
+          </span>
+        )}
+        {phase === "error" && (
+          <span role="alert" className="flex flex-wrap items-center justify-center gap-2 text-[var(--rag-poor)]">
+            <AlertTriangle className="size-4" aria-hidden /> {error}
+            <Button type="button" variant="outline" size="sm" className="min-h-11" onClick={() => (rows.length === 0 ? void loadFirst(query) : void loadMore())}>
+              Retry
+            </Button>
+          </span>
+        )}
+        {phase === "idle" && !hasMore && rows.length > 0 && (
+          <span data-testid="eval-end">You&apos;ve reached the end · {rows.length.toLocaleString()} shown</span>
+        )}
+        {phase === "idle" && hasMore && (
+          <Button type="button" variant="ghost" size="sm" className="min-h-11" onClick={() => void loadMore()}>
+            Load more
+          </Button>
+        )}
+      </div>
 
       <EvaluationSelectionBar
-        total={sel.total}
-        exportable={exportableCount}
-        hidden={sel.hidden}
+        total={nSelected}
+        exportable={nExportable}
+        hidden={hiddenCount(selection, rows.map((r) => r.id))}
+        allMatching={selection.all}
+        maxExport={exportCap(selection)}
         includeReasoning={includeReasoning}
         onIncludeReasoning={setIncludeReasoning}
         status={exportStatus}
         onExport={runExport}
         onDelete={() => setBulkOpen(true)}
-        onClear={clearSelection}
-        onDeselectHidden={() => setSelected((prev) => new Set([...prev].filter((id) => visibleSelectable.includes(id))))}
+        onClear={() => setSelection(EMPTY_SELECTION)}
+        onDeselectHidden={() => setSelection((s) => ({ ...s, ids: new Set([...s.ids].filter((id) => rows.some((r) => r.id === id))) }))}
       />
 
       <Dialog open={!!pendingDelete} onOpenChange={(open) => !open && !deleting && setPendingDelete(null)}>
@@ -450,29 +521,33 @@ export function EvaluationsListClient({
             </p>
           )}
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => setPendingDelete(null)} disabled={deleting}>
+            <Button type="button" variant="ghost" className="min-h-11" onClick={() => setPendingDelete(null)} disabled={deleting}>
               Cancel
             </Button>
-            <Button type="button" variant="destructive" onClick={confirmDelete} disabled={deleting}>
+            <Button type="button" variant="destructive" className="min-h-11" onClick={confirmDelete} disabled={deleting}>
               {deleting && <Loader2 className="size-3.5 animate-spin" aria-hidden />}
               Delete
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
       <Dialog open={bulkOpen} onOpenChange={setBulkOpen}>
         <DialogContent
-          // Cancel is the default focus, so Enter/Space on open can never confirm a destructive delete.
           onOpenAutoFocus={(e) => {
             e.preventDefault();
-            cancelRef.current?.focus();
+            cancelRef.current?.focus(); // Cancel is the default so Enter/Space can never confirm a destructive delete
           }}
         >
           <BulkDeleteBody
-            names={evaluations.filter((e) => selected.has(e.id)).map((e) => e.name)}
+            count={nSelected}
+            allMatching={selection.all}
+            excluded={selection.excluded.size}
+            names={rows.filter((r) => selection.ids.has(r.id)).map((r) => r.name)}
+            summary={describeQuery(query, scorecardName)}
             cancelRef={cancelRef}
             onCancel={() => setBulkOpen(false)}
-            onConfirm={runBulkDeleteSelection}
+            onConfirm={runBulkDelete}
           />
         </DialogContent>
       </Dialog>
@@ -480,75 +555,153 @@ export function EvaluationsListClient({
   );
 }
 
+function toggleIfSelected(sel: BulkSelection, id: string): BulkSelection {
+  return isSelected(sel, id) && !sel.all ? toggleRow(sel, id) : sel;
+}
+
+const EvalRowView = memo(function EvalRowView({
+  row,
+  selected,
+  onToggle,
+  onDelete,
+}: {
+  row: EvalRow;
+  selected: boolean;
+  onToggle: (id: string, shift: boolean) => void;
+  onDelete: (row: EvalRow) => void;
+}) {
+  const selectable = isSelectableRow(row);
+  const status = row.status as EvaluationStatus;
+  return (
+    <div
+      // `content-visibility:auto` lets the browser skip layout/paint of rows far off screen, so thousands of loaded
+      // rows stay cheap; the intrinsic size keeps the scrollbar stable.
+      className={cn(
+        "group relative border-l-4 border-l-transparent [content-visibility:auto] [contain-intrinsic-size:auto_76px]",
+        selected && "border-l-[var(--ink)] bg-[var(--lemon-soft)]",
+      )}
+      data-testid="eval-row"
+      data-status={row.status}
+    >
+      <input
+        type="checkbox"
+        checked={selected}
+        disabled={!selectable}
+        onChange={() => undefined}
+        onClick={(e) => onToggle(row.id, e.shiftKey)}
+        aria-label={`Select evaluation “${row.name}”`}
+        title={selectable ? undefined : "Only completed or failed evaluations can be selected"}
+        className="absolute left-3 top-1/2 z-10 size-4 -translate-y-1/2 accent-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-40"
+      />
+      <Link
+        href={`/charts/${row.scorecardId}/evaluations/${row.id}`}
+        className="flex min-h-[4.25rem] items-center justify-between gap-3 py-4 pl-11 pr-10 transition-colors hover:bg-bg focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--focus)] sm:pr-12"
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            <p className="min-w-0 truncate text-sm font-medium text-ink">{row.name}</p>
+            {row.domain && <Badge variant="muted" className="shrink-0">{row.domain}</Badge>}
+            {row.shared && (
+              <Badge variant="soft" className="shrink-0" title="This chart is shared with collaborators">
+                <Users className="size-3" aria-hidden /> Shared
+              </Badge>
+            )}
+          </div>
+          <p className="mt-0.5 truncate text-xs text-ink-muted" suppressHydrationWarning>
+            {[row.subjectName, row.subjectEmail].filter(Boolean).length > 0 && `${[row.subjectName, row.subjectEmail].filter(Boolean).join(" · ")} · `}
+            {row.scorecardName} · {row.isMine ? "you" : row.runnerName} · {formatDateTime(row.submittedAt ?? row.createdAt)}
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+          {status === "completed" && row.finalWeightedScore != null ? (
+            <RagBadge score={row.finalWeightedScore} size="sm" target={row.targetScore ?? 0} />
+          ) : (
+            <EvaluationStatusBadge evaluation={{ status, stage: row.stage, errorCode: row.errorCode }} />
+          )}
+          <ChevronRight className="hidden size-4 text-ink-muted sm:block" aria-hidden />
+        </div>
+      </Link>
+      <button
+        type="button"
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onDelete(row);
+        }}
+        aria-label={`Delete evaluation “${row.name}”`}
+        title="Delete evaluation"
+        className={cn(
+          "absolute right-1 top-1/2 flex size-11 -translate-y-1/2 items-center justify-center rounded-full text-ink-muted sm:right-3",
+          "opacity-0 transition-opacity hover:bg-[var(--rag-poor)]/10 hover:text-[var(--rag-poor)]",
+          "group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100",
+          "[@media(hover:none)]:opacity-100",
+          "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]",
+        )}
+      >
+        <Trash2 className="size-3.5" aria-hidden />
+      </button>
+    </div>
+  );
+});
+
 function BulkDeleteBody({
+  count,
+  allMatching,
+  excluded,
   names,
+  summary,
   cancelRef,
   onCancel,
   onConfirm,
 }: {
+  count: number;
+  allMatching: boolean;
+  excluded: number;
   names: string[];
+  summary: string[];
   cancelRef: RefObject<HTMLButtonElement | null>;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
-  const { shown, more } = previewNames(names, 5);
+  const shown = names.slice(0, 5);
+  const more = Math.max(0, names.length - shown.length);
   return (
     <>
       <DialogHeader>
         <DialogTitle>
-          Delete {names.length} evaluation{names.length === 1 ? "" : "s"}?
+          Delete {count.toLocaleString()} evaluation{count === 1 ? "" : "s"}?
         </DialogTitle>
         <DialogDescription>
-          This permanently deletes the selected evaluation{names.length === 1 ? "" : "s"} and their results. This can&apos;t be undone.
+          This permanently deletes {allMatching ? "every completed or failed evaluation matching the current filters" : "the selected evaluations"} and their
+          results. Running evaluations are never deleted. This can&apos;t be undone.
         </DialogDescription>
       </DialogHeader>
-      <ul className="list-disc space-y-0.5 pl-5 text-sm text-ink">
-        {shown.map((name, i) => (
-          <li key={`${i}-${name}`} className="break-words">
-            {name}
-          </li>
-        ))}
-        {more > 0 && <li className="list-none text-ink-muted">…and {more} more</li>}
-      </ul>
+      {allMatching ? (
+        <div className="text-sm text-ink">
+          <p>
+            All matching{excluded > 0 ? `, except ${excluded} you unticked` : ""}:
+          </p>
+          <p className="mt-1 text-xs text-ink-muted">{summary.length ? summary.join(" · ") : "No filters (every evaluation you can see)."}</p>
+        </div>
+      ) : (
+        <ul className="list-disc space-y-0.5 pl-5 text-sm text-ink">
+          {shown.map((name, i) => (
+            <li key={`${i}-${name}`} className="break-words">
+              {name}
+            </li>
+          ))}
+          {more > 0 && <li className="list-none text-ink-muted">…and {more} more</li>}
+        </ul>
+      )}
       <DialogFooter>
-        <Button ref={cancelRef} type="button" variant="ghost" onClick={onCancel}>
+        <Button ref={cancelRef} type="button" variant="ghost" className="min-h-11" onClick={onCancel}>
           Cancel
         </Button>
-        <Button type="button" variant="destructive" onClick={onConfirm}>
+        <Button type="button" variant="destructive" className="min-h-11" onClick={onConfirm}>
           <Trash2 className="size-3.5" aria-hidden />
-          Delete {names.length}
+          Delete {count.toLocaleString()}
         </Button>
       </DialogFooter>
     </>
-  );
-}
-
-function FilterSelect({
-  label,
-  value,
-  onChange,
-  options,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  options: Array<{ value: string; label: string }>;
-}) {
-  return (
-    <label className="flex items-center gap-1.5 text-xs font-medium text-ink-muted">
-      <span className="sr-only">{label}</span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        aria-label={label}
-        className="h-9 max-w-[18rem] glass-field rounded-lg px-2.5 text-sm text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
-      >
-        {options.map((opt) => (
-          <option key={opt.value} value={opt.value}>
-            {opt.label}
-          </option>
-        ))}
-      </select>
-    </label>
   );
 }

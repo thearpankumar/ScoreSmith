@@ -6,9 +6,9 @@ export function MarketingFooter({ startHref }: { startHref: string }) {
   return (
     <footer className="mk-footer">
       <div className="mk-footer-inner">
-        <Link href="/" className="mk-logo" aria-label="KPI Metrics home">
+        <Link href="/" className="mk-logo" aria-label="Score Smith home">
           <BrandMark className="mk-logo-mark" />
-          <span className="mk-logo-name">KPI Metrics</span>
+          <span className="mk-logo-name">Score Smith</span>
         </Link>
         <nav aria-label="Footer" className="mk-footer-links">
           <a href="#product">Product</a>

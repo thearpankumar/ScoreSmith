@@ -22,8 +22,11 @@ import { ClarifyingQuestionCard } from "./ClarifyingQuestionCard";
 import { SimilarScorecardSuggestion } from "./SimilarScorecardSuggestion";
 import { LivePreviewPanel } from "./LivePreviewPanel";
 import { TurnTraceCard } from "./TurnTraceCard";
+import { ChartStateNotice } from "./ChartStateNotice";
 import { UnsavedChangesDialog } from "./UnsavedChangesDialog";
 import { GlassCard } from "@/components/design-system/GlassCard";
+import { ChatShareButton } from "@/components/sharing/ChatShareDialog";
+import { requestLiveRefresh, useLiveStatus } from "@/components/live/LiveStatusProvider";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
@@ -214,6 +217,15 @@ export function ChatWorkspace({
   }, [saved]);
   // Sidebar "working…" badge for this chat while its turn runs (cleared when it ends or the chat is left).
   const busy = pending || turnInProgress;
+  // One running chat turn per user across ALL their chats: while another chat of theirs is mid-turn the composer
+  // is disabled with a link to it (the server enforces this too and answers 409 `user_chat_active`).
+  const { slots } = useLiveStatus();
+  const otherChatBusy = !!slots.chat && slots.chat.sessionId !== activeSessionId && !turnInProgress && !pending;
+  const [busyElsewhere, setBusyElsewhere] = useState<string | null>(null);
+  const elsewhereId = otherChatBusy ? slots.chat!.sessionId : busyElsewhere;
+  useEffect(() => {
+    if (busy) requestLiveRefresh();
+  }, [busy]);
   useEffect(() => {
     if (!busy || activeSessionId === "new") return;
     setSessionBusy(activeSessionId, true);
@@ -571,7 +583,19 @@ export function ChatWorkspace({
       // user's own message above is kept in the transcript either way.
       // Note: edits in the live preview only reach the saved scorecard through the assistant,
       // so the message must not suggest "filling it in manually" saves anything.
-      if (err instanceof ApiError && err.status === 409) {
+      if (err instanceof ApiError && err.code === "user_chat_active") {
+        // The user's one allowed chat turn is running in ANOTHER chat: nothing was sent from this one.
+        if (isFirstTurnOfNewSession && clientSessionId) {
+          selfAdoptedSessionIdRef.current = null;
+          setActiveSessionId("new");
+          removeSession(clientSessionId);
+        }
+        setBusyElsewhere(typeof err.data?.session_id === "string" ? err.data.session_id : null);
+        setChatError(err.message);
+        setLastFailedText(text);
+        setPending(false);
+        requestLiveRefresh();
+      } else if (err instanceof ApiError && err.status === 409) {
         // Another turn is already running for this session (e.g. started from a second tab):
         // don't fail — attach to it; the watcher takes over and the reply shows up by itself.
         setTurnStartedAt(Date.now());
@@ -698,14 +722,24 @@ export function ChatWorkspace({
   const chatCard = (
     <GlassCard
       elevation={1}
-      className={cn("flex h-[75vh] min-h-[28rem] min-w-0 flex-1 flex-col p-0", isDesktop && "h-full")}
+      className={cn(
+        "flex h-[75vh] min-h-[28rem] min-w-0 flex-1 flex-col p-0",
+        // landscape phones (short viewports): the card fills the screen so the composer is on screen, not below the fold
+        "[@media(max-height:520px)]:h-[calc(100dvh-5.5rem)] [@media(max-height:520px)]:min-h-[15rem]",
+        isDesktop && "h-full",
+      )}
     >
-        <div className="flex items-center justify-between gap-3 border-b border-hairline px-5 py-3.5">
-          <div className="min-w-0">
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-hairline px-4 py-3.5 sm:px-5">
+          <div className="min-w-0 flex-1 basis-48">
             <p className="truncate text-sm font-semibold text-ink">{liveTitle}</p>
             <p className="truncate text-xs text-ink-muted">{session.contextSummary}</p>
           </div>
-          <div className="flex shrink-0 items-center gap-1.5 xl:hidden">
+          <div className="flex shrink-0 items-center gap-1.5">
+            {/* Top right: share this chat (read-only) with someone, optionally together with its chart. */}
+            {activeSessionId !== "new" && (
+              <ChatShareButton sessionId={activeSessionId} hasChart={Boolean(saved || session.targetScorecardId)} />
+            )}
+            <span className="flex items-center gap-1.5 xl:hidden">
             <Button asChild variant="ghost" size="sm">
               <Link {...navGuard.linkProps("/chat")}>
                 <ArrowLeft className="size-3.5" aria-hidden />
@@ -720,6 +754,7 @@ export function ChatWorkspace({
                 </a>
               </Button>
             )}
+            </span>
           </div>
         </div>
 
@@ -755,12 +790,14 @@ export function ChatWorkspace({
           </div>
         )}
 
+        <ChartStateNotice session={session} />
+
         {saved ? (
           <SavedScorecardBanner saved={saved} variant="banner" linkProps={navGuard.linkProps} />
         ) : (
           isRefineSession &&
           session.targetScorecardId && (
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-lemon-soft/50 px-5 py-2.5 text-xs text-ink">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-lemon-soft/50 px-5 py-2.5 text-xs text-ink [@media(max-height:520px)]:hidden">
               <p className="flex min-w-0 items-center gap-1.5">
                 <Sparkles className="size-3.5 shrink-0 text-lemon-ink" aria-hidden />
                 <span>
@@ -898,6 +935,14 @@ export function ChatWorkspace({
           </div>
         )}
 
+        {elsewhereId && (
+          <p role="status" className="mx-3 mb-1 rounded-lg bg-lemon-soft px-3 py-2 text-xs text-lemon-ink" data-testid="chat-busy-elsewhere">
+            Your assistant is still working in another chat. You can send here once it finishes.{" "}
+            <a className="font-semibold underline underline-offset-2" href={`/chat/${elsewhereId}`}>
+              View it
+            </a>
+          </p>
+        )}
         <form
           className="flex items-end gap-2 border-t border-hairline p-3"
           onSubmit={(e) => {
@@ -916,7 +961,7 @@ export function ChatWorkspace({
                   : "Type a message…"
             }
             className="max-h-32 min-h-10 flex-1 resize-none"
-            disabled={pending || turnInProgress || !!pendingSuggestion}
+            disabled={pending || turnInProgress || !!pendingSuggestion || otherChatBusy}
             aria-label="Message the scorecard assistant"
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
@@ -928,7 +973,7 @@ export function ChatWorkspace({
           <Button
             type="submit"
             size="icon"
-            disabled={pending || turnInProgress || !composer.trim() || !!pendingSuggestion}
+            disabled={pending || turnInProgress || !composer.trim() || !!pendingSuggestion || otherChatBusy}
             aria-label="Send"
           >
             <Send className="size-4" />
@@ -974,7 +1019,7 @@ export function ChatWorkspace({
     // `hidden shrink-0 xl:block`) has moved into `NavRail`'s merged "Chat" section (see
     // that component's docstring) — this workspace is now just the chat/preview split,
     // no second sidebar column.
-    <div className="flex flex-col gap-4 xl:h-[calc(100vh-2rem)] xl:flex-row">
+    <div className="flex flex-col gap-4 md:pt-12 xl:h-[calc(100vh-2rem)] xl:flex-row">
       {isDesktop ? (
         <ResizablePanelGroup orientation="horizontal" className="min-h-[28rem] flex-1">
           <ResizablePanel minSize={360} className="flex min-w-0 flex-col">

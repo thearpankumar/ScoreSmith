@@ -142,7 +142,7 @@ def make_admin_and_member(db: Session) -> tuple[User, User]:
     admin = User(
         email="admin@example.com", name="Admin", role="admin", password_hash=sec.hash_password_sync(strong_password())
     )
-    member = User(email="member@example.com", name="Member", role="member")
+    member = User(email="member@example.com", name="Member", role="user")
     db.add_all([admin, member])
     db.commit()
     return admin, member
@@ -156,7 +156,7 @@ def test_only_an_admin_can_register_users_afterwards(client: TestClient, db_sess
     as_member = client.post("/api/v1/auth/register-user", json=body, headers={"X-User-Id": str(member.id)})
     assert as_member.status_code == 403
     as_admin = client.post("/api/v1/auth/register-user", json=body, headers={"X-User-Id": str(admin.id)})
-    assert as_admin.status_code == 201 and as_admin.json()["role"] == "member"
+    assert as_admin.status_code == 201 and as_admin.json()["role"] == "user"
     assert as_admin.json()["email"] == "new@example.com"
     dup = client.post("/api/v1/auth/register-user", json=body, headers={"X-User-Id": str(admin.id)})
     assert dup.status_code == 409
@@ -179,13 +179,13 @@ def test_role_cannot_be_self_assigned(client: TestClient, db_session: Session) -
     ok = client.post(
         "/api/v1/auth/signup", json={"email": "evil@example.com", "name": "Evil", "password": pw}, headers=ANON
     )
-    assert ok.status_code == 201 and ok.json()["user"]["role"] == "member"
+    assert ok.status_code == 201 and ok.json()["user"]["role"] == "user"
     bearer = {"Authorization": f"Bearer {ok.json()['access_token']}", **ANON}
     patch = client.patch("/api/v1/me", json={"name": "Evil", "role": "admin"}, headers=bearer)
-    assert patch.status_code == 200 and patch.json()["role"] == "member"  # the field is ignored, never applied
-    assert client.patch("/api/v1/me", json={"name": "Renamed"}, headers=bearer).json()["role"] == "member"
+    assert patch.status_code == 200 and patch.json()["role"] == "user"  # the field is ignored, never applied
+    assert client.patch("/api/v1/me", json={"name": "Renamed"}, headers=bearer).json()["role"] == "user"
     db_session.expire_all()
-    assert db_session.execute(select(User.role).where(User.email == "evil@example.com")).scalar_one() == "member"
+    assert db_session.execute(select(User.role).where(User.email == "evil@example.com")).scalar_one() == "user"
 
 
 def test_signup_can_be_switched_off(client: TestClient, db_session: Session, monkeypatch) -> None:
@@ -230,12 +230,12 @@ async def test_env_admin_never_resets_an_existing_users_password(
 ) -> None:
     email, _pw = env_admin
     original = sec.hash_password_sync(strong_password())
-    db_session.add(User(email=email, name="Existing", role="member", password_hash=original))
+    db_session.add(User(email=email, name="Existing", role="user", password_hash=original))
     db_session.commit()
     assert await bootstrap.ensure_env_admin() == "exists"
     db_session.expire_all()
     user = db_session.execute(select(User)).scalar_one()
-    assert user.password_hash == original and user.role == "member"
+    assert user.password_hash == original and user.role == "user"
 
 
 async def test_dev_env_admin_may_use_a_short_password_and_log_in_by_username(
@@ -271,7 +271,7 @@ async def test_production_ignores_the_weak_admin_and_the_username_shortcut(
     assert await bootstrap.ensure_env_admin() == "disabled"
     assert count_users(db_session) == 0
     assert s.dev_username_login is False
-    assert client.get("/api/v1/auth/config", headers=ANON).json()["username_login"] is False
+    assert client.get("/api/v1/auth/config", headers=ANON).json()["username_login"] is True  # handles
     # Even with a real admin present, `admin` is just an unknown identifier in production.
     strong = strong_password()
     db_session.add(

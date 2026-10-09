@@ -29,7 +29,7 @@ if sys.platform == "win32":
 
 from sqlalchemy import text  # noqa: E402
 
-from app import metrics  # noqa: E402
+from app import metrics, trash  # noqa: E402
 from app.ai.scorecard_builder import get_graph_manager  # noqa: E402
 from app.api.v1.chat import get_turn_runner  # noqa: E402
 from app.auth.bootstrap import ensure_env_admin_safe  # noqa: E402
@@ -40,6 +40,8 @@ from app.logging_config import configure_logging  # noqa: E402
 from app.pipeline.dispatcher import get_dispatcher  # noqa: E402
 
 logger = logging.getLogger("app.worker")
+
+TRASH_PURGE_INTERVAL_SECONDS = 600.0  # expired trash is removed at most this often per worker
 
 
 class WorkerState:
@@ -101,6 +103,7 @@ async def _background_loops(state: WorkerState) -> None:
     settings = get_settings()
     dispatcher, runner = get_dispatcher(), get_turn_runner()
     last_publish = float("-inf")
+    last_trash_purge = float("-inf")
     protected = False
     while True:
         try:
@@ -112,6 +115,12 @@ async def _background_loops(state: WorkerState) -> None:
             if time.monotonic() - last_publish >= settings.autoscale_metric_interval_seconds:
                 last_publish = time.monotonic()
                 await metrics.publish_backlog_metric()
+            if time.monotonic() - last_trash_purge >= TRASH_PURGE_INTERVAL_SECONDS:
+                last_trash_purge = time.monotonic()
+                async with AsyncSessionLocal() as db:  # idempotent + SKIP LOCKED: every replica may run it
+                    purged = await trash.purge_expired(db)
+                if purged:
+                    logger.info("purged %d chart(s) past the trash retention", purged)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

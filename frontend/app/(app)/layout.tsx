@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
 import { AppShell } from "@/components/layout/AppShell";
+import { LiveStatusProvider } from "@/components/live/LiveStatusProvider";
 import { ChatSessionsProvider } from "@/components/chat/ChatSessionsContext";
 import { getCurrentUser, listChatSessions } from "@/lib/api-client";
 
@@ -40,7 +41,7 @@ function isNextControlFlow(err: unknown): boolean {
 async function loadSessionUser() {
   try {
     const me = await getCurrentUser();
-    return { name: me.name, email: me.email };
+    return { name: me.name, email: me.email, role: me.role, username: me.username ?? null };
   } catch (err) {
     if (isNextControlFlow(err)) throw err;
     return null;
@@ -51,7 +52,9 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
   const [sessions, user] = await Promise.all([loadInitialChatSessions(), loadSessionUser()]);
   return (
     <ChatSessionsProvider initialSessions={sessions}>
-      <AppShell user={user}>{children}</AppShell>
+      <LiveStatusProvider>
+        <AppShell user={user}>{children}</AppShell>
+      </LiveStatusProvider>
     </ChatSessionsProvider>
   );
 }

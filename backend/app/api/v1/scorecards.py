@@ -5,24 +5,31 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.activity import log_edit
 from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
 from app.ai.scoring_formula import validate as validate_scoring_formula_expr
 from app.ai.similarity import SIMILARITY_THRESHOLD, SimilarScorecardResult, find_similar_scorecards
+from app.api.v1.sharing import leave_chart
 from app.audit import audit
-from app.authz import get_owned_scorecard, get_owned_version
+from app.authz import (
+    get_accessible_scorecard,
+    get_accessible_version,
+    scorecard_access_clause,
+)
 from app.db import get_db
 from app.deps import get_bedrock_client, get_current_user
 from app.models.enums import AuditAction
-from app.models.evaluation import Evaluation
 from app.models.kpi_node import KpiNode
 from app.models.scorecard import Scorecard
 from app.models.scorecard_version import ScorecardVersion
+from app.models.sharing import ScorecardCollaborator
 from app.models.user import User
+from app.occ import check_if_match
 from app.schemas.scorecard import (
     ScorecardCreate,
     ScorecardRead,
@@ -32,6 +39,7 @@ from app.schemas.scorecard import (
     ScorecardVersionReadWithKpiNodes,
     ScorecardVersionUpdate,
 )
+from app.trash import cancel_all_jobs_on_scorecard, delete_scorecard_cascade, move_to_trash  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -109,11 +117,44 @@ async def list_scorecards(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[Scorecard]:
-    stmt = select(Scorecard).where(Scorecard.owner_id == current_user.id).order_by(Scorecard.created_at.desc())
+    stmt = select(Scorecard).where(scorecard_access_clause(current_user)).order_by(Scorecard.created_at.desc())
     if domain is not None:
         stmt = stmt.where(Scorecard.domain == domain)
     result = await db.execute(stmt.offset(skip).limit(limit))
-    return list(result.scalars().all())
+    return await _with_sharing(db, current_user, list(result.scalars().all()))
+
+
+async def _with_sharing(db: AsyncSession, user: User, cards: list[Scorecard]) -> list[ScorecardRead]:
+    """ScorecardRead rows decorated with the caller's role, the owner's name and the collaborator count."""
+    if not cards:
+        return []
+    ids = [c.id for c in cards]
+    counts = dict(
+        (
+            await db.execute(
+                select(ScorecardCollaborator.scorecard_id, func.count())
+                .where(ScorecardCollaborator.scorecard_id.in_(ids))
+                .group_by(ScorecardCollaborator.scorecard_id)
+            )
+        ).all()
+    )
+    owners = dict(
+        (await db.execute(select(User.id, User.name).where(User.id.in_({c.owner_id for c in cards})))).all()
+    )
+    out = []
+    for c in cards:
+        n = int(counts.get(c.id, 0))
+        out.append(
+            ScorecardRead.model_validate(c).model_copy(
+                update={
+                    "owner_name": owners.get(c.owner_id),
+                    "my_role": "owner" if c.owner_id == user.id else "editor",
+                    "is_shared": n > 0,
+                    "collaborator_count": n,
+                }
+            )
+        )
+    return out
 
 
 @router.post("", response_model=ScorecardRead, status_code=status.HTTP_201_CREATED)
@@ -140,8 +181,9 @@ async def create_scorecard(
 @router.get("/{scorecard_id}", response_model=ScorecardRead)
 async def get_scorecard(
     scorecard_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
-) -> Scorecard:
-    return await get_owned_scorecard(db, current_user, scorecard_id)
+) -> ScorecardRead:
+    scorecard = await get_accessible_scorecard(db, current_user, scorecard_id)
+    return (await _with_sharing(db, current_user, [scorecard]))[0]
 
 
 @router.patch("/{scorecard_id}", response_model=ScorecardRead)
@@ -152,16 +194,22 @@ async def update_scorecard(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Scorecard:
-    scorecard = await get_owned_scorecard(db, current_user, scorecard_id)
+    scorecard = await get_accessible_scorecard(db, current_user, scorecard_id)
+    check_if_match(request, scorecard, "This chart")
     old_target = scorecard.target_score
     changes = payload.model_dump(exclude_unset=True)
     if changes.get("current_version_id") is not None:  # may only point at one of THIS scorecard's versions
-        await get_owned_version(db, current_user, changes["current_version_id"], scorecard_id)
+        await get_accessible_version(db, current_user, changes["current_version_id"], scorecard_id)
     for field, value in changes.items():
         setattr(scorecard, field, value)
     try:
         audit(db, request, actor_id=current_user.id, entity_type="scorecard", entity_id=scorecard.id,
               action=AuditAction.UPDATE, diff={"fields": sorted(changes)})
+        await log_edit(
+            db, scorecard.id, current_user, "scorecard_updated",
+            "Changed " + ", ".join(sorted(changes)) if changes else "Saved the chart",
+            entity_type="scorecard", entity_id=scorecard.id, detail={"fields": sorted(changes)},
+        )
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -183,30 +231,18 @@ async def delete_scorecard(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    scorecard = await get_owned_scorecard(db, current_user, scorecard_id)
-    # Deleting a scorecard deletes "every version of it, and its evaluations" (the delete dialog's
-    # promise). Evaluations reference a version with ON DELETE RESTRICT, and their per-KPI results
-    # reference KPI nodes, so they have to go first; deleting an evaluation cascades to its results.
-    version_ids = select(ScorecardVersion.id).where(ScorecardVersion.scorecard_id == scorecard_id)
-    evaluations = (
-        await db.execute(select(Evaluation).where(Evaluation.scorecard_version_id.in_(version_ids)))
-    ).scalars().all()
-    for evaluation in evaluations:
-        await db.delete(evaluation)
-    await db.flush()
-    # Break the current_version_id circular reference first so the version can cascade-delete.
-    scorecard.current_version_id = None
-    await db.flush()
-    await db.delete(scorecard)
-    try:
-        audit(db, request, actor_id=current_user.id, entity_type="scorecard", entity_id=scorecard_id,
-              action=AuditAction.DELETE)
-        await db.commit()
-    except IntegrityError as exc:
-        await db.rollback()
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, detail=f"Cannot delete scorecard: still referenced elsewhere: {exc.orig}"
-        ) from exc
+    """"Delete" on a chart card. The OWNER moves the chart to the trash (soft delete, restorable for the retention
+    period; everybody loses access until it is restored). A COLLABORATOR only removes themselves from the chart
+    (the same as `POST .../leave`): the owner and the other collaborators keep it."""
+    scorecard = await get_accessible_scorecard(db, current_user, scorecard_id)
+    if scorecard.owner_id != current_user.id:
+        await leave_chart(db, request, current_user, scorecard)
+        return
+    await move_to_trash(db, current_user, scorecard)
+    audit(db, request, actor_id=current_user.id, entity_type="scorecard", entity_id=scorecard_id,
+          action=AuditAction.UPDATE, event="chart_trashed")
+    await db.commit()
+    await cancel_all_jobs_on_scorecard(scorecard_id)
 
 
 # --- Scorecard versions, nested under a scorecard ---
@@ -216,7 +252,7 @@ async def delete_scorecard(
 async def list_scorecard_versions(
     scorecard_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> list[ScorecardVersion]:
-    await get_owned_scorecard(db, current_user, scorecard_id)
+    await get_accessible_scorecard(db, current_user, scorecard_id)
     result = await db.execute(
         select(ScorecardVersion)
         .where(ScorecardVersion.scorecard_id == scorecard_id)
@@ -237,13 +273,17 @@ async def create_scorecard_version(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ScorecardVersion:
-    await get_owned_scorecard(db, current_user, scorecard_id)
+    await get_accessible_scorecard(db, current_user, scorecard_id)
     version = ScorecardVersion(scorecard_id=scorecard_id, created_by=current_user.id, **payload.model_dump())
     db.add(version)
     try:
         await db.flush()
         audit(db, request, actor_id=current_user.id, entity_type="scorecard_version", entity_id=version.id,
               action=AuditAction.CREATE)
+        await log_edit(
+            db, scorecard_id, current_user, "version_created", f"Created version {version.version_number}",
+            entity_type="scorecard_version", entity_id=version.id, detail={"version_number": version.version_number},
+        )
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -264,7 +304,7 @@ async def get_scorecard_version(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ScorecardVersion:
-    await get_owned_version(db, current_user, version_id, scorecard_id)
+    await get_accessible_version(db, current_user, version_id, scorecard_id)
     result = await db.execute(
         select(ScorecardVersion)
         .where(ScorecardVersion.id == version_id, ScorecardVersion.scorecard_id == scorecard_id)
@@ -312,7 +352,7 @@ async def validate_formula_endpoint(
     indicator (see app/ai/scoring_formula.py::validate) — the frontend calls this rather
     than reimplementing formula parsing client-side, so validation can never drift from
     what `PATCH .../versions/{id}` (below) or an actual evaluation would do."""
-    await get_owned_version(db, current_user, version_id, scorecard_id)
+    await get_accessible_version(db, current_user, version_id, scorecard_id)
     names = await _leaf_kpi_names(db, version_id)
     result = validate_scoring_formula_expr(payload.formula, names)
     return ValidateFormulaResponse(**result.to_dict())
@@ -327,7 +367,8 @@ async def update_scorecard_version(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ScorecardVersion:
-    version = await get_owned_version(db, current_user, version_id, scorecard_id)
+    version = await get_accessible_version(db, current_user, version_id, scorecard_id)
+    check_if_match(request, version, "This version")
     data = payload.model_dump(exclude_unset=True)
     if "scoring_formula" in data and data["scoring_formula"]:
         names = await _leaf_kpi_names(db, version_id)
@@ -338,6 +379,11 @@ async def update_scorecard_version(
         setattr(version, field, value)
     audit(db, request, actor_id=current_user.id, entity_type="scorecard_version", entity_id=version.id,
           action=AuditAction.UPDATE, diff={"fields": sorted(data)})
+    await log_edit(
+        db, scorecard_id, current_user, "version_updated",
+        f"Edited version {version.version_number} ({', '.join(sorted(data)) or 'no changes'})",
+        entity_type="scorecard_version", entity_id=version.id, detail={"fields": sorted(data)},
+    )
     await db.commit()
     await db.refresh(version)
     return version
@@ -355,15 +401,20 @@ async def delete_scorecard_version(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    version = await get_owned_version(db, current_user, version_id, scorecard_id)
+    version = await get_accessible_version(db, current_user, version_id, scorecard_id)
     scorecard = await db.get(Scorecard, scorecard_id)
     if scorecard is not None and scorecard.current_version_id == version_id:
         scorecard.current_version_id = None
         await db.flush()
+    number = version.version_number
     await db.delete(version)
     try:
         audit(db, request, actor_id=current_user.id, entity_type="scorecard_version", entity_id=version_id,
               action=AuditAction.DELETE)
+        await log_edit(
+            db, scorecard_id, current_user, "version_deleted", f"Deleted version {number}",
+            entity_type="scorecard_version", entity_id=version_id, detail={"version_number": number},
+        )
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()

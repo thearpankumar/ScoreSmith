@@ -110,3 +110,12 @@ evaluation). S3 is cents per month with the 14/90-day lifecycles. The $25/month 
   user input never chooses the host); the IAM role has no access to anything but the bucket prefixes and the models.
 - `qs-backend-app` can neither read `raw/*` nor invoke Bedrock nor touch other S3 buckets. Its key is in `infra/.env`
   only; rotate with `-RotateKey`.
+
+## How the app uses this stack
+
+- `bootstrap` writes `S3_BUCKET`, `SFN_STATE_MACHINE_ARN` and the `qs-backend-app` key pair (as `AWS_APP_ACCESS_KEY_ID` / `AWS_APP_SECRET_ACCESS_KEY`) into the git-ignored `infra/.env`.
+  Without them everything else works and only the file / Google Drive evaluation flow answers 503. The Bedrock credential (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, used as a bearer token) is a different credential.
+- The **worker** processes (`ROLE=worker`) start the executions, poll them (adopting executions of a dead worker by ARN) and score; the API replicas only presign uploads and enqueue. Any number of
+  workers can share the one state machine. See [../docs/architecture.md](../docs/architecture.md#2-evaluation-pipeline-and-lease-lifecycle).
+- For a deployed site pass the real origin to the bucket CORS rules (`--cors-origin https://app.example.com`) so browser multipart uploads work; the web app's CSP already allows `https://*.amazonaws.com` for uploads.
+- Contract (S3 layout, JSON schemas, error codes): [../docs/ai-eval-contract.md](../docs/ai-eval-contract.md).

@@ -136,6 +136,37 @@ export function jwtExpiry(token: string | undefined | null): number | null {
   }
 }
 
+/** A string claim of a JWT payload (NOT verified: only for UX gating, the backend re-checks everything). */
+export function jwtStringClaim(token: string | undefined | null, name: string): string | null {
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const json = typeof atob === "function" ? atob(b64) : Buffer.from(b64, "base64").toString("utf8");
+    const value = (JSON.parse(json) as Record<string, unknown>)[name];
+    return typeof value === "string" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Pages only administrators may open (Users admin, Settings). Everything under them is covered. */
+export const ADMIN_ONLY_PATHS = ["/admin", "/settings"] as const;
+
+export function isAdminOnlyPath(pathname: string): boolean {
+  return ADMIN_ONLY_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`));
+}
+
+/**
+ * Whether `role` (the `rol` claim, null when the token predates role claims) may open `pathname`. An unknown role is
+ * allowed through here on purpose: the page itself and the API re-check the role authoritatively.
+ */
+export function roleMayOpen(pathname: string, role: string | null | undefined): boolean {
+  if (!isAdminOnlyPath(pathname)) return true;
+  return role == null || role === "admin";
+}
+
 /** True when the token is missing, malformed, or expires within `skewSeconds`. */
 export function isExpired(token: string | undefined | null, nowMs: number = Date.now(), skewSeconds = 10): boolean {
   const exp = jwtExpiry(token);

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -21,13 +21,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy_utils import Ltree
 
-from app.authz import get_owned_guideline, get_owned_kpi_node, get_owned_version
+from app.activity import log_edit
+from app.authz import get_accessible_guideline, get_accessible_kpi_node, get_accessible_version
 from app.db import get_db
 from app.deps import get_current_user
 from app.models.kpi_guideline import KpiGuideline
 from app.models.kpi_node import KpiNode
 from app.models.scorecard_version import ScorecardVersion
 from app.models.user import User
+from app.occ import check_if_match
 from app.schemas.kpi import (
     KpiGuidelineCreate,
     KpiGuidelineRead,
@@ -52,7 +54,7 @@ async def get_scorecard_version_flat(
     resolve `evaluations.scorecard_version_id` -> its owning scorecard (an evaluation row
     only carries the version id), and to load a version's KPI tree directly from a chat
     session's `materialized_scorecard_version_id`."""
-    await get_owned_version(db, current_user, version_id)
+    await get_accessible_version(db, current_user, version_id)
     result = await db.execute(
         select(ScorecardVersion)
         .where(ScorecardVersion.id == version_id)
@@ -62,6 +64,16 @@ async def get_scorecard_version_flat(
     if version is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Scorecard version not found.")
     return version
+
+
+async def _scorecard_of_version(db: AsyncSession, version_id: uuid.UUID) -> uuid.UUID:
+    return (
+        await db.execute(select(ScorecardVersion.scorecard_id).where(ScorecardVersion.id == version_id))
+    ).scalar_one()
+
+
+async def _scorecard_of_node(db: AsyncSession, node: KpiNode) -> uuid.UUID:
+    return await _scorecard_of_version(db, node.scorecard_version_id)
 
 
 def _label_for(node_id: uuid.UUID) -> str:
@@ -93,7 +105,7 @@ async def _compute_path_and_level(
 async def list_kpi_nodes(
     version_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> list[KpiNode]:
-    await get_owned_version(db, current_user, version_id)
+    await get_accessible_version(db, current_user, version_id)
     result = await db.execute(
         select(KpiNode)
         .where(KpiNode.scorecard_version_id == version_id)
@@ -124,7 +136,7 @@ async def bulk_create_kpi_nodes(
 ) -> list[KpiNode]:
     """Create a full sibling group (plus their guidelines) in a single transaction, so the
     weight-sum-to-100 trigger evaluates once the whole group is present."""
-    await get_owned_version(db, current_user, version_id)
+    await get_accessible_version(db, current_user, version_id)
     created: list[KpiNode] = []
     for item in payload.nodes:
         node_id = uuid.uuid4()
@@ -145,6 +157,13 @@ async def bulk_create_kpi_nodes(
             db.add(KpiGuideline(kpi_node_id=node_id, **g.model_dump()))
         created.append(node)
 
+    sc_id = await _scorecard_of_version(db, version_id)
+    names = ", ".join(n.name for n in created[:3]) + (f" and {len(created) - 3} more" if len(created) > 3 else "")
+    await log_edit(
+        db, sc_id, current_user, "kpi_added", f"Added {len(created)} KPI(s): {names}",
+        entity_type="kpi_node", entity_id=created[0].id if created else None,
+        detail={"count": len(created), "names": [n.name for n in created][:20]},
+    )
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -177,9 +196,17 @@ async def bulk_update_kpi_node_weights(
     """Rebalance several sibling weights atomically (e.g. the whole sibling group)."""
     nodes: list[KpiNode] = []
     for item in payload.weights:
-        node = await get_owned_kpi_node(db, current_user, item.id)
+        node = await get_accessible_kpi_node(db, current_user, item.id)
         node.weight = item.weight
         nodes.append(node)
+    if nodes:
+        shown = ", ".join(f"{n.name} = {float(n.weight):g}" for n in nodes[:4])
+        await log_edit(
+            db, await _scorecard_of_node(db, nodes[0]), current_user, "weights_changed",
+            f"Changed the weight of {len(nodes)} KPI(s): {shown}",
+            entity_type="kpi_node", entity_id=nodes[0].id,
+            detail={"weights": {n.name: float(n.weight) for n in nodes[:30]}},
+        )
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -197,7 +224,7 @@ async def bulk_update_kpi_node_weights(
 async def get_kpi_node(
     node_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> KpiNode:
-    await get_owned_kpi_node(db, current_user, node_id)
+    await get_accessible_kpi_node(db, current_user, node_id)
     result = await db.execute(
         select(KpiNode).where(KpiNode.id == node_id).options(selectinload(KpiNode.guidelines))
     )
@@ -211,12 +238,27 @@ async def get_kpi_node(
 async def update_kpi_node(
     node_id: uuid.UUID,
     payload: KpiNodeUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> KpiNode:
-    node = await get_owned_kpi_node(db, current_user, node_id)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    node = await get_accessible_kpi_node(db, current_user, node_id)
+    check_if_match(request, node, "This KPI")
+    changes = payload.model_dump(exclude_unset=True)
+    old_name = node.name
+    for field, value in changes.items():
         setattr(node, field, value)
+    weight_only = set(changes) == {"weight"}
+    summary = (
+        f"Changed the weight of {node.name} to {float(node.weight):g}"
+        if weight_only
+        else f"Edited KPI {old_name} ({', '.join(sorted(changes))})"
+    )
+    await log_edit(
+        db, await _scorecard_of_node(db, node), current_user,
+        "weights_changed" if weight_only else "kpi_updated", summary,
+        entity_type="kpi_node", entity_id=node.id, detail={"fields": sorted(changes)},
+    )
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -235,7 +277,11 @@ async def delete_kpi_node(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    node = await get_owned_kpi_node(db, current_user, node_id)
+    node = await get_accessible_kpi_node(db, current_user, node_id)
+    await log_edit(
+        db, await _scorecard_of_node(db, node), current_user, "kpi_deleted", f"Deleted KPI {node.name}",
+        entity_type="kpi_node", entity_id=node.id, detail={"name": node.name},
+    )
     await db.delete(node)
     try:
         await db.commit()
@@ -255,7 +301,7 @@ async def delete_kpi_node(
 async def list_guidelines(
     node_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> list[KpiGuideline]:
-    await get_owned_kpi_node(db, current_user, node_id)
+    await get_accessible_kpi_node(db, current_user, node_id)
     result = await db.execute(
         select(KpiGuideline)
         .where(KpiGuideline.kpi_node_id == node_id)
@@ -275,9 +321,16 @@ async def create_guideline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> KpiGuideline:
-    await get_owned_kpi_node(db, current_user, node_id)
+    node = await get_accessible_kpi_node(db, current_user, node_id)
     guideline = KpiGuideline(kpi_node_id=node_id, **payload.model_dump())
     db.add(guideline)
+    await db.flush()
+    await log_edit(
+        db, await _scorecard_of_node(db, node), current_user, "guideline_added",
+        f"Added the level {payload.score_level} guideline of {node.name}",
+        entity_type="kpi_guideline", entity_id=guideline.id,
+        detail={"kpi": node.name, "score_level": payload.score_level},
+    )
     try:
         await db.commit()
     except IntegrityError as exc:
@@ -295,12 +348,21 @@ async def update_guideline(
     node_id: uuid.UUID,
     guideline_id: uuid.UUID,
     payload: KpiGuidelineUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> KpiGuideline:
-    guideline = await get_owned_guideline(db, current_user, node_id, guideline_id)
+    guideline = await get_accessible_guideline(db, current_user, node_id, guideline_id)
+    check_if_match(request, guideline, "This guideline")
+    node = await db.get(KpiNode, node_id)
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(guideline, field, value)
+    await log_edit(
+        db, await _scorecard_of_node(db, node), current_user, "guideline_updated",
+        f"Edited the level {guideline.score_level} guideline of {node.name}",
+        entity_type="kpi_guideline", entity_id=guideline.id,
+        detail={"kpi": node.name, "score_level": guideline.score_level},
+    )
     await db.commit()
     await db.refresh(guideline)
     return guideline
@@ -317,6 +379,13 @@ async def delete_guideline(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    guideline = await get_owned_guideline(db, current_user, node_id, guideline_id)
+    guideline = await get_accessible_guideline(db, current_user, node_id, guideline_id)
+    node = await db.get(KpiNode, node_id)
+    await log_edit(
+        db, await _scorecard_of_node(db, node), current_user, "guideline_deleted",
+        f"Deleted the level {guideline.score_level} guideline of {node.name}",
+        entity_type="kpi_guideline", entity_id=guideline.id,
+        detail={"kpi": node.name, "score_level": guideline.score_level},
+    )
     await db.delete(guideline)
     await db.commit()

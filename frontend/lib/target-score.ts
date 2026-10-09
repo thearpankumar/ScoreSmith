@@ -28,10 +28,11 @@ export function parseTargetInput(raw: string): TargetParse {
  * the owner may edit (the dev auth stub has no RBAC, so this is a UX rule).
  */
 export function targetEditPermission(
-  scorecard: { status: string; ownerId: string; ownerName: string },
+  scorecard: { status: string; ownerId: string; ownerName: string; myRole?: string },
   currentUserId: string | null,
 ): { canEdit: boolean; lockedReason?: string } {
-  if (currentUserId && scorecard.ownerId !== currentUserId) {
+  // The owner and accepted collaborators ("editor") may change the target; anyone else cannot even open the chart.
+  if (currentUserId && scorecard.ownerId !== currentUserId && scorecard.myRole !== "editor") {
     return { canEdit: false, lockedReason: `Only the owner, ${scorecard.ownerName}, can change the target.` };
   }
   if (scorecard.status === "archived") {

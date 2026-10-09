@@ -4,12 +4,13 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, Numeric, String, Text, select
 from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPKMixin
 from app.models.enums import EvaluationStatus, RagBand
+from app.models.user import User
 
 if TYPE_CHECKING:
     from app.models.evaluation_kpi_result import EvaluationKpiResult
@@ -86,6 +87,9 @@ class Evaluation(UUIDPKMixin, TimestampMixin, Base):
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Set by the API process on cancel; whichever process drives the evaluation sees it and stops.
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Why the SYSTEM cancelled the job (migration 0016): "cancelled_by_trash" = its chart was trashed; restoring the
+    # chart re-queues those rows. After that it becomes "trash_restore_handled" so a later trash cycle never repeats it.
+    cancel_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     scorecard_version: Mapped[ScorecardVersion] = relationship("ScorecardVersion")
     evaluator: Mapped[User] = relationship("User", foreign_keys=[evaluated_by])
@@ -95,3 +99,10 @@ class Evaluation(UUIDPKMixin, TimestampMixin, Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Evaluation id={self.id} name={self.name!r} status={self.status}>"
+
+
+# The runner's display name, so a list of a SHARED chart's evaluations can label who ran each one without an extra
+# lookup per row (read-only, loaded with the row).
+Evaluation.runner_name = column_property(  # type: ignore[attr-defined]
+    select(User.name).where(User.id == Evaluation.owner_id).correlate_except(User).scalar_subquery()
+)

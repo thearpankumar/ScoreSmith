@@ -33,7 +33,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import exists, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.bedrock_client import BedrockClientProtocol
@@ -44,6 +44,8 @@ from app.models.enums import ACTIVE_EVALUATION_STATUSES, EvaluationStatus
 from app.models.evaluation import Evaluation
 from app.models.evaluation_batch import EvaluationBatch
 from app.models.evaluation_source import EvaluationSource
+from app.models.scorecard import Scorecard
+from app.models.scorecard_version import ScorecardVersion
 from app.pipeline.aws_jobs import (
     SFN_RUNNING,
     SFN_SUCCEEDED,
@@ -58,6 +60,8 @@ from app.pipeline.aws_jobs import (
 from app.pipeline.events import emit_evaluation_event
 from app.pipeline.graph import EvaluationCancelled, PipelineError, ScoringDeps, run_scoring
 from app.pipeline.jev_scorer import JevScoreClientProtocol
+from app.pipeline.outcomes import finalize_evaluation_background
+from app.slots import acquire_job_slot
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +156,8 @@ class Dispatcher:
         self._loop_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._wake: asyncio.Event | None = None
+        # set by stop(): the loops end even when their cancellation is swallowed (see ChatTurnRunner._loop)
+        self._stopping = False
 
     # --- settings ---
     @property
@@ -183,6 +189,7 @@ class Dispatcher:
                     update(Evaluation)
                     .where(Evaluation.lease_owner == self.worker_id, Evaluation.status.in_(ACTIVE_EVALUATION_STATUSES))
                     .values(**self._lease_values())
+                    .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
                     .returning(Evaluation.id)
                 )
             ).all()
@@ -207,8 +214,12 @@ class Dispatcher:
         return len(renewed)
 
     async def _heartbeat_loop(self) -> None:
-        while True:
+        # `_stopping` is the real exit condition; task.cancel() only makes it prompt (a cancel that lands inside a DB
+        # driver call can come back as an ordinary exception, which the `except Exception` below would swallow).
+        while not self._stopping:
             await asyncio.sleep(max(1.0, get_settings().lease_heartbeat_seconds))
+            if self._stopping:
+                return
             try:
                 await self.heartbeat()
             except asyncio.CancelledError:
@@ -245,6 +256,7 @@ class Dispatcher:
                     update(Evaluation)
                     .where(Evaluation.id.in_(candidates))
                     .values(**self._lease_values())
+                    .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
                     .returning(Evaluation.id)
                 )
             ).all()
@@ -262,12 +274,14 @@ class Dispatcher:
         if get_settings().ai_eval_inline or self._loop_task is not None:
             return
         self._wake = asyncio.Event()
+        self._stopping = False
         self._loop_task = asyncio.create_task(self._loop(), name="ai-eval-dispatcher")
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="ai-eval-heartbeat")
 
     async def stop(self) -> None:
         """Shutdown / SIGTERM drain: stop claiming, stop the drivers WITHOUT failing evaluations, and release
         their leases so another worker resumes them immediately."""
+        self._stopping = True
         tasks = [t for t in (self._loop_task, self._heartbeat_task, *self._tasks.values()) if t is not None]
         for t in tasks:
             t.cancel()
@@ -287,13 +301,15 @@ class Dispatcher:
             await self.recover()
         except Exception:  # noqa: BLE001
             logger.exception("AI evaluation recovery failed")
-        while True:
+        while not self._stopping:
             try:
                 await self.tick()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - DB hiccup must not kill the loop
                 logger.exception("AI evaluation dispatcher tick failed")
+            if self._stopping:
+                return
             assert self._wake is not None
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), timeout=max(0.5, self.poll_seconds))
@@ -312,15 +328,44 @@ class Dispatcher:
             ).scalar_one()
             free = self.limit - int(active)
             if free > 0:
+                # Fair dispatch: oldest-first with per-user round robin. Queued rows are ranked inside their owner
+                # (1st, 2nd, ... in queue order) and claimed rank by rank, so one user's backlog (e.g. a 50-row
+                # batch) can never starve another user's job; spare capacity still goes to whoever has more queued.
+                rank = (
+                    func.row_number()
+                    .over(
+                        partition_by=Evaluation.owner_id,
+                        order_by=(Evaluation.queued_at.asc().nulls_last(), Evaluation.created_at.asc()),
+                    )
+                    .label("rk")
+                )
+                ranked = (
+                    select(Evaluation.id, Evaluation.queued_at, Evaluation.created_at, rank)
+                    .where(
+                        Evaluation.status == EvaluationStatus.QUEUED,
+                        # a queued job of a chart that was trashed meanwhile is never started
+                        ~exists().where(
+                            ScorecardVersion.id == Evaluation.scorecard_version_id,
+                            Scorecard.id == ScorecardVersion.scorecard_id,
+                            Scorecard.deleted_at.is_not(None),
+                        ),
+                    )
+                    .subquery()
+                )
+                chosen = (
+                    select(ranked.c.id)
+                    .order_by(ranked.c.rk.asc(), ranked.c.queued_at.asc().nulls_last(), ranked.c.created_at.asc())
+                    .limit(free)
+                )
+                picked = {r for (r,) in (await db.execute(chosen)).all()}
                 rows = (
                     await db.execute(
                         select(Evaluation)
-                        .where(Evaluation.status == EvaluationStatus.QUEUED)
+                        .where(Evaluation.id.in_(picked), Evaluation.status == EvaluationStatus.QUEUED)
                         .order_by(Evaluation.queued_at.asc().nulls_last(), Evaluation.created_at.asc())
-                        .limit(free)
                         .with_for_update(skip_locked=True)
                     )
-                ).scalars().all()
+                ).scalars().all() if picked else []
                 now = _now()
                 for ev in rows:
                     ev.status = EvaluationStatus.INGESTING
@@ -401,6 +446,9 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001
             logger.exception("AI evaluation %s crashed", eid)
             await self._fail(eid, "internal", f"Unexpected error: {exc}")
+        # Reached only when the driver finished (done / failed / cancelled flag), never on shutdown: tell the runner
+        # and write the chart's activity line. Idempotent, so a re-driven evaluation does not repeat either.
+        await finalize_evaluation_background(eid)
 
     async def _load(self, eid: uuid.UUID) -> Evaluation | None:
         async with AsyncSessionLocal() as db:
@@ -550,6 +598,7 @@ class Dispatcher:
                     Evaluation.status.in_((EvaluationStatus.INGESTING, EvaluationStatus.PROCESSING)),
                 )
                 .values(status=EvaluationStatus.SCORING, stage="scoring:start")
+                .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
                 .returning(Evaluation.id)
             )
             moved = result.first() is not None
@@ -616,6 +665,7 @@ class Dispatcher:
                     status=EvaluationStatus.FAILED, error_code=code, error_message=message[:2000],
                     finished_at=_now(), stage="failed", lease_owner=None, lease_expires_at=None,
                 )
+                .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
                 .returning(Evaluation.id, Evaluation.batch_id)
             )
             row = result.first()
@@ -663,6 +713,7 @@ class Dispatcher:
                         status=EvaluationStatus.FAILED, error_code="cancelled", error_message="Cancelled by the user.",
                         stage="cancelled", finished_at=_now(), lease_owner=None, lease_expires_at=None,
                     )
+                    .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
                     .returning(Evaluation.sfn_execution_arn, Evaluation.batch_id)
                 )
             ).first()
@@ -682,9 +733,9 @@ class Dispatcher:
                 await db.commit()
 
     # --- user actions ---
-    async def cancel(self, eid: uuid.UUID) -> None:
+    async def cancel(self, eid: uuid.UUID, reason: str | None = None) -> None:
         """Cancel a queued/ingesting/scoring evaluation: failed + error_code=cancelled, stop the SFN
-        execution (best effort) and the local driver."""
+        execution (best effort) and the local driver. `reason` records a SYSTEM cause (e.g. "cancelled_by_trash")."""
         async with AsyncSessionLocal() as db:
             ev = (
                 await db.execute(select(Evaluation).where(Evaluation.id == eid).with_for_update())
@@ -702,6 +753,7 @@ class Dispatcher:
             ev.stage = "cancelled"
             ev.finished_at = _now()
             ev.cancel_requested_at = _now()  # drivers on OTHER processes also see the flag
+            ev.cancel_reason = reason
             ev.lease_owner = None
             ev.lease_expires_at = None
             batch_id = ev.batch_id
@@ -734,6 +786,8 @@ class Dispatcher:
                 raise LookupError("Evaluation not found.")
             if ev.status != EvaluationStatus.FAILED:
                 raise NotRetryableError("Only failed evaluations can be retried.")
+            # The runner may only have one active job (members of the same batch count as one job).
+            await acquire_job_slot(db, ev.owner_id, same_batch_as=ev.batch_id)
             ev.status = EvaluationStatus.QUEUED
             ev.attempt = (ev.attempt or 1) + 1
             ev.error_code = None
@@ -745,6 +799,7 @@ class Dispatcher:
             ev.started_at = None
             ev.finished_at = None
             ev.cancel_requested_at = None
+            ev.cancel_reason = None
             ev.lease_owner = None
             ev.lease_expires_at = None
             await db.execute(

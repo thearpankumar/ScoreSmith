@@ -22,6 +22,8 @@ export function EvaluationSelectionBar({
   total,
   exportable,
   hidden,
+  allMatching = false,
+  maxExport = MAX_EXPORT,
   includeReasoning,
   onIncludeReasoning,
   status,
@@ -34,6 +36,10 @@ export function EvaluationSelectionBar({
   /** How many of the selected rows can go into the export (completed with a score). */
   exportable: number;
   hidden: number;
+  /** True for the server-side "all N matching this filter" selection. */
+  allMatching?: boolean;
+  /** The export cap that applies to this selection (200 by ids, 500 by filter). */
+  maxExport?: number;
   includeReasoning: boolean;
   onIncludeReasoning: (value: boolean) => void;
   status: ExportStatus;
@@ -45,7 +51,7 @@ export function EvaluationSelectionBar({
   const exporting = status.kind === "exporting";
   const deleting = status.kind === "deleting";
   const busy = exporting || deleting;
-  const overCap = exportable > MAX_EXPORT;
+  const overCap = !allMatching && exportable > maxExport;
   if (total === 0 && status.kind !== "success") return null;
 
   return (
@@ -58,7 +64,7 @@ export function EvaluationSelectionBar({
     >
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <p className="min-w-0 font-medium tabular-nums" aria-live="polite">
-          {total} selected
+          {total.toLocaleString()} selected{allMatching ? " (all matching the filter)" : ""}
           {hidden > 0 && (
             <span className="font-normal opacity-80">
               {" "}
@@ -94,7 +100,7 @@ export function EvaluationSelectionBar({
             size="sm"
             onClick={onExport}
             disabled={busy || exportable === 0 || overCap}
-            title={overCap ? `Export is limited to ${MAX_EXPORT} evaluations` : exportable === 0 ? "None of the selected evaluations are completed with a score" : undefined}
+            title={overCap ? `Export is limited to ${maxExport} evaluations` : exportable === 0 ? "None of the selected evaluations are completed with a score" : undefined}
           >
             {exporting ? <Loader2 className="size-3.5 animate-spin" aria-hidden /> : <Download className="size-3.5" aria-hidden />}
             {exporting ? "Preparing workbook…" : `Export to Excel (${exportable})`}
@@ -111,6 +117,9 @@ export function EvaluationSelectionBar({
           <Loader2 className="size-3.5 animate-spin" aria-hidden />
           Deleting {status.done} of {status.total}…
         </p>
+      )}
+      {allMatching && exportable > maxExport && !busy && (
+        <p className="text-xs opacity-80">Excel export includes the first {maxExport} of {exportable.toLocaleString()} matching completed evaluations.</p>
       )}
       {exportable > 100 && !busy && status.kind === "idle" && (
         <p className="text-xs opacity-80">Large exports can take ~10 seconds.</p>

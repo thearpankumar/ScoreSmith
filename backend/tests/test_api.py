@@ -22,7 +22,7 @@ def test_me_profile_and_removed_user_admin_api(client: TestClient, seed_user_id:
     r = client.patch("/api/v1/me", json={"name": "Renamed", "role": "admin"}, headers=h)
     assert r.status_code == 200
     assert r.json()["name"] == "Renamed"
-    assert r.json()["role"] == "member"  # a user cannot promote themselves
+    assert r.json()["role"] == "user"  # a user cannot promote themselves
 
     # The open user-admin endpoints are gone.
     assert client.get(f"/api/v1/users/{seed_user_id}", headers=h).status_code == 404

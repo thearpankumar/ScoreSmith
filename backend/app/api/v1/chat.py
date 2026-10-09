@@ -24,6 +24,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app import notifications as notif
+from app.activity import log_edit
 from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
 from app.ai.draft_materialize import draft_from_scorecard, materialize_draft
 from app.ai.draft_schema import ScorecardDraft
@@ -39,7 +41,7 @@ from app.ai.scorecard_builder import (
 )
 from app.ai.session_title import generate_session_title
 from app.ai.web_search import WebSearchClientProtocol
-from app.authz import get_owned_chat_session, get_owned_scorecard
+from app.authz import get_accessible_scorecard, get_owned_chat_session
 from app.config import get_settings
 from app.db import AsyncSessionLocal, get_db
 from app.deps import get_bedrock_client, get_current_user, get_jev_client, get_web_search_client
@@ -49,6 +51,7 @@ from app.models.chat_session import STALE_TURN_TIMEOUT_SECONDS, ChatSession
 from app.models.chat_turn_event import ChatTurnEvent
 from app.models.enums import ChatMessageRole, ChatSessionStatus
 from app.models.kpi_node import KpiNode
+from app.models.scorecard import Scorecard
 from app.models.scorecard_version import ScorecardVersion
 from app.models.user import User
 from app.ratelimit import rate_limit
@@ -60,6 +63,7 @@ from app.schemas.chat import (
     ChatTurnEventRead,
     ChatTurnRead,
 )
+from app.slots import acquire_chat_slot
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +111,10 @@ async def _mark_turn_in_progress(
     side of this "don't accumulate unboundedly" contract) rather than growing forever
     across a long-lived session's history of turns."""
     started_at = datetime.now(UTC)
+    # One running turn per USER across all their sessions (app/slots.py): atomic with the claim below.
+    owner_id = await db.scalar(select(ChatSession.user_id).where(ChatSession.id == session_id))
+    if owner_id is not None:
+        await acquire_chat_slot(db, owner_id, session_id)
     conditions = [ChatSession.id == session_id]
     if require_idle:
         # Atomic "no turn running" check (two concurrent POSTs must not both start a turn on one thread): a
@@ -119,6 +127,7 @@ async def _mark_turn_in_progress(
         update(ChatSession)
         .where(*conditions)
         .values(pending_turn_started_at=started_at, last_turn_error=None, last_turn_error_code=None, **_TURN_RESET)
+        .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
         .returning(ChatSession.id)
     )
     if claimed.first() is None and require_idle:
@@ -129,6 +138,18 @@ async def _mark_turn_in_progress(
     await db.execute(delete(ChatTurnEvent).where(ChatTurnEvent.session_id == session_id))
     await db.commit()
     return started_at
+
+
+async def _mark_new_turn(db: AsyncSession, session_id: uuid.UUID) -> datetime:
+    """`_mark_turn_in_progress` for a session created a moment ago: when the user's chat slot is busy the fresh
+    (empty) session is removed again, so a refused first message leaves nothing behind."""
+    try:
+        return await _mark_turn_in_progress(db, session_id)
+    except HTTPException:
+        await db.rollback()
+        await db.execute(delete(ChatSession).where(ChatSession.id == session_id))
+        await db.commit()
+        raise
 
 
 async def _clear_turn_in_progress(db: AsyncSession, session_id: uuid.UUID) -> None:
@@ -243,6 +264,26 @@ async def _persist_turn_result(
     await db.commit()
 
 
+async def _notify_turn(session: ChatSession, turn: BuilderTurnResult, turn_started_at: datetime) -> None:
+    """Background turns only (the user may be away): "the assistant asked you something" and "your scorecard was
+    saved". Idempotent per turn (dedupe key), so a retried / re-driven turn never notifies twice."""
+    stamp = turn_started_at.isoformat()
+    title = (session.title or "your chat")[:120]
+    if turn.question:
+        await notif.notify_background(
+            session.user_id, notif.CHAT_QUESTION, "The assistant has a question for you",
+            body=f"In '{title}': {str(turn.question)[:240]}", link=f"/chat/{session.id}",
+            data={"session_id": str(session.id)}, dedupe_key=f"question:{session.id}:{stamp}",
+        )
+    if turn.status == "confirmed" and session.target_scorecard_id is not None:
+        await notif.notify_background(
+            session.user_id, notif.SCORECARD_SAVED, "Your scorecard was saved",
+            body=f"'{title}' finished building.", link=f"/charts/{session.target_scorecard_id}",
+            data={"session_id": str(session.id), "scorecard_id": str(session.target_scorecard_id)},
+            dedupe_key=f"saved:{session.id}:{stamp}",
+        )
+
+
 async def _background_turn(
     *,
     session_id: uuid.UUID,
@@ -283,6 +324,7 @@ async def _background_turn(
             await _persist_turn_result(
                 db, session, turn, bedrock, user_message=message if persist_user_message else None
             )
+            await _notify_turn(session, turn, turn_started_at)
     except asyncio.CancelledError:
         if session_id in _user_cancelled:
             _user_cancelled.discard(session_id)
@@ -328,6 +370,7 @@ class ChatTurnRunner:
     def __init__(self) -> None:
         self.worker_id = f"{platform.node()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self._claiming = True
+        self._stopping = False  # set by stop(): the supervisor loop must end even if its cancellation is swallowed
         self._supervisor: asyncio.Task[None] | None = None
         self._last_beat = float("-inf")
         self._last_reap = float("-inf")
@@ -390,6 +433,7 @@ class ChatTurnRunner:
                     update(ChatSession)
                     .where(ChatSession.id.in_(candidates))
                     .values(**_chat_lease_values(self.worker_id))
+                    .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
                     .returning(
                         ChatSession.id, ChatSession.turn_message, ChatSession.turn_first,
                         ChatSession.pending_turn_started_at,
@@ -459,6 +503,7 @@ class ChatTurnRunner:
                         update(ChatSession)
                         .where(*held)
                         .values(**_chat_lease_values(self.worker_id))
+                        .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
                         .returning(ChatSession.id, ChatSession.turn_cancel_requested_at)
                     )
                 ).all()
@@ -482,7 +527,10 @@ class ChatTurnRunner:
 
     async def _loop(self) -> None:
         settings = get_settings()
-        while True:
+        # `_stopping` is the real exit condition; task.cancel() only makes it prompt. A cancel that lands inside a
+        # DB driver call can come back as an ordinary exception (psycopg connect/rollback), which the `except
+        # Exception` below swallows - without the flag the loop would then run forever and stop() would hang.
+        while not self._stopping:
             try:
                 await self.supervise_once()
                 if time.monotonic() - self._last_reap >= settings.lease_heartbeat_seconds:
@@ -493,11 +541,14 @@ class ChatTurnRunner:
                 raise
             except Exception:  # noqa: BLE001 — a DB hiccup must not kill the loop
                 logger.warning("Chat turn supervisor tick failed.", exc_info=True)
+            if self._stopping:
+                return
             await asyncio.sleep(max(0.2, settings.chat_supervisor_seconds))
 
     async def start(self) -> None:
         """Lifespan / worker hook: reap leases left by dead workers, then supervise + claim in the background."""
         self._claiming = True
+        self._stopping = False
         self._last_reap = time.monotonic()
         recovered = await self.reap()
         if recovered:
@@ -514,6 +565,7 @@ class ChatTurnRunner:
         and clears its marker + lease, so the user is offered a retry rather than a stuck spinner)."""
         self.stop_claiming()
         if self._supervisor is not None:
+            self._stopping = True
             self._supervisor.cancel()
             await asyncio.gather(self._supervisor, return_exceptions=True)
             self._supervisor = None
@@ -563,6 +615,7 @@ async def cancel_background_turn(session_id: uuid.UUID) -> bool:
                     ChatSession.turn_message.is_not(None),  # a queued/background job (inline turns have none)
                 )
                 .values(turn_cancel_requested_at=func.now())
+                .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
                 .returning(ChatSession.turn_lease_owner, ChatSession.pending_turn_started_at)
             )
         ).first()
@@ -658,6 +711,13 @@ async def _maybe_materialize(
         return None, None
     session.target_scorecard_id = scorecard.id
     session.status = ChatSessionStatus.COMPLETED
+    chat_user = await db.get(User, session.user_id)
+    if chat_user is not None:
+        await log_edit(
+            db, scorecard.id, chat_user, "version_created",
+            f"Saved version {version.version_number} from the assistant chat",
+            entity_type="scorecard_version", entity_id=version.id, detail={"version_number": version.version_number},
+        )
     await db.commit()
 
     # Fixes a real gap found during live testing: `upsert_scorecard_embedding` (see
@@ -681,13 +741,41 @@ async def _maybe_materialize(
     return scorecard.id, version.id
 
 
+async def chart_states(
+    db: AsyncSession, user: User, sessions: list[ChatSession]
+) -> dict[uuid.UUID, tuple[str, uuid.UUID | None, bool]]:
+    """Per chat session: (chart_state, chart id the caller may use, caller can restore it).
+
+    `none` = no chart linked (yet); `active` = the chart is live; `trashed` = it is in the trash (its id is only
+    handed to the chart's OWNER, who can restore it - everybody else would just hit a 404); `deleted` = the session
+    built a chart (it is COMPLETED) but the chart is gone (the FK is SET NULL on delete/purge)."""
+    ids = {s.target_scorecard_id for s in sessions if s.target_scorecard_id is not None}
+    cards: dict[uuid.UUID, Scorecard] = {}
+    if ids:
+        cards = {
+            c.id: c for c in (await db.execute(select(Scorecard).where(Scorecard.id.in_(ids)))).scalars().all()
+        }
+    out: dict[uuid.UUID, tuple[str, uuid.UUID | None, bool]] = {}
+    for s in sessions:
+        card = cards.get(s.target_scorecard_id) if s.target_scorecard_id is not None else None
+        if card is None:
+            out[s.id] = ("deleted" if s.status == ChatSessionStatus.COMPLETED else "none", None, False)
+        elif card.deleted_at is None:
+            out[s.id] = ("active", card.id, False)
+        elif card.owner_id == user.id:
+            out[s.id] = ("trashed", card.id, True)
+        else:
+            out[s.id] = ("trashed", None, False)
+    return out
+
+
 @router.get("/sessions", response_model=list[ChatSessionRead])
 async def list_chat_sessions(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> list[ChatSession]:
+) -> list[ChatSessionRead]:
     """Additive (Wave 3 integration): the frontend's Home "continue where you left off"
     list and the Chat sidebar both need a real list of chat sessions — this was missing
     from the Cycle 1c AI-core pass, which only exposed per-session endpoints."""
@@ -695,7 +783,15 @@ async def list_chat_sessions(
         select(ChatSession).where(ChatSession.user_id == current_user.id).order_by(ChatSession.last_activity_at.desc())
     )
     result = await db.execute(stmt.offset(skip).limit(limit))
-    return list(result.scalars().all())
+    sessions = list(result.scalars().all())
+    states = await chart_states(db, current_user, sessions)
+    out: list[ChatSessionRead] = []
+    for s in sessions:
+        state, visible_id, can_restore = states[s.id]
+        item = ChatSessionRead.model_validate(s)
+        item.chart_state, item.chart_can_restore, item.target_scorecard_id = state, can_restore, visible_id
+        out.append(item)
+    return out
 
 
 @router.get("/sessions/{session_id}/messages", response_model=list[ChatMessageRead])
@@ -783,7 +879,7 @@ async def start_chat_session(
         # (`_mark_turn_in_progress` commits), so a reload / navigation right after the 202 — or a
         # failed/cancelled first turn — still sees it; the success path must not write it again.
         await _persist_message(db, session_id, ChatMessageRole.USER, payload.message)
-        turn_started_at = await _mark_turn_in_progress(db, session_id)
+        turn_started_at = await _mark_new_turn(db, session_id)
         await _launch_background_turn(
             session_id=session_id, message=payload.message, first_turn=True, persist_user_message=False,
             turn_started_at=turn_started_at, bedrock=bedrock, web_search=web_search, jev=jev,
@@ -798,7 +894,7 @@ async def start_chat_session(
     # session row is deleted, the title is deleted right along with it — no orphaned
     # title left behind either.
     await _generate_and_persist_title(db, session, bedrock, payload.message)
-    turn_started_at = await _mark_turn_in_progress(db, session_id)
+    turn_started_at = await _mark_new_turn(db, session_id)
     try:
         turn = await start_session(
             str(session_id),
@@ -879,7 +975,7 @@ async def _start_refine_session(
     scorecard's current version (see `draft_from_scorecard` / `seed_session`). Seeding
     never calls the model, so the session (and its loaded draft) is created successfully
     even when Bedrock is unavailable; only an optional first `message` needs Bedrock."""
-    scorecard = await get_owned_scorecard(db, current_user, scorecard_id)
+    scorecard = await get_accessible_scorecard(db, current_user, scorecard_id)
     if scorecard.current_version_id is None:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Scorecard has no current version to refine."
@@ -925,7 +1021,7 @@ async def _start_refine_session(
     if message and not inline:
         await _persist_message(db, session.id, ChatMessageRole.USER, message)
         await db.commit()
-        turn_started_at = await _mark_turn_in_progress(db, session.id)
+        turn_started_at = await _mark_new_turn(db, session.id)
         await _launch_background_turn(
             session_id=session.id, message=message, first_turn=False, persist_user_message=False,
             turn_started_at=turn_started_at, bedrock=bedrock, web_search=web_search, jev=jev,
@@ -939,7 +1035,7 @@ async def _start_refine_session(
     if message:
         await _persist_message(db, session.id, ChatMessageRole.USER, message)
         await db.commit()
-        turn_started_at = await _mark_turn_in_progress(db, session.id)
+        turn_started_at = await _mark_new_turn(db, session.id)
         settings = get_settings()
         try:
             turn = await send_message(
@@ -1103,6 +1199,7 @@ async def get_chat_session(
     show a persistent "still working" indicator and poll this endpoint instead of
     rendering a blank composer as if nothing were happening."""
     session = await get_owned_chat_session(db, current_user, session_id)
+    chart_state, visible_chart_id, can_restore = (await chart_states(db, current_user, [session]))[session.id]
 
     in_progress = session.turn_in_progress
     turn_error = None if in_progress else session.last_turn_error
@@ -1127,6 +1224,8 @@ async def get_chat_session(
                 # early. This is exactly the "second connection sees the title before the
                 # first request returns" path the task's live-verification asks for.
                 title=session.title,
+                chart_state=chart_state,
+                chart_can_restore=can_restore,
             )
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, detail="Chat session has no LangGraph state yet."
@@ -1139,8 +1238,10 @@ async def get_chat_session(
     # Only report a materialized scorecard once something was actually saved: a
     # "Refine with assistant" session carries target_scorecard_id from the start, before
     # anything has been confirmed.
+    response.chart_state, response.chart_can_restore = chart_state, can_restore
     if session.status == ChatSessionStatus.COMPLETED:
-        response.materialized_scorecard_id = session.target_scorecard_id
+        # a trashed / deleted chart must not be offered as a link (it would be a 404 dead end)
+        response.materialized_scorecard_id = visible_chart_id if chart_state == "active" else None
     return response
 
 

@@ -63,3 +63,11 @@ Jev `score` takes at most 10 criteria and returns a 0-indexed fractional positio
 - **Minimum content**: a corpus with fewer than 30 words fails with `no_content`.
 - **Source rows**: a Drive source is the roll-up of its expanded files (`{source_id}-NN`): `running` while any file runs, `done` when any file was processed, `failed` only when none was. The backend applies the same roll-up to `evaluation_sources`.
 - **Concurrency**: Step Functions Map states run 2 files, then 3 images or 3 audio chunks at a time. Lambda throttling is retried up to 25 times (jittered, capped at 30 s).
+
+## Addendum: ownership, slots and workers (added after the original contract; the REST shapes above are unchanged)
+- Every endpoint requires a signed-in user (cookie session or `Authorization: Bearer`). Evaluations and batches are visible to the owner and accepted collaborators of their chart; ids of anyone else's data answer `404`. Route table: `docs/api-reference.md`.
+- `POST /evaluations/ai/jobs` is limited to **one running job per user** (a batch counts as one): `409 {"code":"user_job_active","evaluation_id","batch_id","scorecard_id","message"}`. It also accepts an `Idempotency-Key` header: a retried request with the same key returns the stored result instead of queuing again.
+- The dispatcher runs in `ROLE=worker` processes. A claim stamps a lease (`lease_owner`, `lease_expires_at`, heartbeat) and any worker may adopt a row whose lease expired; cancellation is the DB flag `cancel_requested_at`. A cancelled evaluation is `status=failed`, `error_code=cancelled` (`cancel_reason=cancelled_by_trash` when the chart was trashed; restoring the chart re-queues those rows).
+- `uploads/{user_id}/...` keys are bound to the user they were issued to, and each user has a rolling 24 h upload byte quota (`UPLOAD_USER_DAILY_BYTES`).
+- Lists for the UI use `GET /evaluations/page` (keyset) and `POST /evaluations/refresh`; bulk delete and export accept a server-side filter. See `docs/architecture.md` for the lifecycle diagram.
+

@@ -80,6 +80,7 @@ class EvaluationRead(ORMBase):
     scorecard_version_id: uuid.UUID
     name: str
     evaluated_by: uuid.UUID
+    runner_name: str | None = None
     input_reference: dict | None
     status: EvaluationStatus
     final_weighted_score: float | None

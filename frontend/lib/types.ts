@@ -12,13 +12,15 @@
 
 export type ScorecardStatus = "draft" | "published" | "archived";
 
-export type UserRole = "designer" | "evaluator" | "admin";
+/** Exactly two roles: admins manage users and settings; everyone else is a plain user. */
+export type UserRole = "admin" | "user";
 
 export interface User {
   id: string;
   name: string;
   email: string;
   role: UserRole;
+  username?: string | null;
   orgId?: string | null;
 }
 
@@ -29,6 +31,11 @@ export interface Scorecard {
   domain: string;
   ownerId: string;
   ownerName: string;
+  /** The signed-in user's role on this chart: the owner, or an invited collaborator ("editor"). */
+  myRole?: "owner" | "editor";
+  /** True when the chart has at least one accepted collaborator (shows the editing log, "Shared" badges). */
+  isShared?: boolean;
+  collaboratorCount?: number;
   purposeStatement: string;
   scope: string;
   targetScore: number; // 0-10
@@ -176,7 +183,12 @@ export interface ChatSession {
   title: string;
   status: ChatSessionStatus;
   contextSummary: string;
+  /** The chart behind this chat - only while it is ACTIVE (never a link to a trashed / deleted chart). */
   targetScorecardId: string | null;
+  /** State of the chart behind the chat (backend ChatSessionRead.chart_state). */
+  chartState?: "none" | "active" | "trashed" | "deleted";
+  /** Trashed chart the caller OWNS: its id (to restore it) - null for everybody else. */
+  trashedChartId?: string | null;
   createdAt: string;
   lastActivityAt: string;
   /** A turn is running server-side right now (backend ChatSessionRead.turn_in_progress). */

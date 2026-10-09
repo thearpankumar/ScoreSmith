@@ -158,6 +158,24 @@ def _cases(w: World) -> list[tuple[str, str, dict | None]]:
         ("POST", f"/api/v1/chat/sessions/{chat}/cancel", None),
         ("DELETE", f"/api/v1/chat/sessions/{chat}", None),
         ("POST", "/api/v1/chat/sessions", {"message": "", "target_scorecard_id": sc}),
+        # sharing: managing B's chart's collaborators / reading its log is invisible to A
+        ("POST", f"/api/v1/scorecards/{sc}/invitations", {"identifier": "b@example.com"}),
+        ("GET", f"/api/v1/scorecards/{sc}/sharing", None),
+        ("DELETE", f"/api/v1/scorecards/{sc}/invitations/{uuid.uuid4()}", None),
+        ("DELETE", f"/api/v1/scorecards/{sc}/collaborators/{uuid.uuid4()}", None),
+        ("POST", f"/api/v1/scorecards/{sc}/leave", None),
+        ("GET", f"/api/v1/scorecards/{sc}/activity", None),
+        # invitations / notifications are addressed to one user; any other id is simply "not found"
+        ("GET", f"/api/v1/invitations/{uuid.uuid4()}/preview", None),
+        ("POST", f"/api/v1/invitations/{uuid.uuid4()}/accept", None),
+        ("POST", f"/api/v1/invitations/{uuid.uuid4()}/decline", None),
+        ("POST", f"/api/v1/notifications/{uuid.uuid4()}/read", None),
+        # chats are shared read-only with named people only; for everyone else these are "not found"
+        ("GET", f"/api/v1/chat/shared/{uuid.uuid4()}", None),
+        ("POST", f"/api/v1/chat/shared/{uuid.uuid4()}/save", None),
+        ("POST", f"/api/v1/chat/sessions/{chat}/shares", {"identifier": "a@example.com"}),
+        ("GET", f"/api/v1/chat/sessions/{chat}/shares", None),
+        ("DELETE", f"/api/v1/chat/sessions/{chat}/shares/{uuid.uuid4()}", None),
     ]
 
 
@@ -264,14 +282,15 @@ def test_a_scorecard_cannot_point_at_another_users_version(
 def test_scorecard_owner_sees_other_users_evaluations_of_their_scorecard_but_not_vice_versa(
     client: TestClient, db_session: Session, world: World
 ) -> None:
-    """Decision: a scorecard's owner sees every evaluation of it; an evaluator sees only their own."""
+    """Decision (updated for sharing): evaluations follow their CHART - owner and accepted collaborators see all of
+    them; someone with no access to the chart sees none, even a row that names them as the evaluator."""
     ev_by_a = Evaluation(scorecard_version_id=world.ver.id, name="Alice evaluates Bob's card", evaluated_by=world.a.id)
     db_session.add(ev_by_a)
     db_session.commit()
     seen_by_b = {e["id"] for e in client.get("/api/v1/evaluations", headers=_h(world.b.id)).json()}
     assert seen_by_b == {str(world.ev.id), str(ev_by_a.id)}
     seen_by_a = {e["id"] for e in client.get("/api/v1/evaluations", headers=_h(world.a.id)).json()}
-    assert seen_by_a == {str(ev_by_a.id)}  # A's own evaluation only; Bob's evaluation stays invisible
+    assert seen_by_a == set()  # no access to Bob's chart -> no evaluations of it, Bob's stay invisible too
     assert client.get(f"/api/v1/evaluations/{world.ev.id}", headers=_h(world.a.id)).status_code == 404
     # A cannot read the scorecard itself through its evaluation either.
     assert client.get(f"/api/v1/scorecards/{world.sc.id}", headers=_h(world.a.id)).status_code == 404

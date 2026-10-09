@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
 from app.models.enums import ChatMessageRole, ChatSessionStatus
 from app.schemas.common import ORMBase
+
+ChartState = Literal["none", "active", "trashed", "deleted"]
 
 
 class ChatSessionStart(BaseModel):
@@ -72,6 +74,10 @@ class ChatTurnRead(BaseModel):
     similar_suggestions: list[ChatSimilarSuggestion] | None = None
     assistant_message: str | None = None
     materialized_scorecard_id: uuid.UUID | None = None
+    # State of the chart behind this chat (see `chart_states` in app/api/v1/chat.py): a trashed chart's id is only
+    # exposed to its owner (who can restore it); `deleted` = the chart this chat built no longer exists.
+    chart_state: ChartState = "none"
+    chart_can_restore: bool = False
     materialized_scorecard_version_id: uuid.UUID | None = None
     # Persistent-across-refresh "turn in progress" marker (see app/api/v1/chat.py /
     # ChatSession.pending_turn_started_at) — true when this session has a turn currently
@@ -110,6 +116,8 @@ class ChatSessionRead(ORMBase):
     # See ChatTurnRead.turn_in_progress — surfaced here too so the sidebar session list can
     # badge a session whose turn is still running.
     turn_in_progress: bool = False
+    chart_state: ChartState = "none"
+    chart_can_restore: bool = False
 
 
 class ChatMessageRead(ORMBase):

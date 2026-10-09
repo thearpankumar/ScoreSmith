@@ -1,6 +1,14 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-import { browserOrigin, isExpired, isPublicPath, isSignedOutOnlyPath, safeNextPath } from "@/lib/auth-helpers";
+import {
+  browserOrigin,
+  isExpired,
+  isPublicPath,
+  isSignedOutOnlyPath,
+  jwtStringClaim,
+  roleMayOpen,
+  safeNextPath,
+} from "@/lib/auth-helpers";
 
 /**
  * Route protection + silent session renewal.
@@ -40,6 +48,14 @@ function toLogin(req: NextRequest, expired: boolean): NextResponse {
   return res;
 }
 
+/** A signed-in user opened a page their role may not see (Users admin, Settings): back to the app. */
+function toApp(req: NextRequest): NextResponse {
+  const url = req.nextUrl.clone();
+  url.pathname = "/chat";
+  url.search = "";
+  return NextResponse.redirect(url);
+}
+
 /** `name=value` pairs from Set-Cookie headers (attributes dropped), keyed by cookie name. */
 function cookieUpdates(setCookies: string[]): Map<string, string> {
   const out = new Map<string, string>();
@@ -51,7 +67,10 @@ function cookieUpdates(setCookies: string[]): Map<string, string> {
   return out;
 }
 
-type Renewal = { kind: "renewed"; response: NextResponse } | { kind: "rejected" } | { kind: "unreachable" };
+type Renewal =
+  | { kind: "renewed"; response: NextResponse; access: string | null }
+  | { kind: "rejected" }
+  | { kind: "unreachable" };
 
 async function renewSession(req: NextRequest): Promise<Renewal> {
   const refresh = req.cookies.get(REFRESH)?.value;
@@ -82,7 +101,7 @@ async function renewSession(req: NextRequest): Promise<Renewal> {
   headers.set("cookie", [...merged].map(([k, v]) => `${k}=${v}`).join("; "));
   const next = NextResponse.next({ request: { headers } });
   for (const sc of setCookies) next.headers.append("set-cookie", sc);
-  return { kind: "renewed", response: next };
+  return { kind: "renewed", response: next, access: merged.get(ACCESS) ?? null };
 }
 
 function clearSession(req: NextRequest, res: NextResponse): NextResponse {
@@ -122,10 +141,17 @@ export async function middleware(req: NextRequest) {
   if (isPublicPath(pathname)) return NextResponse.next();
 
   const access = req.cookies.get(ACCESS)?.value;
-  if (access && !isExpired(access)) return NextResponse.next();
+  if (access && !isExpired(access)) {
+    return roleMayOpen(pathname, jwtStringClaim(access, "rol")) ? NextResponse.next() : toApp(req);
+  }
 
   const renewed = await renewSession(req);
-  if (renewed.kind === "renewed") return renewed.response;
+  if (renewed.kind === "renewed") {
+    if (roleMayOpen(pathname, jwtStringClaim(renewed.access, "rol"))) return renewed.response;
+    const away = toApp(req);
+    for (const sc of renewed.response.headers.getSetCookie()) away.headers.append("set-cookie", sc);
+    return away;
+  }
   // Backend unreachable: keep the cookies and let the page render its own "could not reach the backend" error
   // instead of signing the visitor out over a blip.
   if (renewed.kind === "unreachable") return NextResponse.next();

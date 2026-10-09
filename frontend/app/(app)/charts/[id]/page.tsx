@@ -7,7 +7,11 @@ import { CHART_TABS } from "@/components/chart-detail/chart-tabs";
 import { HistoryTab } from "@/components/chart-detail/HistoryTab";
 import { ScorecardActions } from "@/components/chart-detail/ScorecardActions";
 import { ScorecardStatusBadge } from "@/components/charts-library/ScorecardStatusBadge";
+import { ActivityPanel } from "@/components/sharing/ActivityPanel";
+import { ShareButton } from "@/components/sharing/ShareDialog";
+import { Badge } from "@/components/ui/badge";
 import {
+  getCurrentUser,
   getCurrentUserId,
   getScorecardWithVersion,
   listEvaluations,
@@ -33,9 +37,10 @@ export default async function ChartDetailPage({
   if (!withVersion) notFound();
   const { scorecard, version } = withVersion;
 
-  const [evaluations, currentUserId, versionNumbers] = await Promise.all([
+  const [evaluations, currentUserId, me, versionNumbers] = await Promise.all([
     listEvaluations({ scorecardId: id }),
     getCurrentUserId().catch(() => null),
+    getCurrentUser().catch(() => null),
     listScorecardVersionNumbers(id).catch(() => ({}) as Record<string, number>),
   ]);
   const versionEvaluationCount = evaluations.filter((e) => e.scorecardVersionId === version.id).length;
@@ -53,17 +58,30 @@ export default async function ChartDetailPage({
 
   return (
     <div className="flex flex-col gap-4 py-2">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+      <div className="flex flex-wrap items-start justify-between gap-3 md:pr-14">
         <div className="flex flex-wrap items-center gap-2">
           <h1 className="text-2xl font-semibold text-ink">{scorecard.name}</h1>
           <ScorecardStatusBadge status={scorecard.status} />
+          {scorecard.isShared && (
+            <Badge variant="soft">
+              Shared{scorecard.myRole === "editor" ? ` · owned by ${scorecard.ownerName}` : ` with ${scorecard.collaboratorCount}`}
+            </Badge>
+          )}
         </div>
-        <ScorecardActions
-          scorecardId={scorecard.id}
-          status={scorecard.status}
-          issues={issues}
-          evaluationCount={versionEvaluationCount}
-        />
+        <div className="flex flex-wrap items-center gap-2 lg:justify-end">
+          <ShareButton
+            scorecardId={scorecard.id}
+            scorecardName={scorecard.name}
+            myRole={scorecard.myRole ?? "owner"}
+            isShared={Boolean(scorecard.isShared)}
+          />
+          <ScorecardActions
+            scorecardId={scorecard.id}
+            status={scorecard.status}
+            issues={issues}
+            evaluationCount={versionEvaluationCount}
+          />
+        </div>
       </div>
 
       <ChartDetailTabs
@@ -89,6 +107,8 @@ export default async function ChartDetailPage({
           />
         }
       />
+
+      {scorecard.isShared && <ActivityPanel scorecardId={scorecard.id} currentUserName={me?.name} />}
     </div>
   );
 }

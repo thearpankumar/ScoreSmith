@@ -1,17 +1,20 @@
 "use client";
 
 import { useState } from "react";
-import { LogOut } from "lucide-react";
+import { LogOut, UserCog } from "lucide-react";
 
 import { logout } from "@/lib/auth-client";
+import { AccountDialog } from "./AccountDialog";
 import { cn } from "@/lib/utils";
 
 export interface SessionUser {
   name: string;
   email: string;
+  role: string;
+  username?: string | null;
 }
 
-function initials(name: string, email: string): string {
+export function initials(name: string, email: string): string {
   const parts = (name || email).trim().split(/\s+/).filter(Boolean);
   const letters = parts.length > 1 ? parts[0][0] + parts[parts.length - 1][0] : (parts[0] ?? "?").slice(0, 2);
   return letters.toUpperCase();
@@ -34,6 +37,7 @@ async function signOut(): Promise<void> {
 /** Desktop rail footer: who is signed in, and Sign out. */
 export function UserMenu({ user, collapsed }: { user: SessionUser | null; collapsed: boolean }) {
   const [busy, setBusy] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
   return (
     <div className={cn("glass-tint mt-2 flex shrink-0 items-center gap-2 rounded-xl p-2", collapsed && "flex-col")}>
       {user && (
@@ -50,6 +54,20 @@ export function UserMenu({ user, collapsed }: { user: SessionUser | null; collap
           <span className="block truncate text-sm font-medium text-ink">{user.name}</span>
           <span className="block truncate text-xs text-ink-muted">{user.email}</span>
         </span>
+      )}
+      {user && (
+        <>
+          <button
+            type="button"
+            onClick={() => setAccountOpen(true)}
+            title="Your account"
+            aria-label="Your account"
+            className="flex size-8 shrink-0 items-center justify-center rounded-lg text-ink-muted transition-colors hover:bg-white/70 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]"
+          >
+            <UserCog className="size-4.5" aria-hidden />
+          </button>
+          <AccountDialog user={user} open={accountOpen} onOpenChange={setAccountOpen} />
+        </>
       )}
       <button
         type="button"

@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { UnsavedChangesDialog } from "./UnsavedChangesDialog";
+import { SharedChatsList } from "./SharedChatsList";
 import { useChatSessions } from "./ChatSessionsContext";
 import { useUnsavedChangesGuard } from "@/lib/useUnsavedChangesGuard";
 import { deleteChatSession } from "@/lib/api-client";
@@ -175,6 +176,7 @@ export function ChatSessionNavList({ activeSessionId }: { activeSessionId: strin
         })
       )}
 
+      <SharedChatsList activeSessionId={activeSessionId} />
       <UnsavedChangesDialog open={isConfirmOpen} onConfirmLeave={confirmLeave} onCancel={cancelLeave} />
       {deleteDialog}
     </div>

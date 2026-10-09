@@ -1,5 +1,5 @@
 /**
- * The KPI Metrics mark: three fully rounded bars (the middle one tallest) with the third split into a dot and a
+ * The Score Smith mark: three fully rounded bars (the middle one tallest) with the third split into a dot and a
  * stem - a bar chart that doubles as an "i". Inline SVG, drawn in the 1672x941 stage's pixel units.
  */
 export function BrandMark({ className }: { className?: string }) {
@@ -44,7 +44,7 @@ export function BrandLogo() {
     <div className="auth-brand">
       <BrandMark className="auth-brand-mark" />
       <div className="auth-brand-text">
-        <div className="auth-brand-name">KPI Metrics</div>
+        <div className="auth-brand-name">Score Smith</div>
         <div className="auth-brand-sub">Designer &amp; Evaluator</div>
       </div>
     </div>

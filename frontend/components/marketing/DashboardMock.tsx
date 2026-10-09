@@ -37,7 +37,7 @@ export function DashboardMock() {
         <aside className="mkd-side">
           <div className="mkd-side-brand">
             <BrandMark className="mkd-side-mark" />
-            <b>KPI Metrics</b>
+            <b>Score Smith</b>
           </div>
           {NAV.map(({ label, Icon, ...rest }) => (
             <div key={label} className={`mkd-nav${"active" in rest ? " is-active" : ""}`}>

@@ -1,4 +1,6 @@
-# Initial Product Scope — Quality Scorecard System
+# Initial Product Scope — Quality Scorecard System (Score Smith)
+
+> Historical document: this is the scope agreed at the start of Cycle 1. Since then the product was renamed **Score Smith** and gained authentication, two roles (`admin` / `user`), chart and chat sharing, notifications, a chart trash, an AI evaluation pipeline for files and Drive links, and a worker-based scaling model. Current behaviour: [README](../README.md), [architecture](architecture.md), [sharing and RBAC](plan-sharing-rbac.md).
 
 Per Data-Driven Development Framework v1.1 §6. Deliberately lighter than a PRD; the detailed PRD is refined after Cycles 1–3 produce evidence.
 
@@ -26,7 +28,7 @@ Quality of work (documents, tasks, projects, deliverables of any kind) is curren
 - LLM backend must be AWS Bedrock (Z.ai GLM-5 via Converse/ConverseStream for chat and judge; Titan embeddings for similarity).
 - Local development entirely via Docker Compose.
 - Judge reliability matters more than judge speed — reasoning-before-score, evidence citation required.
-- Cycle 1 intentionally defers: complex multi-step business workflows, deliberately-flawed/migration data hardening (Cycle 2), production auth/RLS, and full automated test suites (Cycle 3) — see `plans/polished-swimming-sun.md` for the phased roadmap.
+- Cycle 1 intentionally defers: complex multi-step business workflows, deliberately-flawed/migration data hardening (Cycle 2), production auth/RLS (authentication and RBAC have since been built; RLS has not), and full automated test suites (Cycle 3) — see `plans/polished-swimming-sun.md` for the phased roadmap.
 
 ## Broad functional scope (Cycle 1)
 
@@ -34,4 +36,4 @@ Quality of work (documents, tasks, projects, deliverables of any kind) is curren
 2. Chat-driven scorecard builder (LangGraph state machine, clarifying questions, live draft preview) backed by Bedrock.
 3. Embedding-based "suggest similar scorecard" on new requests.
 4. LLM-judge evaluation flow producing per-KPI scored, reasoned results + weighted final score + RAG band.
-5. Charts library/detail UI (Overview, Guidelines, Evaluate, History) and an Evaluations history view, in a glassmorphism (white + `#FFF700`) design system.
+5. Charts library/detail UI (Overview, Guidelines, Evaluate, History) and an Evaluations history view, in a glassmorphism design system (originally white + lemon `#FFF700`; now warm off-white + amber/gold `#FFC21A`, see `frontend/README.md`).

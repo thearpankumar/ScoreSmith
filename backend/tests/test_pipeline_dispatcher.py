@@ -97,10 +97,12 @@ async def test_dispatcher_runs_fifo_with_limit_2_and_starts_next_when_one_finish
 
     await d.tick()
     await wait_until(lambda: len(aws.start_names) == 2)
-    assert aws.start_names == ids[:2]  # FIFO
+    # FIFO = the two OLDEST were claimed. The two drivers call StartExecution from worker threads, so the order of
+    # those two calls among themselves is not defined; the claim order is what FIFO guarantees.
+    assert set(aws.start_names) == set(ids[:2])
     await d.tick()  # no free capacity
     await asyncio.sleep(0.1)
-    assert aws.start_names == ids[:2]
+    assert set(aws.start_names) == set(ids[:2])
     assert (await get_eval(ids[2])).status == EvaluationStatus.QUEUED
 
     aws.finish(ids[0])
@@ -120,7 +122,7 @@ async def test_dispatcher_runs_fifo_with_limit_2_and_starts_next_when_one_finish
         aws.finish(eid)
         await wait_status(eid, EvaluationStatus.COMPLETED)
     await d.run_until_idle()
-    assert aws.start_names == ids
+    assert set(aws.start_names[:2]) == set(ids[:2]) and aws.start_names[2:] == ids[2:]
     async with AsyncSessionLocal() as db:
         n_done = (
             await db.execute(

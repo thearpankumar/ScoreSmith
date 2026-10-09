@@ -165,7 +165,8 @@ function structureEditPermission(
   scorecard: Scorecard,
   currentUserId: string | null,
 ): { canEdit: boolean; lockedReason?: string } {
-  if (currentUserId && scorecard.ownerId !== currentUserId) {
+  // Owner and accepted collaborators (editors) edit alike; the server enforces it too.
+  if (currentUserId && scorecard.ownerId !== currentUserId && scorecard.myRole !== "editor") {
     return { canEdit: false, lockedReason: `Only the owner, ${scorecard.ownerName}, can edit this scorecard's structure.` };
   }
   if (scorecard.status === "published") {

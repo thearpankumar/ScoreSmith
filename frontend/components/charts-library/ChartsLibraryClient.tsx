@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { AlertTriangle, Loader2, Search } from "lucide-react";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
@@ -16,6 +16,8 @@ import {
 } from "@/components/ui/dialog";
 import { ScorecardCard } from "./ScorecardCard";
 import { deleteScorecard } from "@/lib/api-client";
+import { TRASH_CHANGED_EVENT } from "@/lib/trash-client";
+import { deleteCopy } from "@/lib/trash-selection";
 import type { Scorecard, ScorecardStatus } from "@/lib/types";
 
 export function ChartsLibraryClient({
@@ -40,6 +42,14 @@ export function ChartsLibraryClient({
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  // The owner moves the chart to the trash; a collaborator only removes their own access (wording in deleteCopy).
+  const copy = deleteCopy({
+    name: pendingDelete?.name ?? "this chart",
+    myRole: pendingDelete?.myRole,
+    collaboratorCount: pendingDelete?.collaboratorCount,
+  });
+
   async function confirmDelete() {
     if (!pendingDelete) return;
     setDeleting(true);
@@ -48,12 +58,20 @@ export function ChartsLibraryClient({
       await deleteScorecard(pendingDelete.id);
       setScorecards((prev) => prev.filter((s) => s.id !== pendingDelete.id));
       setPendingDelete(null);
+      window.dispatchEvent(new CustomEvent(TRASH_CHANGED_EVENT)); // refresh the Trash button's count
     } catch (err) {
-      setDeleteError(err instanceof Error ? err.message : "Couldn't delete this scorecard. Try again.");
+      setDeleteError(err instanceof Error ? err.message : "Could not delete this chart. Try again.");
     } finally {
       setDeleting(false);
     }
   }
+
+  // Owners come from the charts themselves (shared charts have other owners than the signed-in user).
+  const ownerOptions = useMemo(() => {
+    const byId = new Map<string, string>(owners.map((o) => [o.id, o.name]));
+    for (const s of scorecards) byId.set(s.ownerId, s.ownerName);
+    return [...byId].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+  }, [owners, scorecards]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -89,7 +107,7 @@ export function ChartsLibraryClient({
           label="Owner"
           value={owner}
           onChange={setOwner}
-          options={[{ value: "all", label: "All owners" }, ...owners.map((o) => ({ value: o.id, label: o.name }))]}
+          options={[{ value: "all", label: "All owners" }, ...ownerOptions.map((o) => ({ value: o.id, label: o.name }))]}
         />
         <FilterSelect
           label="Status"
@@ -115,13 +133,15 @@ export function ChartsLibraryClient({
       )}
 
       <Dialog open={!!pendingDelete} onOpenChange={(open) => !open && !deleting && setPendingDelete(null)}>
-        <DialogContent>
+        <DialogContent
+          onOpenAutoFocus={(e) => {
+            e.preventDefault();
+            cancelRef.current?.focus(); // Cancel is the default focus on a destructive confirmation
+          }}
+        >
           <DialogHeader>
-            <DialogTitle>Delete “{pendingDelete?.name ?? "this scorecard"}”?</DialogTitle>
-            <DialogDescription>
-              This permanently deletes the scorecard, every version of it, and its evaluations. This can&apos;t be
-              undone.
-            </DialogDescription>
+            <DialogTitle>{copy.title}</DialogTitle>
+            <DialogDescription>{copy.description}</DialogDescription>
           </DialogHeader>
           {deleteError && (
             <p role="alert" className="flex items-start gap-1.5 text-xs text-[var(--rag-poor)]">
@@ -130,12 +150,12 @@ export function ChartsLibraryClient({
             </p>
           )}
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => setPendingDelete(null)} disabled={deleting}>
+            <Button ref={cancelRef} type="button" variant="ghost" onClick={() => setPendingDelete(null)} disabled={deleting}>
               Cancel
             </Button>
             <Button type="button" variant="destructive" onClick={confirmDelete} disabled={deleting}>
-              {deleting && <Loader2 className="size-3.5 animate-spin" aria-hidden />}
-              Delete
+              {deleting && <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" aria-hidden />}
+              {copy.confirmLabel}
             </Button>
           </DialogFooter>
         </DialogContent>

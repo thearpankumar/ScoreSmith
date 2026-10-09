@@ -17,8 +17,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import idempotency as idem
+from app.activity import log_edit
 from app.ai.bedrock_client import BedrockClientProtocol
-from app.authz import get_accessible_evaluation, get_owned_batch, get_owned_scorecard
+from app.authz import get_accessible_batch, get_accessible_evaluation, get_accessible_scorecard
 from app.config import get_settings
 from app.db import get_db
 from app.deps import get_aws_jobs, get_bedrock_client, get_current_user
@@ -38,6 +39,7 @@ from app.pipeline.dispatcher import Dispatcher, NotCancellableError, NotRetryabl
 from app.pipeline.drive import DriveUrlError, classify_drive_url
 from app.pipeline.events import emit_evaluation_event
 from app.pipeline.graph import PLACEHOLDER_NAME
+from app.pipeline.outcomes import record_batch_outcome, record_evaluation_outcome
 from app.ratelimit import rate_limit
 from app.schemas.evaluation import EvaluationRead
 from app.schemas.evaluation_ai import (
@@ -61,6 +63,7 @@ from app.schemas.evaluation_ai import (
     UploadInitResponse,
     UploadPart,
 )
+from app.slots import UserJobActiveError, acquire_job_slot
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +327,7 @@ async def create_jobs(
                 batch_id=uuid.UUID(stored["batch_id"]) if stored.get("batch_id") else None,
                 evaluations=[EvaluationRead.model_validate(e) for e in existing],
             )
-    scorecard = await get_owned_scorecard(db, current_user, payload.scorecard_id)
+    scorecard = await get_accessible_scorecard(db, current_user, payload.scorecard_id)
 
     errors: list[dict] = []
     for i, item in enumerate(payload.items):
@@ -347,6 +350,12 @@ async def create_jobs(
 
     version = await _resolve_version(db, scorecard)
     direction = (payload.direction_prompt or "").strip() or None
+    # One running evaluation job per user (a batch is ONE job): checked + inserted under a per-user advisory lock.
+    try:
+        await acquire_job_slot(db, current_user.id)
+    except UserJobActiveError as exc:
+        await db.rollback()
+        raise exc.http() from exc
 
     batch: EvaluationBatch | None = None
     if len(payload.items) > 1:
@@ -392,6 +401,18 @@ async def create_jobs(
                 )
             )
         evaluations.append(ev)
+    if len(evaluations) == 1:
+        first = evaluations[0]
+        await log_edit(
+            db, scorecard.id, current_user, "evaluation_started", f"Started evaluation “{first.name}”",
+            entity_type="evaluation", entity_id=first.id, detail={"key": f"{first.id}:1"},
+        )
+    else:
+        await log_edit(
+            db, scorecard.id, current_user, "batch_started", f"Started a batch of {len(evaluations)} evaluations",
+            entity_type="evaluation_batch", entity_id=batch.id if batch else None,
+            detail={"count": len(evaluations)},
+        )
     if key:
         await idem.remember(
             db, current_user.id, "ai_jobs", key,
@@ -415,7 +436,7 @@ async def create_jobs(
 async def get_batch(
     batch_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
 ) -> BatchRead:
-    batch = await get_owned_batch(db, current_user, batch_id)
+    batch = await get_accessible_batch(db, current_user, batch_id)
     evaluations = list(
         (
             await db.execute(
@@ -511,7 +532,12 @@ async def cancel_evaluation(
     except NotCancellableError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     db.expire_all()
-    return await db.get(Evaluation, evaluation_id)
+    cancelled = await db.get(Evaluation, evaluation_id)
+    await record_evaluation_outcome(db, cancelled)  # activity line "cancelled" (deduplicated)
+    if cancelled.batch_id is not None:
+        await record_batch_outcome(db, cancelled.batch_id)
+    await db.commit()
+    return cancelled
 
 
 @router.post("/{evaluation_id}/retry", response_model=EvaluationRead, status_code=status.HTTP_202_ACCEPTED)
@@ -524,6 +550,8 @@ async def retry_evaluation(
     await get_accessible_evaluation(db, current_user, evaluation_id)
     try:
         await dispatcher.retry(evaluation_id)
+    except UserJobActiveError as exc:
+        raise exc.http() from exc
     except LookupError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Evaluation not found.") from exc
     except NotRetryableError as exc:

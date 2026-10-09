@@ -3,11 +3,12 @@
 
 /* ===========================================================================
    Quality Scorecard System — design tokens
-   Glassmorphism, white + #FFF700 ("lemon"). See the plan's design-system
-   section for the source of truth. Hard rule: #FFF700 is a FILL colour
-   only — it is never used as text, icon, or a thin border directly on
-   white (~1.1:1 contrast, effectively invisible). Text in the yellow
-   family always uses --lemon-ink instead.
+   Glassmorphism, white + brand amber gold #FFC21A (token name kept: "lemon"),
+   the same gold as the logo, login and homepage. Hard rule: the amber is a
+   FILL colour only - never text, an icon or a thin border directly on white
+   (1.6:1). Dark text ON the amber is ink (#16161a, 11.2:1) or --lemon-ink
+   (#4a2f00: 7.7:1 on the amber, 5.4:1 on the hover shade, 11+:1 on white and
+   on --lemon-soft); text in the yellow family always uses --lemon-ink.
    ========================================================================= */
 
 :root {
@@ -16,11 +17,11 @@
   --ink: #16161a;
   --ink-muted: #5b5b63;
 
-  /* Brand lemon — fill-only, see rule above */
-  --lemon: #fff700;
-  --lemon-hover: #ede600;
-  --lemon-ink: #6b6100;
-  --lemon-soft: #fffce0;
+  /* Brand amber gold (logo / homepage) — fill-only, see rule above */
+  --lemon: #ffc21a;
+  --lemon-hover: #e09f00;
+  --lemon-ink: #4a2f00;
+  --lemon-soft: #fff3cf;
 
   /* Glass tiers (see the glass system comment below). Warm-white tint, alpha rises with tier so text on
      stronger tiers keeps >= 4.5:1 over the brightest gold backdrop. */

@@ -124,6 +124,8 @@ async def materialize_draft(
     scorecard: Scorecard | None = None
     if existing_scorecard_id is not None:
         scorecard = await db.get(Scorecard, existing_scorecard_id)
+        if scorecard is not None and scorecard.deleted_at is not None:
+            scorecard = None  # the linked chart is in the trash: save as a new chart instead of editing it
 
     if scorecard is None:
         scorecard = Scorecard(

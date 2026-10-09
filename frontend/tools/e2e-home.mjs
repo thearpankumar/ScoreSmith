@@ -37,7 +37,7 @@ await page.goto(base + "/", { waitUntil: "networkidle" });
 check(path(page) === "/", "logged out: / stays on /", path(page));
 check((await page.locator("h1").count()) === 1, "exactly one h1");
 check(await page.getByRole("link", { name: "Sign in" }).first().isVisible(), "Sign in visible");
-check((await page.title()).includes("KPI Metrics"), "page title", await page.title());
+check((await page.title()).includes("Score Smith"), "page title", await page.title());
 if (shots) {
   mkdirSync(shots, { recursive: true });
   for (const [w, h] of [[1536, 1024], [1440, 900], [768, 1024], [390, 844]]) {

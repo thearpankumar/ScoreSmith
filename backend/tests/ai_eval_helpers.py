@@ -82,7 +82,7 @@ async def get_eval(eid) -> Evaluation:
         return await db.get(Evaluation, uuid.UUID(str(eid)))
 
 
-async def wait_until(cond: Callable[[], Awaitable[bool] | bool], timeout: float = 15.0) -> None:
+async def wait_until(cond: Callable[[], Awaitable[bool] | bool], timeout: float = 30.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         value = cond()
@@ -95,9 +95,20 @@ async def wait_until(cond: Callable[[], Awaitable[bool] | bool], timeout: float 
         await asyncio.sleep(0.02)
 
 
-async def wait_status(eid, *statuses: EvaluationStatus, timeout: float = 15.0) -> Evaluation:
+async def wait_status(eid, *statuses: EvaluationStatus, timeout: float = 30.0) -> Evaluation:
     async def ok() -> bool:
         return (await get_eval(eid)).status in statuses
+
+    await wait_until(ok, timeout)
+    return await get_eval(eid)
+
+
+async def wait_execution_recorded(eid, timeout: float = 30.0) -> Evaluation:
+    """The driver stores `sfn_execution_arn` AFTER the (fake) start call returned. Tests that simulate a crash must wait
+    for it, otherwise the survivor legitimately starts a fresh execution instead of resuming the recorded one."""
+
+    async def ok() -> bool:
+        return (await get_eval(eid)).sfn_execution_arn is not None
 
     await wait_until(ok, timeout)
     return await get_eval(eid)

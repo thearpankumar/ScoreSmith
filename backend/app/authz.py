@@ -1,14 +1,18 @@
-"""Per-user ownership checks. Every endpoint that takes a resource id loads it through one of these helpers.
+"""Per-user access checks. Every endpoint that takes a resource id loads it through one of these helpers.
 
-Each helper queries with the owner in the WHERE clause and answers 404 - never 403 - on a miss, so a caller
-cannot tell "someone else's" from "does not exist".
+Each helper queries with the access rule in the WHERE clause and answers 404 - never 403 - on a miss, so a caller
+cannot tell "someone else's" from "does not exist". (The single exception: a collaborator who may SEE a chart but
+tries an owner-only action such as delete / manage sharing gets 403 `owner_only`; they already know it exists.)
 
-Ownership model (strict per-user, no org sharing):
-- scorecard                : `scorecards.owner_id`; versions, KPI nodes and guidelines through their scorecard
-- evaluation               : `evaluations.owner_id` (the evaluator) OR the owner of the evaluation's scorecard;
-                             results / sources / events / progress follow the evaluation
-- batch                    : `evaluation_batches.created_by`
-- chat session             : `chat_sessions.user_id`; messages / turn events / LangGraph checkpoints follow it
+Access model (one place - `scorecard_access_clause`):
+- scorecard                : the OWNER (`scorecards.owner_id`) or an accepted COLLABORATOR (`scorecard_collaborators`,
+                             role "editor"); versions, KPI nodes, guidelines through their scorecard. A pending
+                             invitee has NO access except the read-only preview endpoint. Admins have no bypass.
+- evaluation               : follows its scorecard (owner or collaborator); the runner is only a label / job-slot owner
+- batch                    : follows its scorecard
+- trash                    : a chart with `deleted_at` set matches none of the above (404) - only the owner's trash
+                             endpoints (app/trash.py) can see it
+- chat session             : strictly private to `chat_sessions.user_id`
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.chat_session import ChatSession
@@ -26,6 +30,7 @@ from app.models.kpi_guideline import KpiGuideline
 from app.models.kpi_node import KpiNode
 from app.models.scorecard import Scorecard
 from app.models.scorecard_version import ScorecardVersion
+from app.models.sharing import ScorecardCollaborator
 from app.models.user import User
 
 
@@ -33,22 +38,58 @@ def _not_found(what: str) -> HTTPException:
     return HTTPException(status.HTTP_404_NOT_FOUND, detail=f"{what} not found.")
 
 
-async def get_owned_scorecard(db: AsyncSession, user: User, scorecard_id: uuid.UUID) -> Scorecard:
+def scorecard_access_clause(user: User):
+    """WHERE-clause (on `Scorecard`) for charts the user may open: owned or shared with them (accepted)."""
+    return and_(
+        Scorecard.deleted_at.is_(None),  # a trashed chart is invisible to everybody (see app/trash.py)
+        or_(
+            Scorecard.owner_id == user.id,
+            Scorecard.id.in_(
+                select(ScorecardCollaborator.scorecard_id).where(ScorecardCollaborator.user_id == user.id)
+            ),
+        ),
+    )
+
+
+def owner_only() -> HTTPException:
+    return HTTPException(
+        status.HTTP_403_FORBIDDEN,
+        detail={"code": "owner_only", "message": "Only the owner of this chart can do that."},
+    )
+
+
+async def get_accessible_scorecard(db: AsyncSession, user: User, scorecard_id: uuid.UUID) -> Scorecard:
     scorecard = (
-        await db.execute(select(Scorecard).where(Scorecard.id == scorecard_id, Scorecard.owner_id == user.id))
+        await db.execute(select(Scorecard).where(Scorecard.id == scorecard_id, scorecard_access_clause(user)))
     ).scalar_one_or_none()
     if scorecard is None:
         raise _not_found("Scorecard")
     return scorecard
 
 
-async def get_owned_version(
+async def get_owned_scorecard(db: AsyncSession, user: User, scorecard_id: uuid.UUID) -> Scorecard:
+    """Owner-only actions (delete, manage sharing). A collaborator gets 403 `owner_only`, anyone else 404."""
+    scorecard = await get_accessible_scorecard(db, user, scorecard_id)
+    if scorecard.owner_id != user.id:
+        raise owner_only()
+    return scorecard
+
+
+async def scorecard_is_shared(db: AsyncSession, scorecard_id: uuid.UUID) -> bool:
+    return (
+        await db.execute(
+            select(ScorecardCollaborator.id).where(ScorecardCollaborator.scorecard_id == scorecard_id).limit(1)
+        )
+    ).first() is not None
+
+
+async def get_accessible_version(
     db: AsyncSession, user: User, version_id: uuid.UUID, scorecard_id: uuid.UUID | None = None
 ) -> ScorecardVersion:
     stmt = (
         select(ScorecardVersion)
         .join(Scorecard, Scorecard.id == ScorecardVersion.scorecard_id)
-        .where(ScorecardVersion.id == version_id, Scorecard.owner_id == user.id)
+        .where(ScorecardVersion.id == version_id, scorecard_access_clause(user))
     )
     if scorecard_id is not None:
         stmt = stmt.where(ScorecardVersion.scorecard_id == scorecard_id)
@@ -58,13 +99,13 @@ async def get_owned_version(
     return version
 
 
-async def get_owned_kpi_node(db: AsyncSession, user: User, node_id: uuid.UUID) -> KpiNode:
+async def get_accessible_kpi_node(db: AsyncSession, user: User, node_id: uuid.UUID) -> KpiNode:
     node = (
         await db.execute(
             select(KpiNode)
             .join(ScorecardVersion, ScorecardVersion.id == KpiNode.scorecard_version_id)
             .join(Scorecard, Scorecard.id == ScorecardVersion.scorecard_id)
-            .where(KpiNode.id == node_id, Scorecard.owner_id == user.id)
+            .where(KpiNode.id == node_id, scorecard_access_clause(user))
         )
     ).scalar_one_or_none()
     if node is None:
@@ -72,10 +113,10 @@ async def get_owned_kpi_node(db: AsyncSession, user: User, node_id: uuid.UUID) -
     return node
 
 
-async def get_owned_guideline(
+async def get_accessible_guideline(
     db: AsyncSession, user: User, node_id: uuid.UUID, guideline_id: uuid.UUID
 ) -> KpiGuideline:
-    node = await get_owned_kpi_node(db, user, node_id)
+    node = await get_accessible_kpi_node(db, user, node_id)
     guideline = await db.get(KpiGuideline, guideline_id)
     if guideline is None or guideline.kpi_node_id != node.id:
         raise _not_found("Guideline")
@@ -83,9 +124,10 @@ async def get_owned_guideline(
 
 
 def evaluation_access_clause(user: User):
-    """WHERE-clause for evaluations the user may see: their own, plus every evaluation of a scorecard they own.
-    Requires `Evaluation` joined to `ScorecardVersion` and `Scorecard` (see `accessible_evaluations`)."""
-    return or_(Evaluation.owner_id == user.id, Scorecard.owner_id == user.id)
+    """WHERE-clause for evaluations the user may see: every evaluation of a chart they own or collaborate on
+    (evaluations are shared among collaborators; the runner is only a label). Requires `Evaluation` joined to
+    `ScorecardVersion` and `Scorecard` (see `accessible_evaluations`)."""
+    return scorecard_access_clause(user)
 
 
 def accessible_evaluations(user: User):
@@ -119,10 +161,12 @@ async def accessible_evaluation_ids(db: AsyncSession, user: User, ids: list[uuid
     return [i for i in ids if i in allowed]
 
 
-async def get_owned_batch(db: AsyncSession, user: User, batch_id: uuid.UUID) -> EvaluationBatch:
+async def get_accessible_batch(db: AsyncSession, user: User, batch_id: uuid.UUID) -> EvaluationBatch:
     batch = (
         await db.execute(
-            select(EvaluationBatch).where(EvaluationBatch.id == batch_id, EvaluationBatch.created_by == user.id)
+            select(EvaluationBatch)
+            .join(Scorecard, Scorecard.id == EvaluationBatch.scorecard_id)
+            .where(EvaluationBatch.id == batch_id, scorecard_access_clause(user))
         )
     ).scalar_one_or_none()
     if batch is None:

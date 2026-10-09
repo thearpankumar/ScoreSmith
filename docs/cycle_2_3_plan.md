@@ -97,7 +97,7 @@ Scoped to the workflows in §3.1, one feature-level acceptance case per row (eac
 
 ### 3.6 Comprehensive automated test suite — coverage areas
 
-Building on the existing 69-test backend suite (`backend/tests/`) and the frontend's `tsc`/`lint`/`build` gates:
+Building on the existing backend suite (about 900 tests by now) (`backend/tests/`) and the frontend's `tsc`/`lint`/`build` gates:
 
 - **Functional**: one test per business rule in §3.2 (state-transition validity, illegal-transition rejection).
 - **Integration**: the full chat → materialize → evaluate → review workflow end-to-end (this task's Part 1/live-verification work is a manual instance of exactly this; Cycle 3 should turn it into an automated integration test using `FakeBedrockClient` for the scripted-disagreement case already proven in `tests/test_judge.py`, plus a separate real-credentials smoke test gated behind an env flag for CI environments that do have Bedrock access).

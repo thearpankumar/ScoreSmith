@@ -23,6 +23,7 @@ class UserRead(ORMBase):
     email: str
     name: str
     role: str
+    username: str | None = None
     email_verified: bool = False
     created_at: datetime
 
@@ -86,7 +87,7 @@ class RegisterUserRequest(BaseModel):
     email: EmailStr
     name: DisplayName
     password: str = Field(min_length=1, max_length=1024)
-    role: Literal["admin", "member"] | None = None
+    role: Literal["admin", "user"] | None = None
 
 
 class AuthConfigResponse(BaseModel):

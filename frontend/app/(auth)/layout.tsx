@@ -16,7 +16,7 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Sign in · KPI Metrics",
+  title: "Sign in · Score Smith",
   description: "Sign in to design, track and evaluate quality scorecards.",
   robots: { index: false, follow: false },
 };

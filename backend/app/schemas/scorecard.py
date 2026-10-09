@@ -41,6 +41,11 @@ class ScorecardRead(ORMBase):
     current_version_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
+    # Sharing context for the caller (filled by the list / detail endpoints; defaults describe an unshared own chart).
+    owner_name: str | None = None
+    my_role: str = "owner"  # "owner" | "editor"
+    is_shared: bool = False  # has at least one accepted collaborator
+    collaborator_count: int = 0
 
 
 class ScorecardVersionCreate(BaseModel):

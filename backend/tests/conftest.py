@@ -88,6 +88,11 @@ os.environ.setdefault("CHAT_TURNS_INLINE", "true")
 os.environ.setdefault("AI_EVAL_INLINE", "true")
 
 APP_TABLES = [
+    "chat_shares",
+    "notifications",
+    "scorecard_activity",
+    "scorecard_invitations",
+    "scorecard_collaborators",
     "audit_log",
     "refresh_tokens",
     "password_reset_tokens",
@@ -200,7 +205,7 @@ def _auth_test_client_class():
             from app.models.user import User
 
             with SyncSessionLocal() as session:
-                user = User(email=body["email"], name=body["name"], role=body.get("role", "member"))
+                user = User(email=body["email"], name=body["name"], role=body.get("role", "user"))
                 session.add(user)
                 session.commit()
                 session.refresh(user)

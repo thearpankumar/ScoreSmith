@@ -74,6 +74,14 @@ ignore = ["B008"]
 "app/reporting/*.py" = ["E501"]
 "tests/*export*.py" = ["E501"]
 "tests/reporting_fixtures.py" = ["E501"]
+# Sharing / RBAC suites: long one-line request assertions read better than wrapped ones.
+"tests/test_sharing.py" = ["E501", "F811"]
+"tests/test_user_slots.py" = ["E501", "F811"]
+"tests/test_notifications.py" = ["E501", "F811"]
+"tests/test_eval_page.py" = ["E501", "F811"]
+"tests/test_admin_users.py" = ["E501", "F811"]
+"tests/test_chat_shares.py" = ["E501", "F811"]
+"tests/test_chart_trash.py" = ["E501", "F811"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
