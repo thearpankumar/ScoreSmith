@@ -39,7 +39,7 @@ def _decode(cursor: str) -> tuple[datetime, uuid.UUID]:
         ts, _, nid = raw.partition("|")
         return datetime.fromisoformat(ts), uuid.UUID(nid)
     except (ValueError, UnicodeDecodeError) as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid cursor.") from exc
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid cursor.") from exc
 
 
 async def _unread(db: AsyncSession, user: User) -> int:

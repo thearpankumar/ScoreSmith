@@ -24,7 +24,7 @@ class _FixedVectorFakeBedrock(FakeBedrockClient):
         return self._vector
 
 
-def test_suggest_similar_returns_ranked_matches(client: TestClient, seed_user_id: str) -> None:
+async def test_suggest_similar_returns_ranked_matches(client: TestClient, seed_user_id: str) -> None:
     user = client.post(
         "/api/v1/users",
         json={"email": "suggest-similar@example.com", "name": "Suggest Similar"},
@@ -45,24 +45,19 @@ def test_suggest_similar_returns_ranked_matches(client: TestClient, seed_user_id
 
     # Seed the embedding directly via the DB (bypassing embeddings.py's own Bedrock call,
     # since this test is only exercising the HTTP + pgvector search path).
-    import asyncio
+    from app.db import AsyncSessionLocal
+    from app.models.scorecard_embedding import ScorecardEmbedding
 
-    async def _seed():
-        from app.db import AsyncSessionLocal
-        from app.models.scorecard_embedding import ScorecardEmbedding
-
-        async with AsyncSessionLocal() as db:
-            db.add(
-                ScorecardEmbedding(
-                    scorecard_version_id=version["id"],
-                    embedding=vector,
-                    embedding_model="test-synthetic",
-                    source_text_hash="deadbeef",
-                )
+    async with AsyncSessionLocal() as db:
+        db.add(
+            ScorecardEmbedding(
+                scorecard_version_id=version["id"],
+                embedding=vector,
+                embedding_model="test-synthetic",
+                source_text_hash="deadbeef",
             )
-            await db.commit()
-
-    asyncio.run(_seed())
+        )
+        await db.commit()
 
     app.dependency_overrides[get_bedrock_client] = lambda: _FixedVectorFakeBedrock(vector)
     try:

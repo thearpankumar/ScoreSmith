@@ -74,7 +74,7 @@ MAX_BATCH_SHEET_BYTES = 20 * 1024 * 1024
 
 
 def _unprocessable(detail: object) -> HTTPException:
-    return HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail)
+    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
 
 
 async def _aws(fn, *args):

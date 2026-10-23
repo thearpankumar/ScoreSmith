@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import re
 import uuid
-from io import BytesIO
 
 from fastapi.testclient import TestClient
-from openpyxl import load_workbook
 from sqlalchemy import event
 from sqlalchemy.orm import Session
 from sqlalchemy_utils import Ltree
@@ -25,6 +23,7 @@ from app.models.kpi_node import KpiNode
 from app.models.scorecard import Scorecard
 from app.models.scorecard_version import ScorecardVersion
 from app.models.user import User
+from tests.reporting_fixtures import load_export
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 EVIL_NAMES = ['=HYPERLINK("http://evil","x")', "+cmd|' /C calc'!A0", "@SUM(1+1)", "-2+3"]
@@ -93,7 +92,7 @@ def _post(client: TestClient, user: User, ids, **extra):
 
 def _wb(resp):
     assert resp.status_code == 200, resp.text
-    return load_workbook(BytesIO(resp.content))
+    return load_export(resp.content)
 
 
 def _seed_five(db: Session):
@@ -145,7 +144,7 @@ def test_export_workbook_structure_headers_and_leaderboard(client: TestClient, d
     assert r.headers["cache-control"] == "no-store" and r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["x-export-count"] == "5" and r.headers["x-export-skipped"] == "0"
 
-    wb = load_workbook(BytesIO(r.content))
+    wb = load_export(r.content)
     students = ["01 Priya Shah", "02 Omar Ali", "03 Asha Menon", "04 Dev Patel", "05 Rahul Kumar"]
     assert wb.sheetnames == ["Summary", "Leaderboard", "Evaluations", "KPI Matrix", "KPI Detail", *students,
                              "KPI Reference", "Guidelines", "Notes"]
@@ -235,7 +234,7 @@ def test_export_skips_deleted_and_non_completed_and_lists_them(client: TestClien
     assert r.status_code == 200
     assert r.headers["x-export-count"] == "2"  # only the 2 completed, scored evaluations are exported
     assert r.headers["x-export-skipped"] == "2"  # 1 deleted + 1 failed
-    wb = load_workbook(BytesIO(r.content))
+    wb = load_export(r.content)
     notes = " ".join(str(c.value) for row in wb["Notes"].iter_rows() for c in row if c.value)
     assert "2 selected evaluations were not exported (deleted, failed or not yet completed)" in notes
     for ws_ in wb.worksheets:  # the failed run is never exported anywhere: no row, no sheet, no mention
@@ -292,7 +291,7 @@ def test_export_mixed_scorecards_get_separate_matrices(client: TestClient, db_se
            _evaluation(db_session, owner, v2, l2, "B", "b@example.com", 6.0, [6] * 4)]
     r = _post(client, owner, [e.id for e in evs])
     assert "evaluations_multi_" in r.headers["content-disposition"]
-    wb = load_workbook(BytesIO(r.content))
+    wb = load_export(r.content)
     matrices = [n for n in wb.sheetnames if n.startswith("Matrix")]
     assert len(matrices) == 2 and len({m.lower() for m in matrices}) == 2
     assert all(len(n) <= 31 and not any(ch in n for ch in "[]:*?/\\") for n in wb.sheetnames)

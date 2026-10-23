@@ -88,10 +88,11 @@ from app.limits.redis_semaphore import get_semaphore
 
 if sys.platform == "win32":
     # Same rationale as app/main.py: psycopg's async mode needs the selector event loop
-    # on Windows. Idempotent — set_event_loop_policy is safe to call more than once.
+    # on Windows. Installed only once: replacing the policy discards the thread's current event loop.
     import asyncio
 
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    if not isinstance(asyncio.get_event_loop_policy(), asyncio.WindowsSelectorEventLoopPolicy):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 logger = logging.getLogger(__name__)
 

@@ -513,8 +513,19 @@ class Dispatcher:
         )
         payload["provider"] = provider
         name = execution_name(str(ev.id), ev.attempt)
+        start = asyncio.ensure_future(asyncio.to_thread(self.aws.start_execution, name, payload))
         try:
-            arn = await asyncio.to_thread(self.aws.start_execution, name, payload)
+            arn = await asyncio.shield(start)
+        except asyncio.CancelledError:
+            # cancel() in this process interrupted us while AWS was starting the run. It found no ARN to stop, so
+            # wait for the start to return and stop it here. (On shutdown the run is left alone: after a restart the
+            # same execution name starts it again idempotently.)
+            if ev.id in self._user_cancelled:
+                with contextlib.suppress(Exception):
+                    await self._stop_orphaned_execution(ev.id, await start)
+            else:
+                start.add_done_callback(lambda f: f.cancelled() or f.exception())  # retrieved: no "never retrieved"
+            raise
         except AwsNotConfiguredError as exc:
             await self._fail(ev.id, "internal", f"AWS is not configured: {exc}")
             return None
@@ -522,14 +533,30 @@ class Dispatcher:
             await self._fail(ev.id, "internal", f"Could not start the processing job: {exc}")
             return None
         async with AsyncSessionLocal() as db:
-            await db.execute(
-                update(Evaluation)
-                .where(Evaluation.id == ev.id, Evaluation.status.in_(ACTIVE_EVALUATION_STATUSES))
-                .values(sfn_execution_arn=arn, stage="ingest", ai_provider=provider)
-            )
+            saved = (
+                await db.execute(
+                    update(Evaluation)
+                    .where(Evaluation.id == ev.id, Evaluation.status.in_(ACTIVE_EVALUATION_STATUSES))
+                    .values(sfn_execution_arn=arn, stage="ingest", ai_provider=provider)
+                    .execution_options(synchronize_session=False)  # SQLAlchemy < 2.0.52 #13439
+                    .returning(Evaluation.id)
+                )
+            ).first()
             await db.commit()
+        if saved is None:
+            # Cancelled (by another process) between StartExecution and this save: the cancel saw no ARN, so
+            # nobody else will ever stop this run.
+            await self._stop_orphaned_execution(ev.id, arn)
+            return None
         await emit_evaluation_event(ev.id, "ingest_started", "Fetching and extracting the submission on AWS.")
         return arn
+
+    async def _stop_orphaned_execution(self, eid: uuid.UUID, arn: str) -> None:
+        """Stop a run that was started for an evaluation that is no longer active (best effort, like cancel())."""
+        try:
+            await asyncio.to_thread(self.aws.stop_execution, arn, "Cancelled by the user.")
+        except Exception:  # noqa: BLE001 - the row is already terminal; AWS stop is best effort
+            logger.warning("StopExecution failed for the orphaned run of %s", eid, exc_info=True)
 
     async def _poll_until_done(self, eid: uuid.UUID, arn: str, started_at: datetime | None) -> bool:
         """True when the execution SUCCEEDED; False when it failed (already recorded) or the evaluation

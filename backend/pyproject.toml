@@ -8,7 +8,11 @@ version = "0.1.0"
 description = "Quality Scorecard System backend — Phase 0 + Cycle 1 (data foundation + core CRUD API)"
 requires-python = ">=3.12"
 dependencies = [
-  "fastapi==0.115.6",
+  "fastapi==0.143.0",
+  # Pinned explicitly: fastapi only asks for starlette>=0.46, so the unlocked installs (CI's `uv pip install -e`, the
+  # Dockerfile's `pip install .`) would otherwise take whatever is newest. 1.7.0 is the first release whose TestClient
+  # no longer uses anyio's deprecated `anyio.abc.BlockingPortal` alias.
+  "starlette==1.7.0",
   "uvicorn[standard]==0.32.1",
   "sqlalchemy==2.0.36",
   "alembic==1.14.0",
@@ -55,6 +59,9 @@ dev = [
   # against — AsyncPostgresSaver.setup()'s CREATE INDEX CONCURRENTLY blocking on a
   # concurrently open transaction elsewhere in the test run).
   "pytest-timeout==2.3.1",
+  # starlette's TestClient runs on httpx2 (plain httpx is deprecated there). It already came in through langsmith;
+  # pinned here so CI's unlocked install tests with the locked version, not whatever was released last.
+  "httpx2==2.13.1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -85,5 +92,6 @@ ignore = ["B008"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Every async fixture is function-scoped and each test gets its own event loop (see tests/conftest.py).
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
-filterwarnings = ["ignore::DeprecationWarning"]

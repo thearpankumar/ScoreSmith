@@ -264,13 +264,18 @@ async def test_http_rate_limit_window_is_shared_through_redis(live_redis, monkey
     """Two API replicas share one moving window: the cap holds across 'processes' (here: two limiter objects)."""
     import app.ratelimit as rl
 
+    async def drop_limiter() -> None:  # `limits` has no close(): close the redis-py client its storage wraps
+        if rl._redis_limiter is not None:
+            await rl._redis_limiter.storage.bridge.get_connection().aclose()
+        rl._redis_limiter = None
+
     monkeypatch.setattr(rl, "_redis_limiter", None)
     monkeypatch.setattr(rl, "_redis_down_until", 0.0)
     try:
         results = [await rl.within_limit("t-shared-window", "3/minute", "ip-1") for _ in range(5)]
         assert results == [True, True, True, False, False]
-        rl._redis_limiter = None  # a second "process" builds its own limiter against the same Redis
+        await drop_limiter()  # a second "process" builds its own limiter against the same Redis
         assert await rl.within_limit("t-shared-window", "3/minute", "ip-1") is False
         assert await rl.within_limit("t-shared-window", "3/minute", "ip-2") is True  # per-identifier windows
     finally:
-        rl._redis_limiter = None
+        await drop_limiter()

@@ -259,19 +259,24 @@ def client(_clean_tables: None):
 
 
 @pytest.fixture(autouse=True)
-def _reset_ai_graph_manager():
+def _reset_ai_graph_manager(request):
     """`app.ai.scorecard_builder.GraphManager` is a module-level singleton holding one
     long-lived `AsyncPostgresSaver` connection — correct for a real ASGI app (one event
     loop for the process lifetime), but pytest-asyncio gives each test function its own
     event loop, and an asyncio.Lock/connection created under one loop cannot be reused
     under another. Resetting the singleton around every test forces a fresh connection
     bound to that test's own loop, so this is a test-harness accommodation only — nothing
-    about production behavior changes."""
+    about production behavior changes. An async test's connection is closed on that test's
+    loop (requested here, so it is still open at this teardown): dropping the singleton
+    alone would leave the psycopg connection open."""
     import app.ai.scorecard_builder as sb
 
+    loop = request.getfixturevalue("event_loop") if "event_loop" in request.fixturenames else None
     sb._graph_manager = None
     yield
-    sb._graph_manager = None
+    manager, sb._graph_manager = sb._graph_manager, None
+    if manager is not None and loop is not None:
+        loop.run_until_complete(manager.aclose())
 
 
 @pytest.fixture()

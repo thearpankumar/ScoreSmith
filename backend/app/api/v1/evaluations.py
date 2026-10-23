@@ -71,7 +71,7 @@ async def run_evaluation(
     except ValueError as exc:
         evaluation.status = EvaluationStatus.FAILED
         await db.commit()
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
     result = await db.execute(
         select(Evaluation)
@@ -110,7 +110,7 @@ async def finalize_evaluation(
     leaves = leaf_nodes(nodes)
     if not leaves:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"scorecard_version {evaluation.scorecard_version_id} has no KPI nodes to finalize against.",
         )
 
@@ -127,7 +127,7 @@ async def finalize_evaluation(
     missing = [leaf.name for leaf in leaves if leaf.id not in scores_by_kpi]
     if missing:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Missing a score for {len(missing)} KPI(s): {', '.join(missing)}",
         )
 
@@ -139,7 +139,7 @@ async def finalize_evaluation(
     except ValueError as exc:
         evaluation.status = EvaluationStatus.FAILED
         await db.commit()
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
     evaluation.final_weighted_score = round(final_score, 2)
     evaluation.rag_band = rag_band_for_score(final_score)

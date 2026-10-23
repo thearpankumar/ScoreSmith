@@ -48,6 +48,7 @@ async def live_redis(monkeypatch):
     monkeypatch.setattr(get_settings(), "redis_url", url)  # a test may have pointed it elsewhere
     rs.gate().reset()
     await rs.gate().run(lambda r: r.flushdb())
+    await rs.gate().aclose()  # the connections belong to this test's event loop
 
 
 async def _hold_many(sem: rs.GlobalSemaphore, n: int, hold: float, counter: dict) -> None:

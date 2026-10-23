@@ -1,9 +1,13 @@
-"""Synthetic `ExportBundle` builders for the pure (no database) export tests."""
+"""Synthetic `ExportBundle` builders for the pure (no database) export tests, and the reader they reopen exports with."""
 
 from __future__ import annotations
 
 import uuid
+import warnings
 from datetime import UTC, datetime
+from io import BytesIO
+
+from openpyxl import load_workbook
 
 from app.reporting.export_data import (
     EvidenceItem,
@@ -21,6 +25,17 @@ DEFAULT_LEAVES = [
     ("Technical", "Depth", 30),
     ("Technical", "Edge cases", 20),
 ]
+
+
+def load_export(data: bytes):
+    """Reopen an exported .xlsx with openpyxl.
+
+    The Summary's solid data bars are Excel 2010 (x14) conditional-format extensions (the sheet-level rule and the
+    rule's x14:id link), which openpyxl cannot model: it warns that it drops them from its in-memory copy. The file
+    users download keeps them, so exactly those two warnings are expected here and silenced for this read only."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", r"(Conditional Formatting|Unknown) extension is not supported and will be removed", UserWarning, r"openpyxl\.")
+        return load_workbook(BytesIO(data))
 
 
 def make_version(leaves=DEFAULT_LEAVES) -> tuple[uuid.UUID, list[ExportKpi]]:

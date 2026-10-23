@@ -8,6 +8,7 @@ exactly the relationship two containers have.
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -203,6 +204,48 @@ async def test_cancel_from_another_process_stops_the_driver_on_this_one(async_db
     assert row.status == EvaluationStatus.FAILED and row.error_code == "cancelled"
     assert row.cancel_requested_at is not None and row.lease_owner is None
     assert len(aws.stopped) == 1
+
+
+async def test_a_cancel_from_another_process_while_aws_starts_the_run_still_stops_it(async_db_session) -> None:
+    # The race behind the old flaky test above: the cancel lands after StartExecution but before the driver saved
+    # the ARN, so the cancel itself has nothing to stop; the driver must stop the run it just started.
+    owner, _sc, version, _ = await seed_scorecard(async_db_session)
+    (ev,) = await seed_queued(async_db_session, owner, version, 1)
+    aws = FakeAwsJobs(hold=True)
+    aws.start_gate = threading.Event()
+    worker, api = make_dispatcher(aws), make_dispatcher(aws)
+    await worker.tick()
+    await wait_until(lambda: len(aws.start_names) == 1)  # AWS started the run; its ARN is not saved yet
+
+    await api.cancel(ev.id)
+    assert aws.stopped == []  # the cancel found no ARN
+    aws.start_gate.set()
+
+    await wait_until(lambda: len(aws.stopped) == 1)
+    await wait_until(lambda: not worker._tasks)
+    row = await get_eval(ev.id)
+    assert row.status == EvaluationStatus.FAILED and row.error_code == "cancelled"
+    assert aws.executions[aws.stopped[0]]["status"] == "ABORTED"
+
+
+async def test_a_cancel_in_this_process_while_aws_starts_the_run_still_stops_it(async_db_session) -> None:
+    owner, _sc, version, _ = await seed_scorecard(async_db_session)
+    (ev,) = await seed_queued(async_db_session, owner, version, 1)
+    aws = FakeAwsJobs(hold=True)
+    aws.start_gate = threading.Event()
+    d = make_dispatcher(aws)
+    await d.tick()
+    await wait_until(lambda: len(aws.start_names) == 1)
+
+    cancelling = asyncio.create_task(d.cancel(ev.id))  # interrupts the driver mid-StartExecution
+    await asyncio.sleep(0.2)
+    aws.start_gate.set()
+    await cancelling
+
+    assert len(aws.stopped) == 1 and aws.executions[aws.stopped[0]]["status"] == "ABORTED"
+    row = await get_eval(ev.id)
+    assert row.status == EvaluationStatus.FAILED and row.error_code == "cancelled"
+    assert not d._tasks
 
 
 async def test_cancel_flag_alone_is_enough_for_the_driver_to_finish_the_cancellation(async_db_session) -> None:

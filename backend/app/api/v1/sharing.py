@@ -146,7 +146,7 @@ async def invite_collaborator(
         raise _err(status.HTTP_404_NOT_FOUND, "user_not_found", "No active user matches that username or email.")
     if payload.include_chat and await _source_chat(db, user, scorecard.id) is None:  # refuse BEFORE inviting
         raise _err(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, "no_source_chat",
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "no_source_chat",
             "You have no chat behind this chart to share. Share the chart only.",
         )
     inv, already_pending = await send_chart_invitation(db, request, user, scorecard, target)
@@ -178,7 +178,7 @@ async def _share_source_chat(
     chat = await _source_chat(db, user, scorecard.id)
     if chat is None:
         raise _err(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, "no_source_chat",
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "no_source_chat",
             "You have no chat behind this chart to share. Share the chart only.",
         )
     share = (
@@ -219,7 +219,7 @@ async def send_chart_invitation(
     """Creates (or finds the pending) invitation of `target` to `scorecard` and commits. Returns (invitation,
     already_pending). Shared by the chart share dialog and "share this chat together with its chart"."""
     if target.id == user.id:
-        raise _err(status.HTTP_422_UNPROCESSABLE_ENTITY, "self_invite", "You already have access to this chart.")
+        raise _err(status.HTTP_422_UNPROCESSABLE_CONTENT, "self_invite", "You already have access to this chart.")
     already = (
         await db.execute(
             select(ScorecardCollaborator.id).where(
@@ -412,7 +412,7 @@ async def leave_chart(db: AsyncSession, request: Request | None, user: User, sco
     """The collaborator `user` stops collaborating on `scorecard` (commits). Shared by `POST .../leave` and by
     `DELETE /scorecards/{id}` when the caller is not the owner ("delete" of a shared chart only removes you)."""
     if scorecard.owner_id == user.id:
-        raise _err(status.HTTP_422_UNPROCESSABLE_ENTITY, "owner_cannot_leave", "Owners cannot leave their own chart.")
+        raise _err(status.HTTP_422_UNPROCESSABLE_CONTENT, "owner_cannot_leave", "Owners cannot leave their own chart.")
     await db.execute(
         ScorecardCollaborator.__table__.delete().where(
             ScorecardCollaborator.scorecard_id == scorecard.id, ScorecardCollaborator.user_id == user.id

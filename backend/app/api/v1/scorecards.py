@@ -380,7 +380,7 @@ async def update_scorecard_version(
         names = await _leaf_kpi_names(db, version_id)
         result = validate_scoring_formula_expr(data["scoring_formula"], names)
         if not result.valid:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=result.error)
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=result.error)
     for field, value in data.items():
         setattr(version, field, value)
     audit(db, request, actor_id=current_user.id, entity_type="scorecard_version", entity_id=version.id,

@@ -9,8 +9,9 @@ import uuid
 
 # psycopg's async mode is incompatible with Windows' default ProactorEventLoop. This only
 # matters for local (non-Docker) dev on Windows; the Docker image runs Linux, where the
-# default event loop already works. Must run before any async engine is created.
-if sys.platform == "win32":
+# default event loop already works. Must run before any async engine is created. Installed only once: replacing
+# the policy again (several modules do this on import) would discard the thread's current event loop.
+if sys.platform == "win32" and not isinstance(asyncio.get_event_loop_policy(), asyncio.WindowsSelectorEventLoopPolicy):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from contextlib import asynccontextmanager

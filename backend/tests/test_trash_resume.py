@@ -4,7 +4,6 @@ anything."""
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -36,16 +35,16 @@ def _restore(client: TestClient, t: Team) -> None:
     assert r.status_code == 200, r.text
 
 
-def _drive_to_idle(fake: FakeAwsJobs, db: Session) -> None:
+async def _drive_to_idle(fake: FakeAwsJobs, db: Session) -> None:
     """Lets the fake pipeline finish every non-terminal evaluation, then runs the dispatcher until idle."""
     fake.hold = False
     db.expire_all()
     for eid in db.execute(select(Evaluation.id)).scalars():
         fake.json_objects[f"derived/{eid}/corpus.json"] = default_corpus(str(eid))
-    asyncio.run(app.dependency_overrides[get_dispatcher]().run_until_idle())  # the fixture's fake-backed dispatcher
+    await app.dependency_overrides[get_dispatcher]().run_until_idle()  # the fixture's fake-backed dispatcher
 
 
-def test_trash_while_running_then_restore_requeues_and_the_job_completes(
+async def test_trash_while_running_then_restore_requeues_and_the_job_completes(
     client: TestClient, db_session: Session, team: Team, aws  # noqa: F811
 ) -> None:
     team.share(client)
@@ -69,18 +68,18 @@ def test_trash_while_running_then_restore_requeues_and_the_job_completes(
     actions = [a.action for a in db_session.execute(select(ScorecardActivity)).scalars()]
     assert actions.count("evaluations_resumed") == 2 and "chart_restored" in actions
 
-    _drive_to_idle(aws, db_session)
+    await _drive_to_idle(aws, db_session)
     for eid in (mine, theirs):
         assert _row(db_session, eid).status == EvaluationStatus.COMPLETED
 
 
-def test_a_batch_comes_back_whole_and_running(client: TestClient, db_session: Session, team: Team, aws) -> None:  # noqa: F811
+async def test_a_batch_comes_back_whole_and_running(client: TestClient, db_session: Session, team: Team, aws) -> None:  # noqa: F811
     batch = _post(client, team.owner, team.sc, _items(3)).json()
     ids = [e["id"] for e in batch["evaluations"]]
     _trash(client, team)
     _restore(client, team)
     assert [_row(db_session, i).status for i in ids] == [EvaluationStatus.QUEUED] * 3
-    _drive_to_idle(aws, db_session)
+    await _drive_to_idle(aws, db_session)
     assert [_row(db_session, i).status for i in ids] == [EvaluationStatus.COMPLETED] * 3
 
 
@@ -107,7 +106,7 @@ def test_a_runner_with_another_active_job_is_offered_a_retry_instead_of_a_second
     assert retry.status_code == 409 and retry.json()["detail"]["code"] == "user_job_active"
 
 
-def test_only_trash_cancelled_jobs_are_resumed_and_never_twice(
+async def test_only_trash_cancelled_jobs_are_resumed_and_never_twice(
     client: TestClient, db_session: Session, team: Team, aws  # noqa: F811
 ) -> None:
     by_user = _post(client, team.owner, team.sc, _items()).json()["evaluations"][0]["id"]
@@ -119,7 +118,7 @@ def test_only_trash_cancelled_jobs_are_resumed_and_never_twice(
     assert _row(db_session, by_user).status == EvaluationStatus.FAILED  # the user's own cancel stays cancelled
     assert _row(db_session, by_trash).status == EvaluationStatus.QUEUED
 
-    _drive_to_idle(aws, db_session)
+    await _drive_to_idle(aws, db_session)
     assert _row(db_session, by_trash).status == EvaluationStatus.COMPLETED
     _trash(client, team)
     _restore(client, team)
@@ -139,20 +138,20 @@ def test_a_deactivated_runner_is_not_resumed(client: TestClient, db_session: Ses
     assert ev.status == EvaluationStatus.FAILED and ev.cancel_reason == trash.TRASH_RESTORE_HANDLED
 
 
-def test_purge_after_retention_does_not_resurrect_cancelled_jobs(
+async def test_purge_after_retention_does_not_resurrect_cancelled_jobs(
     client: TestClient, db_session: Session, team: Team, aws  # noqa: F811
 ) -> None:
     eid = _post(client, team.owner, team.sc, _items()).json()["evaluations"][0]["id"]
     _trash(client, team)
     _backdate(db_session, team.sc, 31)
-    assert _run_purge() == 1
+    assert await _run_purge() == 1
     db_session.expire_all()
     assert db_session.get(Scorecard, uuid.UUID(team.sc)) is None
     assert db_session.get(Evaluation, uuid.UUID(eid)) is None  # gone with the chart, nothing queued anywhere
-    _drive_to_idle(aws, db_session)  # the dispatcher finds nothing to run
+    await _drive_to_idle(aws, db_session)  # the dispatcher finds nothing to run
     assert db_session.execute(select(Evaluation)).scalars().all() == []
     # a chart trashed 29 days ago is still inside the retention window and is kept (restorable)
     other = make_chart(db_session, team.owner, "Boundary")
     assert client.delete(f"/api/v1/scorecards/{other['id']}", headers=hdr(team.owner)).status_code == 204
     _backdate(db_session, other["id"], 29)
-    assert _run_purge(datetime.now(UTC) + timedelta(hours=1)) == 0
+    assert await _run_purge(datetime.now(UTC) + timedelta(hours=1)) == 0

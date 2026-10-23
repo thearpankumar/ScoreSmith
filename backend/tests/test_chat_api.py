@@ -221,7 +221,7 @@ class _FixedVectorFakeBedrock(FakeBedrockClient):
         return self._vector
 
 
-def test_start_session_surfaces_similar_scorecard_before_propose_kpis(
+async def test_start_session_surfaces_similar_scorecard_before_propose_kpis(
     client: TestClient, seed_user_id: str
 ) -> None:
     """Real end-to-end proof of fix #1: the LangGraph chat graph's own `check_similarity`
@@ -231,7 +231,6 @@ def test_start_session_surfaces_similar_scorecard_before_propose_kpis(
     therefore order-sensitive) Bedrock chat model. No `ask_clarification`/`update_draft`
     tool-use response is scripted for the first call, so this also proves propose_kpis was
     never reached on that turn (the FakeBedrockClient would raise otherwise)."""
-    import asyncio
     import uuid as uuid_module
 
     from app.models.scorecard_embedding import EMBEDDING_DIM
@@ -259,22 +258,19 @@ def test_start_session_surfaces_similar_scorecard_before_propose_kpis(
 
     vector = [1.0] + [0.0] * (EMBEDDING_DIM - 1)
 
-    async def _seed_embedding() -> None:
-        from app.db import AsyncSessionLocal
-        from app.models.scorecard_embedding import ScorecardEmbedding
+    from app.db import AsyncSessionLocal
+    from app.models.scorecard_embedding import ScorecardEmbedding
 
-        async with AsyncSessionLocal() as db:
-            db.add(
-                ScorecardEmbedding(
-                    scorecard_version_id=version["id"],
-                    embedding=vector,
-                    embedding_model="test-synthetic",
-                    source_text_hash="deadbeef",
-                )
+    async with AsyncSessionLocal() as db:
+        db.add(
+            ScorecardEmbedding(
+                scorecard_version_id=version["id"],
+                embedding=vector,
+                embedding_model="test-synthetic",
+                source_text_hash="deadbeef",
             )
-            await db.commit()
-
-    asyncio.run(_seed_embedding())
+        )
+        await db.commit()
 
     # No .converse() script entries at all — if propose_kpis were reached before the
     # similarity pause, FakeBedrockClient.converse() would raise AssertionError.

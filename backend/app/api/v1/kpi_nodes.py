@@ -92,7 +92,7 @@ async def _compute_path_and_level(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="parent_id not found.")
     if parent.level >= 4:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Hierarchy depth cannot exceed 4 levels."
+            status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Hierarchy depth cannot exceed 4 levels."
         )
     return f"{parent.path}.{label}", parent.level + 1
 

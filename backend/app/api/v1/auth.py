@@ -91,7 +91,7 @@ async def signup(
     email = sec.normalize_email(payload.email)
     problem = sec.password_problem(payload.password, email)
     if problem:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problem)
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=problem)
     if await _find_user(db, email) is not None:
         # Accounts that were created before login existed have no password: they are claimed through
         # "Forgot password", which proves ownership of the address.
@@ -346,7 +346,7 @@ async def register_user(payload: RegisterUserRequest, request: Request, db: Asyn
         else sec.password_problem(payload.password, email)
     )
     if problem:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problem)
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=problem)
     password_hash = await sec.hash_password(payload.password)
 
     await bootstrap.lock_user_provisioning(db)
@@ -450,7 +450,7 @@ async def reset_password(
     ).scalar_one_or_none()
     problem = sec.password_problem(payload.password, peek.email if peek else None)
     if problem:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problem)
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=problem)
     user = await service.consume_email_token(db, payload.token, "reset")
     if user is None or not user.is_active:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="This reset link is invalid or has expired.")
@@ -562,7 +562,7 @@ async def change_my_password(
     policy = sec.admin_password_problem if user.role == ROLE_ADMIN else sec.password_problem
     problem = policy(payload.new_password, user.email)
     if problem:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problem)
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=problem)
     user.password_hash = await sec.hash_password(payload.new_password)
     await service.revoke_all_sessions(db, user)
     audit(db, request, actor_id=user.id, entity_type="auth", entity_id=user.id, action=AuditAction.UPDATE,

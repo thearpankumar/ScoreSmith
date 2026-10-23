@@ -76,7 +76,9 @@ class _Gate:
     """Per-event-loop Redis connection + a circuit breaker. All Redis traffic goes through `run()`."""
 
     def __init__(self) -> None:
-        self._clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, tuple[str, Any]] = (
+        # One client per loop and URL: a client is bound to the loop that opened it, and keeping the one for an
+        # older URL (tests switch it) means it can still be closed by `aclose()` instead of being dropped open.
+        self._clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, Any]] = (
             weakref.WeakKeyDictionary()
         )
         self._down_until = 0.0
@@ -87,17 +89,16 @@ class _Gate:
 
     def _client(self) -> Any:
         url = get_settings().redis_url
-        loop = asyncio.get_running_loop()
-        cached = self._clients.get(loop)
-        if cached is None or cached[0] != url:
+        clients = self._clients.setdefault(asyncio.get_running_loop(), {})
+        client = clients.get(url)
+        if client is None:
             import redis.asyncio as aioredis  # lazy: a missing package just disables the shared limits
 
-            client = aioredis.from_url(
+            client = clients[url] = aioredis.from_url(
                 url, socket_timeout=1.0, socket_connect_timeout=1.0, health_check_interval=30,
                 decode_responses=True,
             )
-            self._clients[loop] = cached = (url, client)
-        return cached[1]
+        return client
 
     def mark_down(self, exc: BaseException) -> None:
         self._down_until = time.monotonic() + get_settings().redis_retry_after_seconds
@@ -124,11 +125,15 @@ class _Gate:
         self.mark_up()
         return result
 
+    async def aclose(self) -> None:
+        """Close the connections opened on the running loop (tests: each test runs on its own loop)."""
+        for client in self._clients.pop(asyncio.get_running_loop(), {}).values():
+            await client.aclose()
+
     def reset(self) -> None:
         """Forget the breaker state (tests)."""
         self._down_until = 0.0
         self._warned = False
-        self._clients = weakref.WeakKeyDictionary()
 
 
 class RedisUnavailable(Exception):

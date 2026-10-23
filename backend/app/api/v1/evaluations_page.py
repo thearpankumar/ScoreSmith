@@ -123,7 +123,7 @@ def apply_filters(stmt: Select, user: User, f: EvalFilter) -> Select:
             try:
                 stmt = stmt.where(Evaluation.owner_id == uuid.UUID(f.runner))
             except ValueError as exc:
-                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid runner filter.") from exc
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid runner filter.") from exc
     if f.shared is not None:
         has_collab = exists().where(ScorecardCollaborator.scorecard_id == Scorecard.id)
         stmt = stmt.where(has_collab if f.shared else not_(has_collab))
@@ -154,7 +154,7 @@ def filter_from_query(
             }
         )
     except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
 
 
 def _encode(sort: str, key: Any, eid: uuid.UUID) -> str:
@@ -177,7 +177,7 @@ def _decode(sort: str, cursor: str) -> tuple[Any, uuid.UUID]:
             key = Decimal(str(key))
         return key, uuid.UUID(raw["i"])
     except (ValueError, KeyError, TypeError) as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid cursor.") from exc
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid cursor.") from exc
 
 
 def _item(row, user: User) -> EvalListItem:

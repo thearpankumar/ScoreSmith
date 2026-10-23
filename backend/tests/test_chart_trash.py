@@ -3,7 +3,6 @@ empty are strictly per user; trashed charts are invisible everywhere; expired tr
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -35,12 +34,9 @@ def _inbox_types(client: TestClient, user) -> list[str]:
     return [n["type"] for n in client.get("/api/v1/notifications", headers=hdr(user)).json()["items"]]
 
 
-def _run_purge(now: datetime | None = None) -> int:
-    async def go() -> int:
-        async with AsyncSessionLocal() as db:
-            return await trash.purge_expired(db, now)
-
-    return asyncio.run(go())
+async def _run_purge(now: datetime | None = None) -> int:
+    async with AsyncSessionLocal() as db:
+        return await trash.purge_expired(db, now)
 
 
 def _backdate(db: Session, sc: str, days: float) -> None:
@@ -219,30 +215,30 @@ def test_empty_trash_purges_everything_of_the_caller_only(client: TestClient, db
 # --- retention ---------------------------------------------------------------------------------------------
 
 
-def test_purge_expired_with_an_injected_now(client: TestClient, db_session: Session, team: Team) -> None:
+async def test_purge_expired_with_an_injected_now(client: TestClient, db_session: Session, team: Team) -> None:
     _trash(client, team)
     now = datetime.now(UTC)
-    assert _run_purge(now + timedelta(days=29)) == 0  # not 30 days old yet
+    assert await _run_purge(now + timedelta(days=29)) == 0  # not 30 days old yet
     db_session.expire_all()
     assert db_session.get(Scorecard, uuid.UUID(team.sc)) is not None
-    assert _run_purge(now + timedelta(days=31)) == 1
+    assert await _run_purge(now + timedelta(days=31)) == 1
     db_session.expire_all()
     assert db_session.get(Scorecard, uuid.UUID(team.sc)) is None
-    assert _run_purge(now + timedelta(days=60)) == 0  # idempotent: a second run finds nothing
+    assert await _run_purge(now + timedelta(days=60)) == 0  # idempotent: a second run finds nothing
 
 
-def test_purge_expired_only_touches_expired_trashed_charts(client: TestClient, db_session: Session, team: Team) -> None:
+async def test_purge_expired_only_touches_expired_trashed_charts(client: TestClient, db_session: Session, team: Team) -> None:
     live = make_chart(db_session, team.owner, "Live")
     old, fresh = make_chart(db_session, team.owner, "Old"), make_chart(db_session, team.owner, "Fresh")
     for c in (old, fresh):
         assert client.delete(f"/api/v1/scorecards/{c['id']}", headers=hdr(team.owner)).status_code == 204
     _backdate(db_session, old["id"], 31)
     _backdate(db_session, fresh["id"], 29)
-    assert _run_purge() == 1
+    assert await _run_purge() == 1
     db_session.expire_all()
     ids = {c.id for c in db_session.scalars(select(Scorecard))}
     assert uuid.UUID(old["id"]) not in ids and {uuid.UUID(live["id"]), uuid.UUID(fresh["id"])} <= ids
-    assert _run_purge() == 0
+    assert await _run_purge() == 0
 
 
 def test_listing_the_trash_lazily_purges_expired_items(client: TestClient, db_session: Session, team: Team) -> None:
