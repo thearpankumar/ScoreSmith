@@ -126,7 +126,7 @@ def test_vision_fallback_order_kimi_qwen_maverick():
     text, model, _ = bo.analyse(fc, bo.VISION_MODELS, jpeg(), "jpeg")
     assert model == "us.meta.llama4-maverick-17b-instruct-v1:0" and [c["modelId"] for c in fc.calls] == bo.VISION_MODELS
     content = fc.calls[0]["messages"][0]["content"]
-    assert content[1]["text"].startswith("You are analysing one image taken from a hackathon solution document")
+    assert content[1]["text"] == bo.IMAGE_PROMPT  # no scorecard context given: the neutral prompt
     assert fc.calls[0]["inferenceConfig"] == {"maxTokens": 3000, "temperature": 0}
 
 
@@ -172,6 +172,47 @@ def test_run_analyze_image_writes_analysis_and_rejects_foreign_keys():
     assert s.exists("derived/e1/progress/img/d1/0002.done")
     with pytest.raises(PipelineError):
         bo.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": "derived/other/docs/d1/images/1_x.jpg"}, s, client=fc)
+
+
+CONTEXT = {"scorecard": "Billing Support QA", "domain": "Customer Support",
+           "purpose": "Measure first-contact resolution of billing complaints.", "scope": "Call transcripts."}
+
+
+def test_image_prompt_is_neutral_without_context():
+    assert bo.image_prompt(None) == bo.IMAGE_PROMPT == bo.image_prompt({}) == bo.image_prompt({"other": "x"})
+    assert "hackathon" not in bo.IMAGE_PROMPT.lower()
+    assert bo.IMAGE_PROMPT.startswith("You are analysing one image taken from a document submitted for evaluation")
+
+
+def test_image_prompt_carries_the_scorecard_context_and_a_guard():
+    prompt = bo.image_prompt(CONTEXT)
+    assert prompt.endswith(bo.IMAGE_PROMPT)
+    head = prompt[: -len(bo.IMAGE_PROMPT)]
+    assert '"Billing Support QA"' in head and "Customer Support" in head
+    assert "first-contact resolution" in head and "Call transcripts." in head
+    assert "never describe anything that is not in the image" in head.lower()
+    long = bo.image_prompt({"scorecard": "S", "purpose": "p" * 9000})
+    assert len(long) < len(bo.IMAGE_PROMPT) + 2500  # clipped, a hostile payload cannot blow up every image call
+
+
+def test_analyze_image_uses_the_context_saved_by_ingest():
+    s = MemoryStore()
+    key = "derived/e1/docs/d1/images/0004_p01_image.jpg"
+    s.put_bytes(key, jpeg())
+    s.put_json("derived/e1/context.json", CONTEXT)
+    fc = FakeConverse({bo.VISION_MODELS[0]: "## Summary\nA call-flow diagram."})
+    assert bo.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": key}, s, client=fc)["ok"]
+    assert fc.calls[0]["messages"][0]["content"][1]["text"] == bo.image_prompt(CONTEXT)
+
+
+def test_analyze_image_without_saved_context_uses_the_neutral_prompt():
+    s = MemoryStore()
+    key = "derived/e1/docs/d1/images/0005_p01_image.jpg"
+    s.put_bytes(key, jpeg())
+    s.put_bytes("derived/e1/context.json", b"{not json")  # unreadable context never fails the image step
+    fc = FakeConverse({bo.VISION_MODELS[0]: "## Summary\nA chart."})
+    assert bo.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": key}, s, client=fc)["ok"]
+    assert fc.calls[0]["messages"][0]["content"][1]["text"] == bo.IMAGE_PROMPT
 
 
 def test_undecodable_image_is_soft_failure():

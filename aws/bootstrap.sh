@@ -48,6 +48,10 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 ENV_FILE="$REPO_ROOT/infra/.env"
 AWSCLI=(aws --profile "$PROFILE" --region "$REGION")
 WORK="$(mktemp -d)"
+# Git Bash / MSYS on Windows: aws.exe cannot open an MSYS path such as /tmp/tmp.x in a file:// argument ("Unable to
+# load paramfile"), so keep the work directory (every file:// target lives in it) in mixed form, C:/..., which both
+# bash and aws.exe understand.
+if command -v cygpath >/dev/null 2>&1; then WORK="$(cygpath -m "$WORK")"; fi
 trap 'rm -rf "$WORK"' EXIT
 
 say() { printf '\n==> %s\n' "$*"; }
@@ -187,7 +191,7 @@ FUNCTIONS=(
   "assemble|worker.handlers.assemble|3008|512|3"
 )
 wait_fn() { # state: function-active-v2 | function-updated-v2
-  $DRY && { plan "aws lambda wait $1 --function-name $2"; return 0; }
+  $DRY && { plan "${AWSCLI[*]} lambda wait $1 --function-name $2"; return 0; }
   "${AWSCLI[@]}" lambda wait "$1" --function-name "$2"
 }
 
@@ -326,5 +330,5 @@ if $DRY; then
 else
   echo "Bucket:        $BUCKET"
   echo "State machine: $SM_ARN"
-  echo "Next: set AI_EVAL env vars are in infra/.env; run the backend. Update code later with aws/deploy-lambdas.sh."
+  echo "Credentials and ids are in infra/.env. Update code later with aws/deploy-lambdas.sh."
 fi

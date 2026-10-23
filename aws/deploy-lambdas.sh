@@ -28,6 +28,6 @@ run docker push "${REGISTRY}/${REPO}:latest"
 
 for s in ingest extract-doc plan-audio transcribe-chunk analyze-image assemble; do
   run "${AWSCLI[@]}" lambda update-function-code --function-name "${PREFIX}-$s" --image-uri "$IMAGE_URI"
-  if $DRY; then echo "  [plan] aws lambda wait function-updated-v2 --function-name ${PREFIX}-$s"; else "${AWSCLI[@]}" lambda wait function-updated-v2 --function-name "${PREFIX}-$s"; fi
+  if $DRY; then echo "  [plan] ${AWSCLI[*]} lambda wait function-updated-v2 --function-name ${PREFIX}-$s"; else "${AWSCLI[@]}" lambda wait function-updated-v2 --function-name "${PREFIX}-$s"; fi
 done
 echo "Deployed $IMAGE_URI to 6 functions."

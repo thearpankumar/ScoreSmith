@@ -34,11 +34,13 @@ type Mode = EvaluateMode;
  */
 export function EvaluateTab({
   scorecardId,
+  scorecardName,
   kpiNodes,
   targetScore,
   mode,
 }: {
   scorecardId: string;
+  scorecardName: string;
   kpiNodes: KpiNode[];
   targetScore?: number;
   /** Controlled by the parent so the mode switch can live on the tab row (see ChartDetailTabs). */
@@ -57,7 +59,7 @@ export function EvaluateTab({
           setName={setName}
         />
       ) : (
-        <AiJudge scorecardId={scorecardId} kpiNodes={kpiNodes} />
+        <AiJudge scorecardId={scorecardId} scorecardName={scorecardName} kpiNodes={kpiNodes} />
       )}
     </div>
   );

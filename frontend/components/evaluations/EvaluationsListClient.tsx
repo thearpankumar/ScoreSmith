@@ -1,8 +1,18 @@
 "use client";
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent,
+  type RefObject,
+} from "react";
 import Link from "next/link";
-import { AlertTriangle, ChevronRight, Loader2, RefreshCw, Trash2, Users } from "lucide-react";
+import { AlertTriangle, ChevronRight, Loader2, Pencil, RefreshCw, Trash2, Users } from "lucide-react";
 
 import { RagBadge } from "@/components/design-system/RagBadge";
 import { SolidPanel } from "@/components/design-system/SolidPanel";
@@ -17,7 +27,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { deleteEvaluation, exportEvaluationsXlsx } from "@/lib/api-client";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { deleteEvaluation, exportEvaluationsXlsx, renameEvaluation } from "@/lib/api-client";
 import {
   bulkDeleteEvaluations,
   DEFAULT_EVAL_QUERY,
@@ -350,6 +362,35 @@ export function EvaluationsListClient({
     }
   }
 
+  // ---- rename ----------------------------------------------------------------------------------------------------
+  // The new name is what the list, the evaluation page and the Excel export show; scores and the submitter's
+  // name / email are untouched. Safe while an evaluation runs: the pipeline never replaces a name a user chose.
+  const [pendingRename, setPendingRename] = useState<EvalRow | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
+  async function confirmRename(e: FormEvent) {
+    e.preventDefault();
+    const target = pendingRename;
+    const name = renameDraft.trim();
+    if (!target || renaming || !name) return;
+    if (name === target.name) {
+      setPendingRename(null);
+      return;
+    }
+    setRenaming(true);
+    setRenameError(null);
+    try {
+      const saved = await renameEvaluation(target.id, name);
+      setRows_((prev) => prev.map((r) => (r.id === target.id ? { ...r, name: saved } : r)));
+      setPendingRename(null);
+    } catch (err) {
+      setRenameError(err instanceof Error ? err.message : "Couldn't rename this evaluation. Try again.");
+    } finally {
+      setRenaming(false);
+    }
+  }
+
   const filtered = describeQuery(query, scorecardName).length > 0;
   const showEmpty = phase !== "loading" && rows.length === 0 && phase !== "error";
 
@@ -462,6 +503,11 @@ export function EvaluationsListClient({
                 setDeleteError(null);
                 setPendingDelete(r);
               }}
+              onRename={(r) => {
+                setRenameError(null);
+                setRenameDraft(r.name);
+                setPendingRename(r);
+              }}
             />
           ))}
         </SolidPanel>
@@ -532,6 +578,49 @@ export function EvaluationsListClient({
         </DialogContent>
       </Dialog>
 
+      <Dialog open={!!pendingRename} onOpenChange={(open) => !open && !renaming && setPendingRename(null)}>
+        <DialogContent>
+          <form onSubmit={confirmRename} className="flex flex-col gap-4" noValidate>
+            <DialogHeader>
+              <DialogTitle>Rename evaluation</DialogTitle>
+              <DialogDescription>
+                The new name shows in this list, on the evaluation and in Excel exports. Scores and the submitter&apos;s
+                name and email stay as they are.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="rename-evaluation">Name</Label>
+              <Input
+                id="rename-evaluation"
+                value={renameDraft}
+                onChange={(e) => setRenameDraft(e.target.value)}
+                maxLength={255}
+                autoComplete="off"
+                autoFocus
+                onFocus={(e) => e.currentTarget.select()}
+                disabled={renaming}
+                className="min-h-11"
+              />
+            </div>
+            {renameError && (
+              <p role="alert" className="flex items-start gap-1.5 text-xs text-[var(--rag-poor)]">
+                <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+                {renameError}
+              </p>
+            )}
+            <DialogFooter>
+              <Button type="button" variant="ghost" className="min-h-11" onClick={() => setPendingRename(null)} disabled={renaming}>
+                Cancel
+              </Button>
+              <Button type="submit" className="min-h-11" disabled={renaming || !renameDraft.trim()}>
+                {renaming && <Loader2 className="size-3.5 animate-spin" aria-hidden />}
+                Save
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={bulkOpen} onOpenChange={setBulkOpen}>
         <DialogContent
           onOpenAutoFocus={(e) => {
@@ -564,11 +653,13 @@ const EvalRowView = memo(function EvalRowView({
   selected,
   onToggle,
   onDelete,
+  onRename,
 }: {
   row: EvalRow;
   selected: boolean;
   onToggle: (id: string, shift: boolean) => void;
   onDelete: (row: EvalRow) => void;
+  onRename: (row: EvalRow) => void;
 }) {
   const selectable = isSelectableRow(row);
   const status = row.status as EvaluationStatus;
@@ -595,12 +686,17 @@ const EvalRowView = memo(function EvalRowView({
       />
       <Link
         href={`/charts/${row.scorecardId}/evaluations/${row.id}`}
-        className="flex min-h-[4.25rem] items-center justify-between gap-3 py-4 pl-11 pr-10 transition-colors hover:bg-bg focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--focus)] sm:pr-12"
+        className="flex min-h-[4.25rem] items-center justify-between gap-3 py-4 pl-11 pr-[5.25rem] transition-colors hover:bg-bg focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--focus)] sm:pr-[6.25rem]"
       >
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             <p className="min-w-0 truncate text-sm font-medium text-ink">{row.name}</p>
-            {row.domain && <Badge variant="muted" className="shrink-0">{row.domain}</Badge>}
+            {row.domain && (
+              // Truncates instead of overflowing into the score badge on narrow rows (phones keep the actions visible).
+              <Badge variant="muted" className="min-w-0 max-w-full" title={row.domain}>
+                <span className="truncate">{row.domain}</span>
+              </Badge>
+            )}
             {row.shared && (
               <Badge variant="soft" className="shrink-0" title="This chart is shared with collaborators">
                 <Users className="size-3" aria-hidden /> Shared
@@ -621,28 +717,46 @@ const EvalRowView = memo(function EvalRowView({
           <ChevronRight className="hidden size-4 text-ink-muted sm:block" aria-hidden />
         </div>
       </Link>
-      <button
-        type="button"
-        onClick={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          onDelete(row);
-        }}
-        aria-label={`Delete evaluation “${row.name}”`}
-        title="Delete evaluation"
-        className={cn(
-          "absolute right-1 top-1/2 flex size-11 -translate-y-1/2 items-center justify-center rounded-full text-ink-muted sm:right-3",
-          "opacity-0 transition-opacity hover:bg-[var(--rag-poor)]/10 hover:text-[var(--rag-poor)]",
-          "group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100",
-          "[@media(hover:none)]:opacity-100",
-          "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]",
-        )}
-      >
-        <Trash2 className="size-3.5" aria-hidden />
-      </button>
+      <div className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center sm:right-3">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onRename(row);
+          }}
+          aria-label={`Rename evaluation “${row.name}”`}
+          title="Rename evaluation"
+          className={cn(ROW_ACTION, "hover:bg-[var(--lemon-soft)] hover:text-ink")}
+        >
+          <Pencil className="size-3.5" aria-hidden />
+        </button>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            onDelete(row);
+          }}
+          aria-label={`Delete evaluation “${row.name}”`}
+          title="Delete evaluation"
+          className={cn(ROW_ACTION, "hover:bg-[var(--rag-poor)]/10 hover:text-[var(--rag-poor)]")}
+        >
+          <Trash2 className="size-3.5" aria-hidden />
+        </button>
+      </div>
     </div>
   );
 });
+
+/** A row's hover actions (rename / delete): revealed on hover or keyboard focus, always shown on touch screens. */
+const ROW_ACTION = cn(
+  "flex size-11 items-center justify-center rounded-full text-ink-muted",
+  "opacity-0 transition-opacity",
+  "group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100",
+  "[@media(hover:none)]:opacity-100",
+  "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--focus)]",
+);
 
 function BulkDeleteBody({
   count,

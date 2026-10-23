@@ -21,6 +21,7 @@ export function ChartDetailTabs({
   guidelines,
   history,
   scorecardId,
+  scorecardName,
   kpiNodes,
   targetScore,
 }: {
@@ -29,6 +30,7 @@ export function ChartDetailTabs({
   guidelines: ReactNode;
   history: ReactNode;
   scorecardId: string;
+  scorecardName: string;
   kpiNodes: KpiNode[];
   targetScore?: number;
 }) {
@@ -50,7 +52,13 @@ export function ChartDetailTabs({
       <TabsContent value="overview">{overview}</TabsContent>
       <TabsContent value="guidelines">{guidelines}</TabsContent>
       <TabsContent value="evaluate">
-        <EvaluateTab scorecardId={scorecardId} kpiNodes={kpiNodes} targetScore={targetScore} mode={mode} />
+        <EvaluateTab
+          scorecardId={scorecardId}
+          scorecardName={scorecardName}
+          kpiNodes={kpiNodes}
+          targetScore={targetScore}
+          mode={mode}
+        />
       </TabsContent>
       <TabsContent value="history">{history}</TabsContent>
     </Tabs>

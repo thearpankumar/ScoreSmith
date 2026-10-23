@@ -191,7 +191,7 @@ try {
     @('assemble', 'worker.handlers.assemble', 3008, 512, 3)
   )
   function Wait-Fn([string]$State, [string]$Fn) {
-    if ($Dry) { Plan "aws lambda wait $State --function-name $Fn"; return }
+    if ($Dry) { Plan "aws $($AwsBase -join ' ') lambda wait $State --function-name $Fn"; return }
     & aws @AwsBase lambda wait $State --function-name $Fn
     if ($LASTEXITCODE -ne 0) { throw "lambda wait $State failed for $Fn" }
   }

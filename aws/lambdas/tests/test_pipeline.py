@@ -53,6 +53,25 @@ def test_ingest_uploads_ok_and_manifest(tmp_path):
     assert prog["stage"] == "extract" and prog["counters"]["files_total"] == 3
 
 
+def test_ingest_saves_the_scorecard_context_for_the_image_step():
+    s = MemoryStore()
+    s.put_bytes("uploads/u/g/1.pdf", PDF)
+    event = ev([{"source_id": "a", "kind": "upload", "s3_key": "uploads/u/g/1.pdf", "original_name": "Plan.pdf"}])
+    event["context"] = {"scorecard": " Billing Support QA ", "domain": "Customer Support", "purpose": "p" * 9000,
+                        "scope": None, "injected": "ignored"}
+    run_ingest(event, s)
+    saved = s.get_json("derived/e1/context.json")
+    assert saved["scorecard"] == "Billing Support QA" and saved["domain"] == "Customer Support"
+    assert set(saved) == {"scorecard", "domain", "purpose"} and len(saved["purpose"]) <= 2000
+
+
+def test_ingest_without_context_saves_none():
+    s = MemoryStore()
+    s.put_bytes("uploads/u/g/1.pdf", PDF)
+    run_ingest(ev([{"source_id": "a", "kind": "upload", "s3_key": "uploads/u/g/1.pdf", "original_name": "Plan.pdf"}]), s)
+    assert not s.exists("derived/e1/context.json")
+
+
 def test_ingest_rejects_bad_magic_oversize_and_foreign_key(tmp_path):
     s = MemoryStore()
     s.put_bytes("uploads/u/g/fake.pdf", b"<html>not a pdf</html>")

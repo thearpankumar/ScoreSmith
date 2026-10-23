@@ -337,6 +337,7 @@ erDiagram
         datetime lease_expires_at "Q"
         datetime cancel_requested_at "Q"
         string cancel_reason
+        datetime renamed_at
     }
     EVALUATION_KPI_RESULTS {
         uuid id PK
@@ -400,7 +401,8 @@ Not drawn: `kpi_guidelines` columns, `password_reset_tokens`, `oauth_identities`
 
 Migrations: `0001`..`0010` foundation, chat, AI evaluation; `0011_scaling_leases` (leases, cancel flags, chat-turn queue, `idempotency_keys`);
 `0012_auth_ownership` (passwords, tokens, `evaluations.owner_id`, audit context); `0013_sharing_rbac` (usernames, collaborators, invitations, activity,
-notifications, two roles, list indexes); `0014_chat_shares`; `0015_chart_trash` (`scorecards.deleted_at/deleted_by`); `0016_eval_cancel_reason`.
+notifications, two roles, list indexes); `0014_chat_shares`; `0015_chart_trash` (`scorecards.deleted_at/deleted_by`); `0016_eval_cancel_reason`;
+`0017_eval_renamed_at`.
 
 ## 7. Frontend route and redirect map
 

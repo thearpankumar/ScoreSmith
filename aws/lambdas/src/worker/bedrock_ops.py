@@ -8,6 +8,7 @@ import io
 import os
 from datetime import datetime, timezone
 
+from . import scorecard_context
 from .errors import PipelineError, TransientError
 from .progress import Progress
 from .store import derived
@@ -20,7 +21,8 @@ VISION_MODELS = [
 ]
 # tested wording; longer prompts made the model translate
 TRANSCRIBE_PROMPT = "Transcribe this audio verbatim. Output only the transcript."
-IMAGE_PROMPT = """You are analysing one image taken from a hackathon solution document or slide deck.
+IMAGE_PROMPT = """You are analysing one image taken from a document submitted for evaluation (a report, slide deck,
+solution document or similar).
 
 Reply in Markdown with exactly these sections:
 
@@ -34,6 +36,27 @@ Describe the key elements, how they connect or flow, and any numbers/values show
 
 ## Summary
 One sentence."""
+
+
+def image_prompt(context: object) -> str:
+    """IMAGE_PROMPT, preceded by what the evaluation's scorecard is about (see scorecard_context) so the description
+    brings out the details that matter for that kind of evaluation. No context: the neutral IMAGE_PROMPT."""
+    ctx = scorecard_context.clean(context)
+    if not ctx:
+        return IMAGE_PROMPT
+    head = "Context: the document is being evaluated"
+    if ctx.get("scorecard"):
+        head += f' with the scorecard "{ctx["scorecard"]}"'
+    if ctx.get("domain"):
+        head += f" (domain: {ctx['domain']})"
+    lines = [head + "."]
+    if ctx.get("purpose"):
+        lines.append(f"Purpose of the scorecard: {ctx['purpose']}")
+    if ctx.get("scope"):
+        lines.append(f"Scope: {ctx['scope']}")
+    lines.append("Use this context only to decide which visible details are worth describing. "
+                 "Never describe anything that is not in the image.")
+    return "\n".join(lines) + "\n\n" + IMAGE_PROMPT
 
 # Converse documents 3.75 MB / 8000 px per image, but that limit is really on the request BODY, where the image is
 # base64-encoded (+33%). Measured: Kimi K2.5 and Qwen3-VL accept raw images up to ~2.61 MiB; one budget safe for all:
@@ -162,14 +185,14 @@ def prepare(raw: bytes, ext: str, budget: int = MAX_BYTES) -> tuple[bytes, str]:
     return encode_best(img, budget), "jpeg"
 
 
-def analyse(client, models: list[str], data: bytes, fmt: str) -> tuple[str, str, dict]:
+def analyse(client, models: list[str], data: bytes, fmt: str, prompt: str = IMAGE_PROMPT) -> tuple[str, str, dict]:
     last: Exception | None = None
     for model in models:
         try:
             r = client.converse(
                 modelId=model,
                 messages=[{"role": "user", "content": [{"image": {"format": fmt, "source": {"bytes": data}}},
-                                                       {"text": IMAGE_PROMPT}]}],
+                                                       {"text": prompt}]}],
                 inferenceConfig={"maxTokens": 3000, "temperature": 0},
             )
             text = _text_of(r)
@@ -186,13 +209,14 @@ def analyse(client, models: list[str], data: bytes, fmt: str) -> tuple[str, str,
     raise TransientError(f"all vision models failed (last: {last})")
 
 
-def analyse_image(client, models: list[str], raw: bytes, ext: str) -> tuple[str, str, dict]:
+def analyse_image(client, models: list[str], raw: bytes, ext: str,
+                  prompt: str = IMAGE_PROMPT) -> tuple[str, str, dict]:
     """prepare + analyse, shrinking the budget by 15% and retrying if the service still says the body is too big."""
     budget = MAX_BYTES
     for _ in range(4):
         data, fmt = prepare(raw, ext, budget)
         try:
-            return analyse(client, models, data, fmt)
+            return analyse(client, models, data, fmt, prompt)
         except TooLarge:
             budget = int(min(budget, len(data)) * 0.85)
             print(f"    body too large ({len(data) / 1e6:.2f} MB); retrying at <= {budget / 1e6:.2f} MB")
@@ -214,8 +238,9 @@ def run_analyze_image(event: dict, store, client=None, models: list[str] | None 
     raw = store.get_bytes(key)
     ext = key.rsplit(".", 1)[-1]
     prog = Progress(store, eid)
+    prompt = image_prompt(scorecard_context.load(store, eid))
     try:
-        text, model, usage = analyse_image(client, models or VISION_MODELS, raw, ext)
+        text, model, usage = analyse_image(client, models or VISION_MODELS, raw, ext, prompt)
     except TransientError:
         raise
     except Exception as e:  # undecodable image etc.: soft failure, the evaluation continues

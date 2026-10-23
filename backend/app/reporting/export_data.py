@@ -103,9 +103,13 @@ class ExportEvaluation:
     results: dict[uuid.UUID, ExportResult] = field(default_factory=dict)
     category_scores: dict[str, float | None] = field(default_factory=dict)
     kpis_total: int = 0
+    renamed: bool = False  # a user renamed the evaluation (evaluations.renamed_at)
 
     @property
     def display_name(self) -> str:
+        """The row / sheet label: the name a user gave the evaluation, else the submitter's name, else its name."""
+        if self.renamed:
+            return self.name
         return (self.subject_name or "").strip() or self.name
 
     @property
@@ -335,6 +339,7 @@ async def load_export_bundle(db: AsyncSession, ids: list[uuid.UUID]) -> ExportBu
                 custom_formula=bool(version.scoring_formula), results=results,
                 category_scores=rollup_categories(kpis, results),
                 kpis_total=sum(1 for k in kpis if k.is_leaf),
+                renamed=e.renamed_at is not None,
             )
         )
     return ExportBundle(out, kpis_by_version, missing, excluded)

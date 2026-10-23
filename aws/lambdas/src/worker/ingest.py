@@ -9,7 +9,7 @@ import os
 import shutil
 import tempfile
 
-from . import audio
+from . import audio, scorecard_context
 from .drive import DriveClient, DriveError, classify
 from .errors import PipelineError
 from .progress import Progress
@@ -65,6 +65,7 @@ def run_ingest(event: dict, store, drive: DriveClient | None = None, probe_fn=au
     max_bytes, max_files = int(limits["max_file_bytes"]), int(limits["max_files"])
     prog = Progress(store, eid)
     prog.set_stage("ingest", "Fetching and validating files")
+    scorecard_context.save(store, eid, event.get("context"))  # read back by the image step
 
     files: list[dict] = []
     drive_entries: list[dict] = []

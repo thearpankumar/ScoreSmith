@@ -90,6 +90,9 @@ class Evaluation(UUIDPKMixin, TimestampMixin, Base):
     # Why the SYSTEM cancelled the job (migration 0016): "cancelled_by_trash" = its chart was trashed; restoring the
     # chart re-queues those rows. After that it becomes "trash_restore_handled" so a later trash cycle never repeats it.
     cancel_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # When a user last renamed the evaluation (migration 0017). The Excel export then labels it with this name rather
+    # than the submitter's, and the AI pipeline never replaces it.
+    renamed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     scorecard_version: Mapped[ScorecardVersion] = relationship("ScorecardVersion")
     evaluator: Mapped[User] = relationship("User", foreign_keys=[evaluated_by])

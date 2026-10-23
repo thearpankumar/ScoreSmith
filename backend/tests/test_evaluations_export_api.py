@@ -177,6 +177,22 @@ def test_export_workbook_structure_headers_and_leaderboard(client: TestClient, d
     assert col_a[clarity + 3] == "Evidence 2\nSection 3" and sheet.cell(clarity + 3, 2).value == "“quote two”"
 
 
+def test_export_shows_a_renamed_evaluation_under_its_new_name(client: TestClient, db_session: Session) -> None:
+    owner, _, _, _, evs = _seed_five(db_session)
+    r = client.patch(f"/api/v1/evaluations/{evs[0].id}", json={"name": "Team Falcon"},
+                     headers={"X-User-Id": str(owner.id)})
+    assert r.status_code == 200, r.text
+
+    wb = _wb(_post(client, owner, [e.id for e in evs]))
+    students = ["01 Team Falcon", "02 Omar Ali", "03 Asha Menon", "04 Dev Patel", "05 Rahul Kumar"]
+    assert [n for n in wb.sheetnames if n[:2].isdigit()] == students
+    board = wb["Leaderboard"]
+    head = next(c.row for row in board.iter_rows() for c in row if c.value == "Rank")
+    assert [board.cell(head + i, 2).value for i in range(1, 6)] == [s[3:] for s in students]
+    detail = next(r for r in wb["KPI Detail"].iter_rows(values_only=True) if r[0] == "Team Falcon")
+    assert detail[1:3] == ("Priya Shah", "priya@example.com")
+
+
 def test_export_include_reasoning_false(client: TestClient, db_session: Session) -> None:
     owner, _, _, _, evs = _seed_five(db_session)
     detail = _wb(_post(client, owner, [e.id for e in evs], include_reasoning=False))["KPI Detail"]

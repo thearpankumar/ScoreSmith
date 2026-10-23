@@ -236,6 +236,7 @@ Summary only; the ORM models in `backend/app/models/` and the migrations in `bac
 | `0014_chat_shares` | table `chat_shares` (unique `session_id, recipient_id`; `shared_by`, `with_chart`, `saved_scorecard_id`) |
 | `0015_chart_trash` | `scorecards.deleted_at`, `deleted_by`; partial indexes for the trash listing and the retention purge |
 | `0016_eval_cancel_reason` | `evaluations.cancel_reason` (`cancelled_by_trash` marks jobs to resume on restore) |
+| `0017_eval_renamed_at` | `evaluations.renamed_at` (set when a user renames the evaluation; the Excel export then labels it with that name, and the AI pipeline never replaces it) |
 
 Evaluation statuses are `pending`, `in_progress`, `completed`, `failed`, `queued`, `ingesting`, `processing`, `scoring`; a cancelled evaluation is `failed` with `error_code = 'cancelled'`.
 

@@ -87,6 +87,7 @@ export default async function ChartDetailPage({
       <ChartDetailTabs
         initialTab={initialTab}
         scorecardId={scorecard.id}
+        scorecardName={scorecard.name}
         kpiNodes={version.kpiNodes}
         targetScore={scorecard.targetScore}
         overview={

@@ -74,6 +74,17 @@ class EvaluationUpdate(BaseModel):
 
     _check_status = field_validator("status")(_client_settable)
 
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str | None) -> str:
+        """A rename: trimmed, never blank / null (the column is NOT NULL), at most 255 characters."""
+        name = (value or "").strip()
+        if not name:
+            raise ValueError("Name cannot be empty.")
+        if len(name) > 255:
+            raise ValueError("Name must be at most 255 characters.")
+        return name
+
 
 class EvaluationRead(ORMBase):
     id: uuid.UUID

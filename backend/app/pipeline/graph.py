@@ -36,12 +36,14 @@ from app.models.evaluation import Evaluation
 from app.models.evaluation_kpi_result import EvaluationKpiResult
 from app.models.evaluation_source import EvaluationSource
 from app.models.kpi_node import KpiNode
+from app.models.scorecard import Scorecard
 from app.models.scorecard_version import ScorecardVersion
 from app.pipeline import master
 from app.pipeline.aws_jobs import AwsJobsProtocol
 from app.pipeline.corpus import Corpus, load_corpus
 from app.pipeline.events import emit_evaluation_event
-from app.pipeline.jev_scorer import JevScoreClientProtocol, score_kpi
+from app.pipeline.jev_scorer import NOUL_GATE, JevScoreClientProtocol, KpiScore, score_kpi
+from app.pipeline.scorecard_context import ScorecardContext
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +150,7 @@ class _Loaded:
     filenames: list[str]
     nodes: list[KpiNode]
     scoring_formula: str | None
-    name_is_placeholder: bool
+    context: ScorecardContext | None = None  # what the scorecard is about, given to every AI step
 
 
 async def _load_evaluation(evaluation_id: uuid.UUID) -> _Loaded:
@@ -169,6 +171,7 @@ async def _load_evaluation(evaluation_id: uuid.UUID) -> _Loaded:
             ).scalars().all()
         )
         version = await db.get(ScorecardVersion, ev.scorecard_version_id)
+        scorecard = await db.get(Scorecard, version.scorecard_id) if version else None
         return _Loaded(
             direction=ev.direction_prompt,
             hint_name=ev.subject_name,
@@ -176,7 +179,7 @@ async def _load_evaluation(evaluation_id: uuid.UUID) -> _Loaded:
             filenames=[s.original_name or s.drive_url or "" for s in sources],
             nodes=nodes,
             scoring_formula=version.scoring_formula if version else None,
-            name_is_placeholder=ev.name == PLACEHOLDER_NAME,
+            context=ScorecardContext.of(scorecard) if scorecard else None,
         )
 
 
@@ -210,6 +213,32 @@ def _fallback_title(corpus: Any, filenames: list[str]) -> str | None:
     return (specific or stems or [None])[0]
 
 
+NO_EVIDENCE_REASONING = (
+    "The submission does not report anything that shows this KPI, so it scored 0 for lack of evidence and is "
+    "flagged for review."
+)
+GATED_REASONING = "The passages found do not actually show what this KPI measures, so it scored 0 for lack of evidence."
+
+
+def _unshown_reasoning(ks: KpiScore) -> str | None:
+    """A 0 that only means "nothing shows this KPI" is explained as exactly that. Asking the model to justify it
+    against the level-0 guideline produced "indicating severe understaffing" and "the corpus data is empty": the
+    worst case stated as fact when nothing was reported. A 0 the evidence supports is still explained by the model."""
+    raw = ks.jev_raw or {}
+    if raw.get("skipped") == "no_evidence":
+        return NO_EVIDENCE_REASONING
+    noul = raw.get("noul")
+    if ks.score == 0 and isinstance(noul, int | float) and noul < NOUL_GATE:
+        return GATED_REASONING
+    return None
+
+
+def _auto_name(identity: master.Identity, corpus: Any, filenames: list[str]) -> str | None:
+    """The name the pipeline gives an evaluation that has none yet: the submitter when known, else the title the
+    model wrote from the content, else the main file's name."""
+    return _display_name(identity) or identity.title or _fallback_title(corpus, filenames)
+
+
 def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Loaded):
     leaves = leaf_nodes(loaded.nodes)
     if not leaves:
@@ -237,25 +266,27 @@ def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Lo
         identity = await master.identify_subject(
             deps.bedrock, model, state["corpus"],
             hint_name=loaded.hint_name, hint_email=loaded.hint_email, filenames=loaded.filenames,
+            context=loaded.context,
         )
         async with AsyncSessionLocal() as db:
             ev = await db.get(Evaluation, evaluation_id)
             if ev is not None and ev.status == EvaluationStatus.SCORING:
                 ev.subject_name = identity.name or ev.subject_name
                 ev.subject_email = identity.email or ev.subject_email
-                display = _display_name(identity) or _fallback_title(state["corpus"], loaded.filenames)
-                if display and loaded.name_is_placeholder:
-                    ev.name = display
+                # Checked on the fresh row: a rename made while this evaluation runs is never replaced.
+                if ev.name == PLACEHOLDER_NAME and ev.renamed_at is None:
+                    ev.name = _auto_name(identity, state["corpus"], loaded.filenames) or ev.name
                 await db.commit()
+        titled = f" Title: {identity.title}." if identity.title and not _display_name(identity) else ""
         await emit_evaluation_event(
             evaluation_id, "identified",
-            f"Submitter: {identity.name or 'unknown'} <{identity.email or 'no email'}> ({identity.source}).",
+            f"Submitter: {identity.name or 'unknown'} <{identity.email or 'no email'}> ({identity.source}).{titled}",
         )
         return {"identity": identity}
 
     async def digest_node(state: ScoreState) -> dict[str, Any]:
         await _set_stage(evaluation_id, "scoring:digest")
-        digest = await master.build_digest(deps.bedrock, model, state["corpus"])
+        digest = await master.build_digest(deps.bedrock, model, state["corpus"], context=loaded.context)
         await emit_evaluation_event(evaluation_id, "digest", f"Indexed {len(digest)} section(s).")
         return {"digest": digest}
 
@@ -275,7 +306,8 @@ def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Lo
         await emit_evaluation_event(evaluation_id, "kpi_evidence", f"Selecting evidence for '{kpi.name}'.")
         ev = await _patiently(
             lambda: master.select_evidence(
-                deps.bedrock, model, kpi, kpi.guidelines, corpus, payload["digest"], loaded.direction
+                deps.bedrock, model, kpi, kpi.guidelines, corpus, payload["digest"], loaded.direction,
+                context=loaded.context,
             ),
             lambda r: r.reason == "unavailable",
             deps.patience_waits,
@@ -290,7 +322,7 @@ def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Lo
                 return await score_kpi(
                     deps.jev, deps.bedrock, kpi=kpi, guidelines=kpi.guidelines, evidence=evidence,
                     direction=loaded.direction, fallback_model_id=deps.fallback_model_id,
-                    media_note=media_note, **jev_kwargs,
+                    media_note=media_note, context=loaded.context, **jev_kwargs,
                 )
 
         ks = await jev_score(quotes)
@@ -303,7 +335,8 @@ def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Lo
             await _check_cancel(evaluation_id)
             extra = await _patiently(
                 lambda: master.second_look(
-                    deps.bedrock, model, kpi, kpi.guidelines, corpus, ev.snippets, loaded.direction
+                    deps.bedrock, model, kpi, kpi.guidelines, corpus, ev.snippets, loaded.direction,
+                    context=loaded.context,
                 ),
                 lambda r: r.reason == "unavailable",
                 deps.patience_waits,
@@ -327,12 +360,16 @@ def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Lo
 
         level_text = next((g.qualitative_text for g in kpi.guidelines if g.score_level == ks.matched_level), None)
         reasoning_template = False
-        if ks.fallback_reasoning:
+        unshown = _unshown_reasoning(ks)
+        if unshown:
+            reasoning = unshown
+        elif ks.fallback_reasoning:
             reasoning = ks.fallback_reasoning
         else:
             reasoning, reasoning_template = await _patiently(
                 lambda: master.write_reasoning_checked(
-                    deps.bedrock, model, kpi, ks.score, level_text, ev.snippets, loaded.direction, media_note
+                    deps.bedrock, model, kpi, ks.score, level_text, ev.snippets, loaded.direction, media_note,
+                    context=loaded.context,
                 ),
                 lambda r: r[1],
                 deps.patience_waits,

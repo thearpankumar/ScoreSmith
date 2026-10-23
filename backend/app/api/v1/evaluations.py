@@ -237,6 +237,7 @@ async def get_evaluation(
 async def update_evaluation(
     evaluation_id: uuid.UUID,
     payload: EvaluationUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Evaluation:
@@ -246,8 +247,14 @@ async def update_evaluation(
         raise HTTPException(
             status.HTTP_409_CONFLICT, detail="The evaluation is being processed; cancel it before changing its status."
         )
+    previous_name = evaluation.name
     for field, value in changes.items():
         setattr(evaluation, field, value)
+    if evaluation.name != previous_name:
+        # Renamed (also while it runs: the pipeline never replaces a name a user chose).
+        evaluation.renamed_at = datetime.now(UTC)
+        audit(db, request, actor_id=current_user.id, entity_type="evaluation", entity_id=evaluation.id,
+              action=AuditAction.UPDATE, event="renamed", diff={"from": previous_name, "to": evaluation.name})
     try:
         await db.commit()
     except IntegrityError as exc:

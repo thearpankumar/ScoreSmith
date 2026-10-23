@@ -116,6 +116,13 @@ test("evaluation list rows map the new AI fields; 422 detail arrays are readable
     api.createAiJobs({ scorecardId: "sc", items: [{ sources: [{ kind: "drive", driveUrl: "https://x.com" }] }] }),
     (err) => err.status === 422 && /host not allowed/.test(err.message),
   );
+
+  // The queued run's progress card names the chart (it used to say "Unknown scorecard": the creation response is
+  // mapped without lookups, so the caller passes the name it already has).
+  script = [{ status: 202, body: { batch_id: null, evaluations: [{ id: "e2", scorecard_version_id: "v1", name: "AI evaluation", evaluated_by: "u", input_reference: null, status: "queued", final_weighted_score: null, rag_band: null, submitted_at: null, domain: null, created_at: "2026-01-01T00:00:00Z", stage: "queued", subject_name: null, subject_email: null, batch_id: null, error_code: null, queued_at: "q", started_at: null, finished_at: null }] } }];
+  const created = await api.createAiJobs({ scorecardId: "sc", scorecardName: "Support QA", items: [{ sources: [{ kind: "drive", driveUrl: "https://drive.google.com/file/d/x" }] }] });
+  assert.equal(created.evaluations[0].scorecardName, "Support QA");
+  assert.equal(created.evaluations[0].scorecardId, "sc");
 });
 
 test("progress polls ride on the session cookie (credentials: include) and never send a user-id header", async () => {

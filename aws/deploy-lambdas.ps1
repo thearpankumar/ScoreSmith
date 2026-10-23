@@ -46,7 +46,7 @@ if ($Dry) {
 
 foreach ($s in 'ingest', 'extract-doc', 'plan-audio', 'transcribe-chunk', 'analyze-image', 'assemble') {
   Invoke-AwsMut lambda update-function-code --function-name "$Prefix-$s" --image-uri $ImageUri
-  if ($Dry) { Write-Host "  [plan] aws lambda wait function-updated-v2 --function-name $Prefix-$s" } else {
+  if ($Dry) { Write-Host "  [plan] aws $($AwsBase -join ' ') lambda wait function-updated-v2 --function-name $Prefix-$s" } else {
     & aws @AwsBase lambda wait function-updated-v2 --function-name "$Prefix-$s"
     if ($LASTEXITCODE -ne 0) { throw "lambda wait failed for $Prefix-$s" }
   }

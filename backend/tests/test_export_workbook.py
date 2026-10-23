@@ -205,6 +205,24 @@ def test_every_exported_student_gets_a_sheet_in_rank_order() -> None:
     assert names == [n[3:] for n in STUDENTS]
 
 
+def test_a_renamed_evaluation_is_labelled_with_its_new_name_and_keeps_the_student() -> None:
+    bundle = make_bundle([("Priya Shah", "priya@example.com", 9.1, [9, 9, 9, 9]),
+                          ("Rahul Kumar", "rahul@example.com", 3.4, [4, 3, 3, 3])])
+    renamed = bundle.evaluations[0]
+    renamed.name, renamed.renamed = "Team Falcon – Final Pitch", True
+    wb = _open(bundle)
+    assert [n for n in wb.sheetnames if n[:2].isdigit()] == ["01 Team Falcon – Final Pitch", "02 Rahul Kumar"]
+    board = wb["Leaderboard"]
+    head = next(c.row for row in board.iter_rows() for c in row if c.value == "Rank")
+    assert [board.cell(head + i, 2).value for i in (1, 2)] == ["Team Falcon – Final Pitch", "Rahul Kumar"]
+    row = next(r for r in wb["Evaluations"].iter_rows(values_only=True) if r[1] == "Team Falcon – Final Pitch")
+    assert row[2:4] == ("Priya Shah", "priya@example.com")  # the student keeps their own columns
+    assert "Priya Shah" in _texts(wb["01 Team Falcon – Final Pitch"])  # ... and stays on their sheet
+    assert "Rahul Kumar" not in _texts(wb["01 Team Falcon – Final Pitch"])
+    # an evaluation that was never renamed still uses the student's name, exactly as before
+    assert "Subject name" not in _texts(wb["02 Rahul Kumar"])
+
+
 @pytest.mark.parametrize("n", [1, 40])
 def test_builds_for_small_and_larger_selections(n: int) -> None:
     rows = [(f"Person {i}", f"p{i}@x.com", round(10 - (i * 10 / max(n, 1)), 2), [8, 7, 6, 5]) for i in range(n)]

@@ -13,6 +13,7 @@ Single source of truth for the three build areas (`aws/`, `backend/`, `frontend/
 - `raw/{evaluation_id}/{source_id}.{ext}`: files downloaded from Drive by the `ingest` Lambda. Lifecycle 14 d.
 - `batches/{upload_group_id}/{uuid}.{xlsx|csv}`: batch sheets (uploaded with purpose `batch_sheet`). Lifecycle 14 d.
 - `derived/{evaluation_id}/...`: everything below. Lifecycle 90 d.
+  - `context.json` (written by `ingest` when the input has `context`): `{"scorecard","domain","purpose","scope"}`, known string fields only, clipped. Read by `analyze-image`; missing or unreadable means "no context".
   - `manifest.json`: `{"files":[{"source_id","original_name","kind":"pdf|docx|text|video|other","raw_key","size","status":"ok|skipped|failed","warnings":[str]}],"drive":[{"source_id","url","state":"ok|inaccessible|quota|empty","files_found":int,"warnings":[str]}]}`
   - `docs/{source_id}/content.md`, `docs/{source_id}/images/NNNN_*.jpg` and `NNNN_*.analysis.md` (same text format as `scripts/analyze_images.py`)
   - `video/{source_id}/audio.mp3`, `chunks/cN.mp3`, `transcript.txt`, `transcript.json`
@@ -27,8 +28,11 @@ Single source of truth for the three build areas (`aws/`, `backend/`, `frontend/
 ## Step Functions input
 ```json
 {"evaluation_id":"uuid","bucket":"...","limits":{"max_file_bytes":2147483648,"max_files":20},
- "sources":[{"source_id":"uuid","kind":"upload|drive","s3_key":"uploads/...","original_name":"a.pdf","drive_url":"https://drive.google.com/..."}]}
+ "sources":[{"source_id":"uuid","kind":"upload|drive","s3_key":"uploads/...","original_name":"a.pdf","drive_url":"https://drive.google.com/..."}],
+ "context":{"scorecard":"Customer Support Quality Scorecard","domain":"Customer Support","purpose":"...","scope":"..."}}
 ```
+`context` (optional; empty fields omitted) says what the scorecard is about. `ingest` saves it as `context.json` so image descriptions are written with the scorecard in mind; the local scoring graph gives the same context to every scoring step (see `backend/app/pipeline/scorecard_context.py`). It never overrides the KPI guidelines or the 0-10 scale. Older Lambdas ignore the field, and a Lambda without it uses a neutral prompt.
+
 Execution name = `evaluation_id` (+ `-aN` attempt suffix on retry). The execution succeeds only when `corpus.json` has been written; failure paths write `status.json` + `progress.json` stage `failed`.
 
 ## Evaluation status values

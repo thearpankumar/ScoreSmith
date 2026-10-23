@@ -84,6 +84,12 @@ cd aws/lambdas && pip install -r requirements-dev.txt && python -m pytest -q
   (2 files, 3 images, 3 audio chunks) so one evaluation cannot take every slot.
 - Google Docs are fetched as DOCX; Sheets and Slides as PDF. Folder listings are capped by Google at 50 files (warning).
 - Models: Voxtral small then mini; Kimi K2.5, then Qwen3-VL, then Llama 4 Maverick. Auth is the Lambda role.
+- Scorecard context: the execution input may carry `context` (what the scorecard is about). `ingest` saves it as
+  `derived/{eid}/context.json` and `analyze-image` puts it in front of its prompt, so images are described with that
+  scorecard in mind. Without it (or with older backends) the prompt is neutral. Transcription never uses it: the
+  transcript must stay word for word.
+- Git Bash on Windows works too: `bootstrap.sh` keeps its temp files in `C:/...` form so `aws.exe` can read the
+  `file://` arguments.
 
 ## Costs (rough, us-east-1)
 

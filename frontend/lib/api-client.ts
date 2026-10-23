@@ -1178,6 +1178,13 @@ export async function deleteEvaluation(id: string): Promise<void> {
   await apiFetch(`/api/v1/evaluations/${id}`, { method: "DELETE" });
 }
 
+/** Hover-rename on an evaluation row in the Evaluations list (`PATCH /api/v1/evaluations/{id}` —
+ * backend/app/api/v1/evaluations.py::update_evaluation). Resolves to the name as saved (trimmed by the server). */
+export async function renameEvaluation(id: string, name: string): Promise<string> {
+  const saved = await apiFetch<BeEvaluation>(`/api/v1/evaluations/${id}`, { method: "PATCH", body: { name } });
+  return saved.name;
+}
+
 export async function getEvaluation(id: string): Promise<Evaluation | undefined> {
   let be: BeEvaluation;
   try {
@@ -1429,7 +1436,11 @@ export async function createAiJobs(input: CreateAiJobsInput): Promise<CreateAiJo
   const ctx: EnrichmentContext = { versionById: new Map(), scorecardById: new Map(), userNameById: new Map() };
   return {
     batchId: be.batch_id ?? null,
-    evaluations: be.evaluations.map((e) => ({ ...mapEvaluation(e, ctx), scorecardId: input.scorecardId })),
+    evaluations: be.evaluations.map((e) => ({
+      ...mapEvaluation(e, ctx),
+      scorecardId: input.scorecardId,
+      ...(input.scorecardName ? { scorecardName: input.scorecardName } : {}),
+    })),
   };
 }
 

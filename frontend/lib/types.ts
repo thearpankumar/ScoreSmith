@@ -402,6 +402,8 @@ export interface AiJobItem {
 
 export interface CreateAiJobsInput {
   scorecardId: string;
+  /** Shown on the queued run's card: the creation response is mapped without lookups. */
+  scorecardName?: string;
   directionPrompt?: string | null;
   items: AiJobItem[];
 }

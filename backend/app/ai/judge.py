@@ -58,7 +58,9 @@ from app.models.evaluation import Evaluation
 from app.models.evaluation_kpi_result import EvaluationKpiResult
 from app.models.kpi_guideline import KpiGuideline
 from app.models.kpi_node import KpiNode
+from app.models.scorecard import Scorecard
 from app.models.scorecard_version import ScorecardVersion
+from app.pipeline.scorecard_context import ScorecardContext
 
 # Number of independent judge calls per leaf KPI, and the score-spread threshold (points,
 # on the 0-10 scale) above which a KPI's ensemble result is flagged for human review. A
@@ -299,13 +301,17 @@ async def _judge_one_kpi_call(
     ordered_guidelines: list[KpiGuideline],
     shared_evidence: str,
     input_text: str,
+    *,
+    context_block: str = "",
 ) -> SingleCallJudgment:
     """A single Converse call judging one KPI, given guideline rungs in a caller-chosen
     order (see `_order_guidelines`). One of the k=3 ensemble calls made by
-    `_judge_kpi_ensemble` below — never called with fewer/more than that context."""
+    `_judge_kpi_ensemble` below — never called with fewer/more than that context.
+    `context_block`: what the scorecard is about (app/pipeline/scorecard_context.py), when known."""
     guideline_text = _format_guidelines(ordered_guidelines)
     prompt = (
-        f"KPI: {kpi.name} (weight {kpi.weight}% of the whole scorecard)\n\n"
+        (f"{context_block}\n\n" if context_block else "")
+        + f"KPI: {kpi.name} (weight {kpi.weight}% of the whole scorecard)\n\n"
         f"Guideline rungs (0-10, listed in no particular order of merit — read every "
         f"rung and match on substance, not position in this list):\n{guideline_text}\n\n"
         f"Shared evidence extracted from the input:\n{shared_evidence}\n\n"
@@ -341,6 +347,8 @@ async def _judge_kpi_ensemble(
     guidelines: list[KpiGuideline],
     shared_evidence: str,
     input_text: str,
+    *,
+    context_block: str = "",
 ) -> KpiJudgment:
     """Runs ENSEMBLE_K independent judge calls for one KPI (guideline order perturbed per
     call — see `_order_guidelines`), concurrently, and aggregates by median score. Flags
@@ -355,6 +363,7 @@ async def _judge_kpi_ensemble(
                 _order_guidelines(guidelines, attempt, str(kpi.id)),
                 shared_evidence,
                 input_text,
+                context_block=context_block,
             )
             for attempt in range(ENSEMBLE_K)
         )
@@ -412,18 +421,24 @@ async def run_judge(
     evaluation.status = EvaluationStatus.IN_PROGRESS
     await db.flush()
 
+    version = await db.get(ScorecardVersion, evaluation.scorecard_version_id)
+    scorecard = await db.get(Scorecard, version.scorecard_id) if version is not None else None
+    context_block = ScorecardContext.of(scorecard).prompt_block() if scorecard is not None else ""
+
     shared_evidence = await _extract_shared_evidence(bedrock, input_text, judge_model_id)
 
     # Every leaf's k=3-call ensemble runs concurrently with every other leaf's (each
     # ensemble internally gathers its own k calls too — see _judge_kpi_ensemble).
     judgments = await asyncio.gather(
         *(
-            _judge_kpi_ensemble(bedrock, judge_model_id, leaf, leaf.guidelines, shared_evidence, input_text)
+            _judge_kpi_ensemble(
+                bedrock, judge_model_id, leaf, leaf.guidelines, shared_evidence, input_text,
+                context_block=context_block,
+            )
             for leaf in leaves
         )
     )
 
-    version = await db.get(ScorecardVersion, evaluation.scorecard_version_id)
     scoring_formula = version.scoring_formula if version is not None else None
 
     scores_by_kpi = {j.kpi_node_id: j.score for j in judgments}

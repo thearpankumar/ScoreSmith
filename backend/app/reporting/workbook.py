@@ -662,6 +662,8 @@ def _build_student_sheet(bk: _Book, ws, bundle: ExportBundle, ins: Insights, row
         ws.set_row(r, 20)
         r += 1
 
+    if ev.renamed and (ev.subject_name or "").strip():  # the title shows the new name: keep the submitter visible
+        info("Subject name", lambda rr: bk.put(ws, rr, 1, ev.subject_name))
     info("Email", lambda rr: bk.email(ws, rr, 1, ev.subject_email) if (ev.subject_email or "").strip()
          else bk.put(ws, rr, 1, "—", font_color=P.MUTED))
     info("Scorecard", lambda rr: bk.put(ws, rr, 1, f"{ev.scorecard_name} (v{ev.version_number})"

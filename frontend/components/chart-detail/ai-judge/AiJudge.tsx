@@ -35,7 +35,15 @@ type QueuedRun = { kind: "single"; evaluation: Evaluation } | { kind: "batch"; b
  * same place, by the live progress of that run (no separate page). "Evaluate another" brings back a
  * fresh form.
  */
-export function AiJudge({ scorecardId, kpiNodes }: { scorecardId: string; kpiNodes: KpiNode[] }) {
+export function AiJudge({
+  scorecardId,
+  scorecardName,
+  kpiNodes,
+}: {
+  scorecardId: string;
+  scorecardName: string;
+  kpiNodes: KpiNode[];
+}) {
   const [run, setRun] = useState<QueuedRun | null>(null);
   const [formKey, setFormKey] = useState(0);
   const storageKey = `qs.aiRun.${scorecardId}`;
@@ -73,7 +81,15 @@ export function AiJudge({ scorecardId, kpiNodes }: { scorecardId: string; kpiNod
 
   if (run?.kind === "single") return <SingleRun evaluation={run.evaluation} onNew={startOver} />;
   if (run?.kind === "batch") return <BatchRun batchId={run.batchId} initial={run.evaluations} onNew={startOver} />;
-  return <AiJudgeForm key={formKey} scorecardId={scorecardId} kpiNodes={kpiNodes} onQueued={queued} />;
+  return (
+    <AiJudgeForm
+      key={formKey}
+      scorecardId={scorecardId}
+      scorecardName={scorecardName}
+      kpiNodes={kpiNodes}
+      onQueued={queued}
+    />
+  );
 }
 
 /**
@@ -82,10 +98,12 @@ export function AiJudge({ scorecardId, kpiNodes }: { scorecardId: string; kpiNod
  */
 function AiJudgeForm({
   scorecardId,
+  scorecardName,
   kpiNodes,
   onQueued,
 }: {
   scorecardId: string;
+  scorecardName: string;
   kpiNodes: KpiNode[];
   onQueued: (run: QueuedRun) => void;
 }) {
@@ -178,7 +196,7 @@ function AiJudgeForm({
     setError(null);
     setBlockedLink(null);
     try {
-      const res = await createAiJobs({ scorecardId, directionPrompt: direction, items: buildItems() });
+      const res = await createAiJobs({ scorecardId, scorecardName, directionPrompt: direction, items: buildItems() });
       requestLiveRefresh(); // the slot is busy from now on: disable the other forms right away
       if (res.batchId && res.evaluations.length > 1) {
         onQueued({ kind: "batch", batchId: res.batchId, evaluations: res.evaluations });

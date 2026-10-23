@@ -61,6 +61,7 @@ from app.pipeline.events import emit_evaluation_event
 from app.pipeline.graph import EvaluationCancelled, PipelineError, ScoringDeps, run_scoring
 from app.pipeline.jev_scorer import JevScoreClientProtocol
 from app.pipeline.outcomes import finalize_evaluation_background
+from app.pipeline.scorecard_context import ScorecardContext
 from app.slots import acquire_job_slot
 
 logger = logging.getLogger(__name__)
@@ -494,6 +495,11 @@ class Dispatcher:
                     for s in sources
                 ],
             }
+            # What the scorecard is about, for the image-description step (saved by ingest as context.json).
+            version = await db.get(ScorecardVersion, ev.scorecard_version_id)
+            scorecard = await db.get(Scorecard, version.scorecard_id) if version else None
+            if scorecard is not None:
+                payload["context"] = ScorecardContext.of(scorecard).payload()
         name = execution_name(str(ev.id), ev.attempt)
         try:
             arn = await asyncio.to_thread(self.aws.start_execution, name, payload)
