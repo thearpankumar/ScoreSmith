@@ -345,3 +345,31 @@ body {
   background: var(--hairline);
   border-radius: 999px;
 }
+
+/* ===========================================================================
+   Scoring-formula builder
+   ========================================================================= */
+
+/* Insertion point in the token canvas: blinks like a text caret, steady when motion is reduced. */
+@keyframes formula-caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.formula-caret {
+  animation: formula-caret-blink 1.1s steps(1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .formula-caret {
+    animation: none;
+  }
+}
+
+/* KPI rows in the builder's list: the browser skips layout and paint for rows scrolled out of view
+   (a scorecard can have a few hundred KPIs), and the remembered size keeps the scrollbar steady. */
+.formula-kpi-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 3.25rem;
+}

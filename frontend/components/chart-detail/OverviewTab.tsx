@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { CheckCircle2, XCircle } from "lucide-react";
 
@@ -11,6 +11,7 @@ import { ScorecardStatusBadge } from "@/components/charts-library/ScorecardStatu
 import { KpiStructureTree, type StructureEditing } from "./KpiStructureTree";
 import { ScoringFormulaPanel } from "./ScoringFormulaPanel";
 import { TargetScoreField } from "./TargetScoreField";
+import { formulaKpis } from "@/lib/formula-kpis";
 import { guidelineCoverage, leafKpiNodes, validateSiblingWeights } from "@/lib/kpi-tree";
 import { targetEditPermission } from "@/lib/target-score";
 import { formatDate } from "@/lib/utils";
@@ -46,6 +47,7 @@ export function OverviewTab({
   const weightChecks = validateSiblingWeights(nodes);
   const allWeightsOk = weightChecks.every((c) => c.ok);
   const leaves = leafKpiNodes(nodes);
+  const formulaKpiList = useMemo(() => formulaKpis(nodes), [nodes]);
   const fullyDefined = leaves.filter((l) => guidelineCoverage(l).defined === 11).length;
   const totalGuidelines = leaves.reduce((s, l) => s + guidelineCoverage(l).defined, 0);
   const maxDepth = nodes.reduce((m, n) => Math.max(m, n.level), 0);
@@ -113,7 +115,7 @@ export function OverviewTab({
         <KpiStructureTree kpiNodes={nodes} editing={editing} />
         <ScoringFormulaPanel
           initialFormula={version.scoringFormula}
-          leafKpiNames={leaves.map((l) => l.name)}
+          kpis={formulaKpiList}
           onValidate={(formula) => validateScoringFormula(scorecard.id, version.id, formula)}
           onSave={async (formula) => {
             await updateScoringFormula(scorecard.id, version.id, formula);

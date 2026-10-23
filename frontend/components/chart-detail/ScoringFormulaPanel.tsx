@@ -7,6 +7,7 @@ import { SolidPanel } from "@/components/design-system/SolidPanel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ApiError, type FormulaValidation } from "@/lib/api-client";
+import type { FormulaKpi } from "@/lib/formula-kpis";
 import { cn } from "@/lib/utils";
 import { ScoringFormulaBuilderDialog } from "./ScoringFormulaBuilderDialog";
 
@@ -32,13 +33,14 @@ const VALIDATE_DEBOUNCE_MS = 400;
  */
 export function ScoringFormulaPanel({
   initialFormula,
-  leafKpiNames,
+  kpis,
   onValidate,
   onSave,
   savedNotice = { custom: "Custom formula saved.", cleared: "Reverted to the default weighted average." },
 }: {
   initialFormula: string | null;
-  leafKpiNames: string[];
+  /** The scorecard's leaf KPIs in scorecard order (`formulaKpis(...)`), for the builder and the name list. */
+  kpis: FormulaKpi[];
   /** Real backend validation — see module docstring. */
   onValidate: (formula: string) => Promise<FormulaValidation>;
   /** Persists an already-validated formula (`null` clears it). May be a real network call
@@ -214,15 +216,17 @@ export function ScoringFormulaPanel({
         </div>
       )}
 
-      {leafKpiNames.length > 0 && (
+      {kpis.length > 0 && (
         <details className="text-xs text-ink-muted">
           <summary className="cursor-pointer select-none font-medium hover:text-ink">
-            Available KPI names ({leafKpiNames.length})
+            Available KPI names ({kpis.length})
           </summary>
-          <ul className="mt-1.5 flex flex-wrap gap-1">
-            {leafKpiNames.map((name) => (
-              <li key={name}>
-                <code className="rounded bg-black/5 px-1 py-0.5 font-mono text-[11px]">kpi[&quot;{name}&quot;]</code>
+          <ul className="thin-scrollbar mt-1.5 flex max-h-48 flex-wrap gap-1 overflow-y-auto">
+            {kpis.map((k) => (
+              <li key={k.name} className="min-w-0 max-w-full">
+                <code className="block truncate rounded bg-black/5 px-1 py-0.5 font-mono text-[11px]" title={k.name}>
+                  kpi[{JSON.stringify(k.name)}]
+                </code>
               </li>
             ))}
           </ul>
@@ -262,7 +266,7 @@ export function ScoringFormulaPanel({
         open={builderOpen}
         onOpenChange={setBuilderOpen}
         initialText={text}
-        leafKpiNames={leafKpiNames}
+        kpis={kpis}
         onValidate={onValidate}
         onApply={(next) => {
           setText(next);

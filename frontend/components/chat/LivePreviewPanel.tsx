@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScoringFormulaPanel } from "@/components/chart-detail/ScoringFormulaPanel";
 import { validateScoringFormulaDraft } from "@/lib/api-client";
+import { formulaKpis } from "@/lib/formula-kpis";
 import { siblingWeightSum } from "@/lib/kpi-tree";
 import { draftKpiCounts, weightedLeafProgress } from "@/lib/chat-turn-state";
 import { cn } from "@/lib/utils";
@@ -73,6 +74,7 @@ export const LivePreviewPanel = memo(function LivePreviewPanel({
     return { parentIds: parents, childrenByParent: byParent, topLevel: top };
   }, [draft.kpis]);
   const leafKpiNames = draft.kpis.filter((k) => !parentIds.has(k.id)).map((k) => k.name);
+  const formulaKpiList = useMemo(() => formulaKpis(draft.kpis), [draft.kpis]);
 
   // Only LEAF KPIs (ones nothing else is nested under) carry a weight — a category/
   // grouping node has none of its own (see backend migration
@@ -446,7 +448,7 @@ export const LivePreviewPanel = memo(function LivePreviewPanel({
            */}
           <ScoringFormulaPanel
             initialFormula={draft.scoringFormula}
-            leafKpiNames={leafKpiNames}
+            kpis={formulaKpiList}
             onValidate={(formula) => validateScoringFormulaDraft(formula, leafKpiNames)}
             onSave={async (formula) => patch({ scoringFormula: formula })}
             savedNotice={{
