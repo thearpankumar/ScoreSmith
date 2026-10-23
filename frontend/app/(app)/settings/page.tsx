@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 
 import { GlassCard } from "@/components/design-system/GlassCard";
+import { AiProviderCard } from "@/components/settings/AiProviderCard";
 import { SettingsForm } from "@/components/settings/SettingsForm";
 import { getCurrentUser } from "@/lib/api-client";
 
@@ -17,11 +18,15 @@ export default async function SettingsPage() {
       <div>
         <h1 className="text-2xl font-semibold text-ink">Settings</h1>
         <p className="mt-1 text-sm text-ink-muted">
-          Administrator settings and your profile. People are managed under Users.
+          The product-wide AI provider and your profile. People are managed under Users.
         </p>
       </div>
 
-      <GlassCard elevation={1} className="p-6">
+      <GlassCard elevation={1} className="p-4 sm:p-6">
+        <AiProviderCard />
+      </GlassCard>
+
+      <GlassCard elevation={1} className="p-4 sm:p-6">
         <SettingsForm user={user} />
       </GlassCard>
     </div>

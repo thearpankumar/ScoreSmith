@@ -79,6 +79,12 @@ _apply_test_database_url()
 os.environ["JWT_SECRET"] = secrets.token_urlsafe(48)
 for _name in ("ENV", "ENVIRONMENT", "ADMIN_EMAIL", "ADMIN_PASSWORD", "BOOTSTRAP_TOKEN", "SIGNUP_ENABLED"):
     os.environ.pop(_name, None)
+# No test may reach the real OpenRouter, and the AI-provider availability starts from the bare environment (tests
+# that need a provider available set the key / BEDROCK_AVAILABLE on the settings object themselves).
+for _name in ("OPENROUTER_API_KEY", "BEDROCK_AVAILABLE"):
+    os.environ.pop(_name, None)
+# Nor may the developer's ~/.aws make Bedrock look available (providers.shared_aws_credentials()).
+os.environ["AWS_SHARED_CREDENTIALS_FILE"] = os.environ["AWS_CONFIG_FILE"] = os.devnull
 
 # Chat turns default to BACKGROUND tasks (202 + polling) in production; the pre-existing API tests
 # assert on the inline 200/201 responses, so the suite runs inline by default and the background
@@ -88,6 +94,7 @@ os.environ.setdefault("CHAT_TURNS_INLINE", "true")
 os.environ.setdefault("AI_EVAL_INLINE", "true")
 
 APP_TABLES = [
+    "app_settings",
     "chat_shares",
     "notifications",
     "scorecard_activity",
@@ -217,6 +224,21 @@ def _auth_test_client_class():
             return httpx.Response(201, json=data)
 
     return AuthTestClient
+
+
+@pytest.fixture(autouse=True)
+def _reset_ai_provider_state():
+    """The stored-provider cache and the per-provider client singletons are process state: start every test fresh
+    (a test that saved "openrouter" must not leak it into the next one through the 5 s cache)."""
+    from app.ai import providers
+
+    providers.invalidate_cache()
+    providers.reset_clients()
+    providers.shared_aws_credentials.cache_clear()
+    yield
+    providers.invalidate_cache()
+    providers.reset_clients()
+    providers.shared_aws_credentials.cache_clear()
 
 
 @pytest.fixture(autouse=True)

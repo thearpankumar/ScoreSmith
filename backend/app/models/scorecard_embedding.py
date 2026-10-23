@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -20,15 +20,21 @@ EMBEDDING_DIM = 1024
 
 class ScorecardEmbedding(UUIDPKMixin, Base):
     """Similarity-search vector for one scorecard version's purpose/KPI text, used to
-    suggest reuse of an existing scorecard for a new request. HNSW-indexed (cosine)."""
+    suggest reuse of an existing scorecard for a new request. HNSW-indexed (cosine).
+
+    One row per (version, embedding model) (migration 0018): vectors from different models
+    (Titan on Bedrock, text-embedding-3-small on OpenRouter) are not comparable, so each AI
+    provider searches only the rows of its own model, and switching back reuses the old rows."""
 
     __tablename__ = "scorecard_embeddings"
+    __table_args__ = (
+        UniqueConstraint("scorecard_version_id", "embedding_model", name="uq_scorecard_embeddings_version_model"),
+    )
 
     scorecard_version_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("scorecard_versions.id", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
     )
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
     embedding_model: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -41,7 +47,7 @@ class ScorecardEmbedding(UUIDPKMixin, Base):
     )
 
     scorecard_version: Mapped[ScorecardVersion] = relationship(
-        "ScorecardVersion", back_populates="embedding"
+        "ScorecardVersion", back_populates="embeddings"
     )
 
     def __repr__(self) -> str:  # pragma: no cover

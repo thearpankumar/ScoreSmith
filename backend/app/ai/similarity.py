@@ -4,11 +4,13 @@ similar scorecard" feature.
 `find_similar_by_vector` is the pure-DB half (query vector in, ranked rows out) and is
 independently testable against real Postgres/pgvector with synthetic vectors, with no
 Bedrock call needed — see `tests/test_similarity.py`. `find_similar_scorecards` is the
-Bedrock-backed convenience wrapper that embeds free-text first.
+client-backed convenience wrapper that embeds free-text first and compares it only with
+rows embedded by the same model (vectors from different models are not comparable).
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 
@@ -16,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.bedrock_client import BedrockClientProtocol
+from app.ai.providers import embedding_model_of
 from app.models.scorecard import Scorecard
 from app.models.scorecard_embedding import ScorecardEmbedding
 from app.models.scorecard_version import ScorecardVersion
@@ -49,7 +52,11 @@ async def find_similar_by_vector(
     top_n: int = 5,
     threshold: float = SIMILARITY_THRESHOLD,
     owner_id: uuid.UUID | None = None,
+    embedding_model: str | None = None,
 ) -> list[SimilarScorecardResult]:
+    """`embedding_model`: when given, only rows embedded with that exact model are compared
+    (a Titan vector and a text-embedding-3-small vector live in different spaces). None = no
+    filter (test fakes, which have no model of their own)."""
     distance = ScorecardEmbedding.embedding.cosine_distance(query_vector)
     stmt = (
         select(
@@ -68,6 +75,8 @@ async def find_similar_by_vector(
     )
     if owner_id is not None:  # only the caller's own scorecards are ever suggested
         stmt = stmt.where(Scorecard.owner_id == owner_id)
+    if embedding_model is not None:
+        stmt = stmt.where(ScorecardEmbedding.embedding_model == embedding_model)
     rows = (await db.execute(stmt)).all()
     results = [
         SimilarScorecardResult(
@@ -92,5 +101,9 @@ async def find_similar_scorecards(
     threshold: float = SIMILARITY_THRESHOLD,
     owner_id: uuid.UUID | None = None,
 ) -> list[SimilarScorecardResult]:
-    query_vector = bedrock.embed(query_text)
-    return await find_similar_by_vector(db, query_vector, top_n=top_n, threshold=threshold, owner_id=owner_id)
+    # The clients are synchronous (boto3 / httpx): keep the event loop free.
+    query_vector = await asyncio.to_thread(bedrock.embed, query_text)
+    return await find_similar_by_vector(
+        db, query_vector, top_n=top_n, threshold=threshold, owner_id=owner_id,
+        embedding_model=embedding_model_of(bedrock),
+    )

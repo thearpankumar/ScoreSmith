@@ -1,4 +1,5 @@
-"""Alembic migrations 0011 (scaling leases) and 0012 (auth + ownership): upgrade, data backfill, downgrade.
+"""Alembic migrations 0011 (scaling leases), 0012 (auth + ownership) and 0018 (AI provider settings): upgrade, data
+backfill, downgrade.
 
 Runs in a throw-away Postgres SCHEMA (search_path of a subprocess) so the shared test database that every other
 test truncates is never touched. Extensions (vector, ltree) live in `public` and stay visible through the path."""
@@ -118,3 +119,57 @@ def test_upgrade_head_is_idempotent(scratch) -> None:
     alembic, _sql, _columns, _tables = scratch
     alembic("upgrade", "head")
     alembic("upgrade", "head")  # already at head: a no-op, not an error
+
+
+def test_0018_ai_provider_settings_upgrade_two_models_and_downgrade(scratch) -> None:
+    alembic, sql, columns, tables = scratch
+
+    alembic("upgrade", "0017_eval_renamed_at")
+    assert "app_settings" not in tables() and "ai_provider" not in columns("evaluations")
+    uid, sid, vid = (str(uuid.uuid4()) for _ in range(3))
+    vector = "[" + ",".join(["0.03125"] * 1024) + "]"
+    sql("INSERT INTO users (id, email, name) VALUES (%s, 'emb@example.com', 'Emb')", (uid,))
+    sql("INSERT INTO scorecards (id, name, owner_id) VALUES (%s, 'S', %s)", (sid, uid))
+    sql(
+        "INSERT INTO scorecard_versions (id, scorecard_id, version_number, created_by) VALUES (%s, %s, 1, %s)",
+        (vid, sid, uid),
+    )
+
+    def embed(model: str, *, age: str = "0 seconds") -> None:
+        sql(
+            "INSERT INTO scorecard_embeddings (id, scorecard_version_id, embedding, embedding_model, source_text_hash,"
+            " updated_at) VALUES (%s, %s, %s::vector, %s, 'h', now() - %s::interval)",
+            (str(uuid.uuid4()), vid, vector, model, age),
+        )
+
+    embed("amazon.titan-embed-text-v2:0", age="1 hour")
+    with pytest.raises(psycopg.errors.UniqueViolation):  # before 0018: one embedding per version
+        embed("openai/text-embedding-3-small")
+
+    alembic("upgrade", "0018_ai_provider_settings")
+    assert "app_settings" in tables()
+    assert {"id", "key", "value", "created_at", "updated_at", "updated_by"} <= columns("app_settings")
+    assert "ai_provider" in columns("evaluations")
+    embed("openai/text-embedding-3-small")  # a second model now lives next to Titan
+    assert sql("SELECT count(*) FROM scorecard_embeddings WHERE scorecard_version_id=%s", (vid,)) == [(2,)]
+    with pytest.raises(psycopg.errors.UniqueViolation):  # still one row per (version, model)
+        embed("openai/text-embedding-3-small")
+    sql(
+        "INSERT INTO app_settings (key, value, updated_by) VALUES ('ai_provider', %s::jsonb, %s)",
+        ('{"provider": "openrouter"}', uid),
+    )
+    assert sql("SELECT value->>'provider', id IS NOT NULL FROM app_settings") == [("openrouter", True)]
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        sql("INSERT INTO app_settings (key, value) VALUES ('ai_provider', '{}')")
+
+    # Downgrade keeps the Titan embedding (the only model the pre-0018 code uses), even though the OpenAI row is
+    # newer, and restores the one-per-version constraint.
+    alembic("downgrade", "0017_eval_renamed_at")
+    assert "app_settings" not in tables() and "ai_provider" not in columns("evaluations")
+    assert sql("SELECT embedding_model FROM scorecard_embeddings WHERE scorecard_version_id=%s", (vid,)) == [
+        ("amazon.titan-embed-text-v2:0",)
+    ]
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        embed("openai/text-embedding-3-small")
+    alembic("upgrade", "head")
+    assert "app_settings" in tables()

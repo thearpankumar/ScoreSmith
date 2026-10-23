@@ -54,6 +54,13 @@ class BedrockTimeoutError(BedrockUnavailableError):
     SMALLER request (guideline fill) catch this specifically."""
 
 
+# Provider-neutral names: the OpenRouter client (app/ai/openrouter_client.py) raises the SAME classes, so every
+# existing `except BedrockUnavailableError` handler (and the "bedrock_unavailable" error code the frontend knows)
+# keeps working whichever provider is active.
+LLMUnavailableError = BedrockUnavailableError
+LLMTimeoutError = BedrockTimeoutError
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     """One `toolConfig` tool definition, in Bedrock Converse's `toolSpec` shape."""
@@ -165,6 +172,9 @@ def _parse_converse_response(response: dict[str, Any]) -> ConverseResult:
 class BedrockClient:
     """Real boto3-backed implementation of `BedrockClientProtocol`."""
 
+    # Which AI provider this client talks to (see app/ai/providers.py: provider_of / models_of).
+    provider = "bedrock"
+
     def __init__(
         self,
         *,
@@ -172,13 +182,27 @@ class BedrockClient:
         chat_model_id: str | None = None,
         judge_model_id: str | None = None,
         embedding_model_id: str | None = None,
+        master_model_id: str | None = None,
     ) -> None:
         settings = get_settings()
         self._region = region or settings.aws_region
         self.chat_model_id = chat_model_id or settings.bedrock_chat_model_id
         self.judge_model_id = judge_model_id or settings.bedrock_judge_model_id
+        self.master_model_id = master_model_id or settings.bedrock_master_model_id
         self.embedding_model_id = embedding_model_id or settings.bedrock_embedding_model_id
         self._client: Any = None  # lazy — see module docstring
+
+    def _model(self, model_id: str | None) -> str:
+        """The Bedrock model for a call. An OpenRouter id ("vendor/model") reaching this client is a call-site bug
+        (it resolved its model for the other provider): use this client's default instead of failing the call."""
+        if model_id and "/" in model_id and not model_id.startswith("arn:"):
+            logger.warning(
+                "Bedrock client got an OpenRouter model id %r; using the default %s instead.",
+                model_id,
+                self.chat_model_id,
+            )
+            return self.chat_model_id
+        return model_id or self.chat_model_id
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -201,7 +225,7 @@ class BedrockClient:
     ) -> ConverseResult:
         client = self._get_client()
         kwargs: dict[str, Any] = {
-            "modelId": model_id or self.chat_model_id,
+            "modelId": self._model(model_id),
             "messages": messages,
         }
         if system:
@@ -267,7 +291,7 @@ class BedrockClient:
         interrupt()-driven graph turn. Documented simplification, not an omission."""
         client = self._get_client()
         kwargs: dict[str, Any] = {
-            "modelId": model_id or self.chat_model_id,
+            "modelId": self._model(model_id),
             "messages": messages,
         }
         if system:

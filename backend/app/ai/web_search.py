@@ -41,6 +41,13 @@ to the in-process cap if Redis is down).
 Structured behind `WebSearchClientProtocol`, mirroring exactly how
 `bedrock_client.py`'s `BedrockClientProtocol` is structured, so `AgentCoreWebSearchClient`
 can be swapped for `tests/fakes.py::FakeWebSearchClient` in tests.
+
+**OpenRouter fallback** (`OpenRouterWebSearchClient`): when the AgentCore Gateway is NOT
+configured and the active AI provider is OpenRouter, `web_search_for()` returns a client
+that runs one chat completion with OpenRouter's `openrouter:web_search` server tool and
+maps the answer's `url_citation` annotations to `SearchResult`s. Same contract: never
+raises, returns [] on any failure, shares the cluster-wide "web_search" slot. AgentCore
+always wins when its keys exist, whichever provider is active.
 """
 
 from __future__ import annotations
@@ -321,3 +328,222 @@ class AgentCoreWebSearchClient:
                     backoff = (2**attempt) + random.uniform(0, 1)
                     await asyncio.sleep(backoff)
         return []  # pragma: no cover — unreachable (loop always returns/retries)
+
+
+# --- OpenRouter web search (chat/completions + the `openrouter:web_search` server tool) ------------------------
+
+_OPENROUTER_TIMEOUT_SECONDS = 90.0
+_OPENROUTER_MAX_TOKENS = 3000
+_OPENROUTER_RETRYABLE = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def extract_openrouter_results(data: Any, max_results: int = _MAX_RESULTS) -> list[SearchResult]:
+    """Maps `choices[0].message.annotations[]` of type `url_citation` (`url_citation.url/title/content`) to
+    `SearchResult`s, deduplicated by URL and capped at `max_results`. Never raises on a malformed body."""
+    results: list[SearchResult] = []
+    try:
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+        annotations = message.get("annotations") or []
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return results
+    if not isinstance(annotations, list):
+        return results
+    seen: set[str] = set()
+    for ann in annotations:
+        if len(results) >= max_results:
+            break
+        if not isinstance(ann, dict) or ann.get("type") != "url_citation":
+            continue
+        cite = ann.get("url_citation")
+        if not isinstance(cite, dict) or not cite.get("url"):
+            continue
+        url = str(cite["url"])
+        if url in seen:
+            continue
+        seen.add(url)
+        results.append(
+            _normalize_result(
+                {
+                    "title": cite.get("title"),
+                    "url": url,
+                    "snippet": cite.get("content"),
+                    "published_date": cite.get("published_date") or cite.get("publishedDate"),
+                }
+            )
+        )
+    return results
+
+
+def _scrub(text: str, key: str) -> str:
+    return (text.replace(key, "***") if key else text)[:300]
+
+
+class OpenRouterWebSearchClient:
+    """`WebSearchClientProtocol` over OpenRouter's `openrouter:web_search` server tool: one chat completion on the
+    agent model whose `url_citation` annotations are the results. `search()` never raises and returns [] on any
+    failure (missing key, HTTP error, timeout, malformed body). The API key is never logged."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model_id: str | None = None,
+        engine: str | None = None,
+        max_results: int = _MAX_RESULTS,
+        max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
+        transport: httpx.AsyncBaseTransport | None = None,
+        retry_delay: float = 1.0,
+    ) -> None:
+        self._api_key = api_key  # None = read OPENROUTER_API_KEY at call time
+        self._base_url = base_url
+        self._model_id = model_id
+        self._engine = engine
+        self._max_results = max(1, min(int(max_results), _MAX_RESULTS))
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._max_concurrency = max_concurrency
+        self._transport = transport
+        self._retry_delay = retry_delay
+
+    def _key(self) -> str:
+        key = self._api_key if self._api_key is not None else get_settings().openrouter_api_key
+        return (key or "").strip()
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._key())
+
+    def _global_slot(self):
+        """Cluster-wide cap on concurrent searches, shared with the AgentCore client (Redis; no-op without it)."""
+        return get_semaphore(
+            "web_search",
+            local_limit=None,  # the per-client asyncio.Semaphore is the local cap
+            global_limit=lambda: get_settings().web_search_global_concurrency or self._max_concurrency,
+        ).slot()
+
+    def _payload(self, query: str) -> dict[str, Any]:
+        settings = get_settings()
+        engine = self._engine if self._engine is not None else settings.openrouter_search_engine
+        parameters: dict[str, Any] = {"max_results": self._max_results, "search_context_size": "low"}
+        if engine:
+            parameters["engine"] = engine
+        prompt = (
+            "Search the web for the query below and reply with a brief summary of the most relevant, "
+            f"authoritative findings, citing your sources.\n\nQuery: {query}"
+        )
+        return {
+            "model": self._model_id or settings.openrouter_agent_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "tools": [{"type": "openrouter:web_search", "parameters": parameters}],
+            "reasoning": {"effort": "low", "exclude": True},
+            "max_tokens": _OPENROUTER_MAX_TOKENS,
+        }
+
+    @staticmethod
+    def _headers(key: str) -> dict[str, str]:
+        settings = get_settings()
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        if settings.openrouter_http_referer:
+            headers["HTTP-Referer"] = settings.openrouter_http_referer
+        if settings.openrouter_app_title:
+            headers["X-OpenRouter-Title"] = settings.openrouter_app_title
+        return headers
+
+    async def search(self, query: str) -> list[SearchResult]:
+        key = self._key()
+        if not key:
+            logger.warning("OpenRouter web search is not configured (OPENROUTER_API_KEY is empty); returning [].")
+            return []
+        base_url = (self._base_url or get_settings().openrouter_api_base).rstrip("/")
+        payload = self._payload(query)
+        headers = self._headers(key)
+        async with self._semaphore, self._global_slot():
+            for attempt in range(_MAX_ATTEMPTS):
+                status: int | None = None
+                try:
+                    async with httpx.AsyncClient(timeout=_OPENROUTER_TIMEOUT_SECONDS, transport=self._transport) as c:
+                        response = await c.post(f"{base_url}/chat/completions", json=payload, headers=headers)
+                    status = response.status_code
+                    if status >= 400:
+                        raise RuntimeError(f"HTTP {status}")
+                    data = response.json()
+                    if not isinstance(data, dict):
+                        raise RuntimeError("non-object response body")
+                    error = data.get("error")
+                    if error and not data.get("choices"):
+                        code = error.get("code") if isinstance(error, dict) else None
+                        status = int(code) if isinstance(code, int | float) else 502
+                        raise RuntimeError(f"error body (code {status})")
+                    results = extract_openrouter_results(data, self._max_results)
+                    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+                    logger.info("web_search query=%r -> %d result(s) (openrouter)", query, len(results))
+                    logger.debug("openrouter web_search via=%s cost=%s", data.get("provider"), usage.get("cost"))
+                    return results
+                except Exception as exc:  # noqa: BLE001 - never raise from search()
+                    # Transport errors, timeouts, unreadable 200s and 408/429/5xx may heal; other 4xx will not.
+                    retryable = status is None or status < 400 or status in _OPENROUTER_RETRYABLE
+                    give_up = attempt + 1 >= _MAX_ATTEMPTS or not retryable
+                    # Only the exception type / status (scrubbed): the request headers carry the API key.
+                    logger.warning(
+                        "web_search query=%r failed on attempt %d/%d (openrouter, %s: %s)%s",
+                        query,
+                        attempt + 1,
+                        _MAX_ATTEMPTS,
+                        type(exc).__name__,
+                        _scrub(str(exc), key),
+                        " - giving up, returning []" if give_up else " - retrying",
+                    )
+                    if give_up:
+                        return []
+                    if self._retry_delay > 0:
+                        await asyncio.sleep(self._retry_delay * (2**attempt) + random.uniform(0, self._retry_delay))
+        return []  # pragma: no cover - the loop always returns
+
+
+# --- selection ------------------------------------------------------------------------------------------------------
+
+_agentcore_client: AgentCoreWebSearchClient | None = None
+_openrouter_client: OpenRouterWebSearchClient | None = None
+
+
+def _agentcore() -> AgentCoreWebSearchClient:
+    global _agentcore_client
+    if _agentcore_client is None:
+        _agentcore_client = AgentCoreWebSearchClient()
+    return _agentcore_client
+
+
+def _openrouter() -> OpenRouterWebSearchClient:
+    global _openrouter_client
+    if _openrouter_client is None:
+        _openrouter_client = OpenRouterWebSearchClient(max_results=get_settings().openrouter_search_max_results)
+    return _openrouter_client
+
+
+def agentcore_configured() -> bool:
+    return _agentcore().is_configured
+
+
+def web_search_backend(provider: str | None) -> str:
+    """Which web search a chat turn on `provider` gets: "agentcore" | "openrouter" | "none"."""
+    if _agentcore().is_configured:
+        return "agentcore"
+    if provider == "openrouter" and (get_settings().openrouter_api_key or "").strip():
+        return "openrouter"
+    return "none"
+
+
+def web_search_for(provider: str) -> WebSearchClientProtocol:
+    """The web-search client for a chat turn running on `provider`: AgentCore whenever its keys are configured;
+    otherwise OpenRouter's server tool when the provider is OpenRouter and OPENROUTER_API_KEY is set; otherwise the
+    (unconfigured) AgentCore client, whose search() returns no results."""
+    if web_search_backend(provider) == "openrouter":
+        return _openrouter()
+    return _agentcore()
+
+
+def reset_web_search_clients() -> None:
+    """Drop the process singletons (tests; settings changed)."""
+    global _agentcore_client, _openrouter_client
+    _agentcore_client = None
+    _openrouter_client = None

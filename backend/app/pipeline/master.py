@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError, ToolSpec
+from app.ai.providers import provider_of
 from app.ai.scorecard_builder import _converse_limited
 from app.models.kpi_guideline import KpiGuideline
 from app.models.kpi_node import KpiNode
@@ -106,7 +107,7 @@ async def _call_tool(
     last: Exception | None = None
     throttled = 0
     tries = 0
-    limiter = get_master_limiter()
+    limiter = get_master_limiter(provider_of(bedrock))  # each provider has its own quota and AIMD state
     while tries < attempts:
         try:
             async with limiter.slot():

@@ -14,8 +14,9 @@ Single source of truth for the three build areas (`aws/`, `backend/`, `frontend/
 - `batches/{upload_group_id}/{uuid}.{xlsx|csv}`: batch sheets (uploaded with purpose `batch_sheet`). Lifecycle 14 d.
 - `derived/{evaluation_id}/...`: everything below. Lifecycle 90 d.
   - `context.json` (written by `ingest` when the input has `context`): `{"scorecard","domain","purpose","scope"}`, known string fields only, clipped. Read by `analyze-image`; missing or unreadable means "no context".
+  - `run_config.json` (written by `ingest`): `{"provider":"bedrock|openrouter"}`, the input's `provider` normalised (missing or unknown = `bedrock`). Read by `transcribe-chunk` and `analyze-image` to pick the provider's models; a missing or unreadable file means `bedrock`.
   - `manifest.json`: `{"files":[{"source_id","original_name","kind":"pdf|docx|text|video|other","raw_key","size","status":"ok|skipped|failed","warnings":[str]}],"drive":[{"source_id","url","state":"ok|inaccessible|quota|empty","files_found":int,"warnings":[str]}]}`
-  - `docs/{source_id}/content.md`, `docs/{source_id}/images/NNNN_*.jpg` and `NNNN_*.analysis.md` (same text format as `scripts/analyze_images.py`)
+  - `docs/{source_id}/content.md`, `docs/{source_id}/images/NNNN_*.jpg` and `NNNN_*.analysis.md` (same text format as `scripts/analyze_images.py`). An analysis has the sections `## Text (OCR)`, `## Description`, `## What it shows` (what the image is about, what it represents or is trying to explain, and how it supports the document) and `## Summary`, whichever provider wrote it.
   - `video/{source_id}/audio.mp3`, `chunks/cN.mp3`, `transcript.txt`, `transcript.json`
   - `corpus.json`: `{"evaluation_id","built_at","stats":{"docs":int,"videos":int,"images":int,"words":int},"warnings":[str],"sections":[{"id":"s001","source_id","source_name","kind":"doc|video|image","label":"DOC a.pdf p3 | VIDEO demo.mp4 00:00-05:00 | IMAGE a.pdf fig 4","text":str}]}` (sections in reading order; docs get one section per page, video one per transcript chunk, image one per analysis)
   - `corpus.md`: same, stitched with `## [label]` headings
@@ -29,11 +30,18 @@ Single source of truth for the three build areas (`aws/`, `backend/`, `frontend/
 ```json
 {"evaluation_id":"uuid","bucket":"...","limits":{"max_file_bytes":2147483648,"max_files":20},
  "sources":[{"source_id":"uuid","kind":"upload|drive","s3_key":"uploads/...","original_name":"a.pdf","drive_url":"https://drive.google.com/..."}],
- "context":{"scorecard":"Customer Support Quality Scorecard","domain":"Customer Support","purpose":"...","scope":"..."}}
+ "context":{"scorecard":"Customer Support Quality Scorecard","domain":"Customer Support","purpose":"...","scope":"..."},
+ "provider":"bedrock"}
 ```
+`provider` (`"bedrock"` or `"openrouter"`; the backend always sends it) is the AI provider an admin selected in Settings when the execution started. `ingest` stores it in `derived/{evaluation_id}/run_config.json`; the transcription and image-analysis steps then call that provider's models (Bedrock: Amazon Transcribe, then Voxtral, and Kimi K2.5 / Qwen3-VL / Maverick; OpenRouter: Voxtral via OpenRouter, qwen3.7-flash / Qwen3-VL, with the key read from SSM). An input without the key (an older backend) runs on Bedrock. With `openrouter`, `ingest` fails the run at once if the Lambda cannot read its OpenRouter key from SSM (error_code `internal`, message starting `OpenRouter key not configured in AWS (SSM parameter /qs-eval/openrouter-api-key: ...)`), and likewise when OpenRouter rejects the key or its credit limit is used up (`OpenRouter rejected the API key ...` / `The OpenRouter key has no credit left ...`), instead of letting every image and audio chunk be skipped. On an OpenRouter run the `.analysis.md` headers and the per-chunk JSON (`video/{source_id}/chunks/cN.json`) name OpenRouter model ids (e.g. `qwen/qwen3.7-flash`, `mistralai/voxtral-small-24b-2507`); a chunk transcribed by Voxtral Mini (OpenRouter's speech-to-text endpoint) reports `tokens_in`/`tokens_out` = 0. On a Bedrock run the chunk JSON names `amazon.transcribe` (Bedrock's Voxtral rejects audio since Oct 2026), also with `tokens_in`/`tokens_out` = 0. The backend records the same value in `evaluations.ai_provider` and scores with it (see "AI provider" below).
+
 `context` (optional; empty fields omitted) says what the scorecard is about. `ingest` saves it as `context.json` so image descriptions are written with the scorecard in mind; the local scoring graph gives the same context to every scoring step (see `backend/app/pipeline/scorecard_context.py`). It never overrides the KPI guidelines or the 0-10 scale. Older Lambdas ignore the field, and a Lambda without it uses a neutral prompt.
 
 Execution name = `evaluation_id` (+ `-aN` attempt suffix on retry). The execution succeeds only when `corpus.json` has been written; failure paths write `status.json` + `progress.json` stage `failed`.
+
+## AI provider (added with the Settings provider switch; additive)
+- The provider is resolved once per evaluation, when its execution starts, and stored in `evaluations.ai_provider` (null until then). Scoring uses that provider, or the currently selected one if the stored provider is no longer available, so an evaluation that was running when an admin switched providers finishes on the provider it started with. `POST /evaluations/{id}/retry` clears it and the new attempt uses whichever provider is selected when it starts.
+- Backend models per provider: master (evidence, reasoning, batch column mapping) Llama 4 Maverick or `openai/gpt-5-mini`; judge-tier fallback GLM-4.7-Flash or `openai/gpt-5-mini`. The Jev scoring gate is the same for both.
 
 ## Evaluation status values
 `queued`, `ingesting` (Drive fetch + extraction + transcription on AWS), `processing` (unused alias kept in the enum), `scoring` (local LangGraph), `completed`, `failed`, plus legacy `pending`, `in_progress`. `stage` (free text column) mirrors `progress.json.stage` or `scoring:<substep>`.

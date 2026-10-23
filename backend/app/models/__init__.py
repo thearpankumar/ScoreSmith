@@ -1,6 +1,7 @@
 """Import every model module so `Base.metadata` is fully populated (needed by Alembic
 autogenerate and by anything that calls `Base.metadata.create_all`)."""
 
+from app.models.app_setting import AppSetting
 from app.models.audit_log import AuditLog
 from app.models.auth import OAuthIdentity, PasswordResetToken, RefreshToken
 from app.models.base import Base
@@ -48,4 +49,5 @@ __all__ = [
     "ScorecardInvitation",
     "ScorecardActivity",
     "ChatShare",
+    "AppSetting",
 ]

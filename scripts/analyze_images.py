@@ -50,7 +50,8 @@ MODELS = [
     "qwen.qwen3-vl-235b-a22b",
     "us.meta.llama4-maverick-17b-instruct-v1:0",
 ]
-PROMPT = """You are analysing one image taken from a hackathon solution document or slide deck.
+PROMPT = """You are analysing one image taken from a document submitted for evaluation (a report, slide deck,
+solution document or similar).
 
 Reply in Markdown with exactly these sections:
 
@@ -61,6 +62,11 @@ separated by " | ". If there is no text, write "(none)".
 ## Description
 Say what kind of image this is (screenshot, architecture diagram, flow chart, chart/graph, table, photo, logo, other).
 Describe the key elements, how they connect or flow, and any numbers/values shown. Be factual and concise.
+
+## What it shows
+Explain what the image is about and what it represents or is trying to explain: the process, structure, comparison,
+trend or argument it conveys, what a reader should take away from it, and how it supports the document it was taken
+from. Base this strictly on what is visible in the image and do not invent details; if its purpose is unclear, say so.
 
 ## Summary
 One sentence."""
@@ -185,7 +191,7 @@ def analyse(client, models: list[str], data: bytes, fmt: str) -> tuple[str, str,
             r = client.converse(
                 modelId=model,
                 messages=[{"role": "user", "content": [{"image": {"format": fmt, "source": {"bytes": data}}}, {"text": PROMPT}]}],
-                inferenceConfig={"maxTokens": 3000, "temperature": 0},
+                inferenceConfig={"maxTokens": 4000, "temperature": 0},
             )
             text = "".join(b.get("text", "") for b in r["output"]["message"]["content"]).strip()
             if not text:

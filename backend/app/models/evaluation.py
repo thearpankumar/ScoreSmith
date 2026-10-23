@@ -93,6 +93,10 @@ class Evaluation(UUIDPKMixin, TimestampMixin, Base):
     # When a user last renamed the evaluation (migration 0017). The Excel export then labels it with this name rather
     # than the submitter's, and the AI pipeline never replaces it.
     renamed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The AI provider ("bedrock" | "openrouter") this evaluation's run started on (migration 0018). Set when the
+    # AWS stage starts; scoring uses the same provider while it stays available, so an admin switching providers
+    # mid-run does not move a running job. NULL = not started yet (or reset by a retry).
+    ai_provider: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     scorecard_version: Mapped[ScorecardVersion] = relationship("ScorecardVersion")
     evaluator: Mapped[User] = relationship("User", foreign_keys=[evaluated_by])

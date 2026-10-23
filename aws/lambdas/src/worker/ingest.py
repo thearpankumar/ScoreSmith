@@ -9,7 +9,7 @@ import os
 import shutil
 import tempfile
 
-from . import audio, scorecard_context
+from . import audio, run_config, scorecard_context
 from .drive import DriveClient, DriveError, classify
 from .errors import PipelineError
 from .progress import Progress
@@ -66,6 +66,13 @@ def run_ingest(event: dict, store, drive: DriveClient | None = None, probe_fn=au
     prog = Progress(store, eid)
     prog.set_stage("ingest", "Fetching and validating files")
     scorecard_context.save(store, eid, event.get("context"))  # read back by the image step
+    provider = run_config.save(store, eid, event.get("provider"))  # read back by the transcription and image steps
+    if provider == "openrouter":
+        from .openrouter_ops import openrouter_client
+
+        # Fail the run here, with a clear error, when the key is missing, unreadable, rejected or out of credit.
+        # Later, the per-image and per-chunk Catch states would quietly skip every item instead.
+        openrouter_client().check_key()
 
     files: list[dict] = []
     drive_entries: list[dict] = []

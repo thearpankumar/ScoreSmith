@@ -18,6 +18,10 @@ done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$(cd "$HERE/.." && pwd)/infra/.env"
 AWSCLI=(aws --profile "$PROFILE" --region "$REGION")
+# Git Bash / MSYS rewrites every argument that starts with "/" into a Windows path before aws.exe sees it
+# (/qs-eval/... -> C:/Program Files/Git/qs-eval/...). Exempt the SSM parameter and log-group names only; other
+# paths (docker build context, file:// work files) still convert. No effect outside MSYS.
+export MSYS2_ARG_CONV_EXCL="/${PREFIX}/;/aws/lambda/"
 run() {  # mutating; failures (already gone) are reported but do not stop the teardown
   if $DRY; then printf '  [plan] '; printf '%q ' "$@"; printf '\n'; return 0; fi
   "$@" >/dev/null 2>&1 && echo "  ok: $*" || echo "  (skipped, probably already gone): $*"
@@ -31,7 +35,8 @@ SM_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${PREFIX}-pipeline"
 echo "This will PERMANENTLY delete in account $ACCOUNT_ID ($REGION):"
 echo "  S3 bucket $BUCKET and ALL its objects, ECR repo ${PREFIX}-worker, 6 Lambda functions + log groups,"
 echo "  state machine ${PREFIX}-pipeline, IAM roles ${PREFIX}-lambda-role / ${PREFIX}-sfn-role, IAM user qs-backend-app (+keys),"
-echo "  budget ${PREFIX}-monthly, and the related lines in infra/.env."
+echo "  SSM parameter /${PREFIX}/openrouter-api-key, budget ${PREFIX}-monthly, and the related lines in infra/.env"
+echo "  (OPENROUTER_API_KEY stays there)."
 if ! $DRY && ! $YES; then
   read -r -p "Type the bucket name ($BUCKET) to continue: " answer
   [[ "$answer" == "$BUCKET" ]] || { echo "Aborted."; exit 1; }
@@ -44,6 +49,8 @@ for s in ingest extract-doc plan-audio transcribe-chunk analyze-image assemble; 
   awsr lambda delete-function --function-name "${PREFIX}-$s"
   awsr logs delete-log-group --log-group-name "/aws/lambda/${PREFIX}-$s"
 done
+echo "==> SSM parameter (OpenRouter key)"
+awsr ssm delete-parameter --name "/${PREFIX}/openrouter-api-key"
 echo "==> ECR"
 awsr ecr delete-repository --repository-name "${PREFIX}-worker" --force
 echo "==> S3 (empties the bucket first)"

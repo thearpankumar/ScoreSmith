@@ -22,6 +22,10 @@ x-backend-env: &backend-env
     # container is guaranteed to pick it up on `docker compose up` without relying
     # solely on env_file ordering/caching.
     OPENROUTER_JEV_API: ${OPENROUTER_JEV_API:-}
+    # OpenRouter as the AI provider (an admin picks Bedrock or OpenRouter in Settings; see app/ai/providers.py).
+    # A separate key from OPENROUTER_JEV_API: neither ever falls back to the other. Listed explicitly for the same
+    # reason as the Jev key above.
+    OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
     # Shared Bedrock / Jev / web-search limits across every api + worker container (fails open to the
     # per-process limits if Redis is down). Redis is on the compose network only - no host port.
     REDIS_URL: redis://redis:6379/0

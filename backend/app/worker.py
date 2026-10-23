@@ -30,6 +30,7 @@ if sys.platform == "win32":
 from sqlalchemy import text  # noqa: E402
 
 from app import metrics, trash  # noqa: E402
+from app.ai.providers import warn_legacy_env  # noqa: E402
 from app.ai.scorecard_builder import get_graph_manager  # noqa: E402
 from app.api.v1.chat import get_turn_runner  # noqa: E402
 from app.auth.bootstrap import ensure_env_admin_safe  # noqa: E402
@@ -132,6 +133,7 @@ async def run_worker() -> None:
     settings = get_settings()
     settings.validate_production_settings()  # a worker with default secrets must not boot in production either
     configure_logging()
+    warn_legacy_env()  # same one-time notice as the API lifespan (names only)
     await ensure_env_admin_safe()  # non-production only; idempotent and advisory-locked across replicas
     state = WorkerState()
     stop = asyncio.Event()

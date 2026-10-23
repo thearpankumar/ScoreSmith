@@ -70,7 +70,9 @@ from app.ai.bedrock_client import (
     ToolSpec,
 )
 from app.ai.draft_schema import MAX_HIERARCHY_LEVEL, KpiDraft, ScorecardDraft
+from app.ai.embedding_backfill import schedule_backfill
 from app.ai.jev_client import QUALITY_GATE_THRESHOLD, JevClientProtocol, QualityGateResult, quality_gate
+from app.ai.providers import models_of, provider_of
 from app.ai.request_routing import (
     extract_kpi_target,
     parse_structured_kpi_list,
@@ -1436,7 +1438,7 @@ def _assess_research_coverage(
     )
 
 
-# --- Bounded Bedrock concurrency -------------------------------------------------------------
+# --- Bounded LLM concurrency (per provider) ---------------------------------------------------
 #
 # The research fan-out (agents x continuation chunks x dedup judging) can put dozens of Converse
 # calls in flight for a 40+ KPI request. A process-wide semaphore (per event loop - an
@@ -1444,22 +1446,33 @@ def _assess_research_coverage(
 # caps that at `settings.bedrock_max_concurrency` to avoid Bedrock throttling. Bedrock's quota is
 # account-level, so with several worker processes the same cap is ALSO enforced cluster-wide through
 # Redis (`bedrock_global_concurrency`, default = the per-process cap); without Redis, or if it is down,
-# only the per-process cap applies.
+# only the per-process cap applies. OpenRouter has its own quota, so it gets its own semaphore
+# ("openrouter", `openrouter_max_concurrency` / `openrouter_global_concurrency`): a job still running
+# on one provider after an admin switch never eats the other provider's slots.
 
 
-def _bedrock_slots():
-    """Async context manager gating one Bedrock call (per-process cap + cluster-wide cap)."""
-    sem = get_semaphore(
-        "bedrock",
-        local_limit=lambda: get_settings().bedrock_max_concurrency,
-        global_limit=lambda: get_settings().bedrock_global_concurrency or get_settings().bedrock_max_concurrency,
-    )
+def _bedrock_slots(provider: str = "bedrock"):
+    """Async context manager gating one LLM call of `provider` (per-process cap + cluster-wide cap)."""
+    if provider == "openrouter":
+        sem = get_semaphore(
+            "openrouter",
+            local_limit=lambda: get_settings().openrouter_max_concurrency,
+            global_limit=lambda: (
+                get_settings().openrouter_global_concurrency or get_settings().openrouter_max_concurrency
+            ),
+        )
+    else:
+        sem = get_semaphore(
+            "bedrock",
+            local_limit=lambda: get_settings().bedrock_max_concurrency,
+            global_limit=lambda: get_settings().bedrock_global_concurrency or get_settings().bedrock_max_concurrency,
+        )
     return sem.slot()
 
 
 async def _converse_limited(bedrock: BedrockClientProtocol, **kwargs: Any) -> Any:
-    """`bedrock.converse(**kwargs)` on a worker thread, gated by the shared concurrency cap."""
-    async with _bedrock_slots():
+    """`bedrock.converse(**kwargs)` on a worker thread, gated by its provider's concurrency cap."""
+    async with _bedrock_slots(provider_of(bedrock)):
         return await asyncio.to_thread(bedrock.converse, **kwargs)
 
 
@@ -1638,7 +1651,7 @@ async def _judge_duplicate_pairs(
                 system="You decide whether two KPI names are the same measurement concept. Call the tool once.",
                 tools=[JUDGE_DUPLICATE_KPIS_TOOL],
                 force_tool_use=True,
-                model_id=get_settings().bedrock_judge_model_id,
+                model_id=models_of(bedrock).judge,
             )
             if not result.is_tool_use or result.tool_name != "judge_duplicate_kpis" or result.truncated:
                 return
@@ -3288,6 +3301,18 @@ def _needs_weighting_step(spec: UserSpec) -> bool:
     return len(_scored_leaves_missing_weight(spec)) >= 2
 
 
+_KPI_REF_RE = re.compile(r"""kpi\[(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\]""")
+_GATING_RE = re.compile(r"\b(?:min|max|sqrt)\s*\(|[<>]=?|==|!=|\*\*")
+
+
+def _is_gating_formula(formula: str) -> bool:
+    """Whether a model-proposed formula is actually non-compensatory (min/max, a comparison, a power or root), as
+    `_FORMULA_ALLOWED_RULE` requires. A plain average or weighted sum is not: it only replaces the proposed weights
+    (e.g. an equal-weight `avg(...)` silently cancels them), so the default weighted average is kept instead. KPI
+    names are blanked first, so a name such as "Min response time" cannot pass the check."""
+    return bool(_GATING_RE.search(_KPI_REF_RE.sub("K", formula)))
+
+
 def _formula_allowed(spec: UserSpec) -> bool:
     """A model-proposed formula is only ever applied in user_specified mode (in hybrid it would
     silently ignore the researched KPIs), and only if the user supplied neither a formula nor
@@ -3347,11 +3372,15 @@ def _propose_weighting(
     if not weights:
         return None
     formula = data.get("scoring_formula")
+    formula = formula.strip() if _formula_allowed(spec) and isinstance(formula, str) and formula.strip() else None
+    if formula and not _is_gating_formula(formula):
+        logger.info("Dropping a proposed scoring formula that does not gate (keeps the weighted average): %r", formula)
+        formula = None
     return {
         "weights": weights,
         "rationales": rationales,
         "approach": str(data.get("approach") or "").strip(),
-        "formula": formula.strip() if _formula_allowed(spec) and isinstance(formula, str) and formula.strip() else None,
+        "formula": formula,
         "formula_rationale": str(data.get("formula_rationale") or "").strip(),
     }
 
@@ -3467,7 +3496,7 @@ async def _fill_attempt(
     """One guideline-writing call under the shared Bedrock concurrency cap. A timeout or any
     other Bedrock failure yields `{}` (the caller then retries the missing KPIs smaller)."""
     try:
-        async with _bedrock_slots():
+        async with _bedrock_slots(provider_of(bedrock)):
             return await asyncio.to_thread(
                 _fill_user_kpi_details, bedrock, model_id, conversation_context, chunk, findings, proposed, proxy_retry
             )
@@ -4370,7 +4399,7 @@ def _header_call(bedrock: BedrockClientProtocol, message: str, kpi_names: list[s
         ),
         tools=[SET_SCORECARD_HEADER_TOOL],
         force_tool_use=True,
-        model_id=get_settings().bedrock_judge_model_id,
+        model_id=models_of(bedrock).judge,
     )
     if result.is_tool_use and result.tool_name == "set_scorecard_header":
         return _clean_header(result.tool_input or {})
@@ -5496,6 +5525,9 @@ async def check_similarity(state: BuilderState, config: RunnableConfig) -> dict[
             exc_info=True,
         )
         return {"similarity_checked": True}
+    # Versions embedded only with the other provider's model were invisible to this search: fill them in
+    # (background, debounced, a no-op for test fakes).
+    schedule_backfill(bedrock, reason="check_similarity")
 
     if not results:
         return {"similarity_checked": True}

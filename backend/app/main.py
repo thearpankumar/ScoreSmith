@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from app.ai.providers import warn_legacy_env
 from app.ai.scorecard_builder import get_graph_manager
 from app.api.v1.chat import get_turn_runner
 from app.api.v1.router import api_router
@@ -51,6 +52,8 @@ async def lifespan(_: FastAPI):
     # ROLE=api serves HTTP only: long jobs (evaluation drivers, background chat turns) are queued in Postgres
     # and run by `python -m app.worker` processes. ROLE=all (the default: local dev, tests) also runs them here.
     runs_jobs = settings.role != "api"
+    # Variables from an earlier OpenRouter prototype do nothing now; say so once (names only, never values).
+    warn_legacy_env()
     # Non-production only: create the ADMIN_EMAIL admin if missing (advisory-locked, so replicas can race safely).
     await ensure_env_admin_safe()
     runner = get_turn_runner()

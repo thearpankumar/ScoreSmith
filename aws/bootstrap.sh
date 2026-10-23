@@ -12,7 +12,8 @@
 #   --rotate-key           delete the existing qs-backend-app access key(s) and create a new one
 #
 # Everything uses `aws --profile arpan-aws --region us-east-1`. Secrets are written to git-ignored infra/.env and
-# never printed.
+# never printed. A non-empty OPENROUTER_API_KEY in infra/.env is stored as the SSM SecureString
+# /qs-eval/openrouter-api-key, which the Lambdas read for evaluations that run on OpenRouter.
 set -euo pipefail
 
 PROFILE="arpan-aws"
@@ -24,6 +25,7 @@ LAMBDA_ROLE="qs-eval-lambda-role"
 SFN_ROLE="qs-eval-sfn-role"
 APP_USER="qs-backend-app"
 BUDGET_NAME="qs-eval-monthly"
+SSM_PARAM="/${PREFIX}/openrouter-api-key"
 DRY=false
 CORS_ORIGIN=""
 BUDGET_EMAIL="arpankumar1119@gmail.com"
@@ -37,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     --email) BUDGET_EMAIL="${2:?--email needs a value}"; shift ;;
     --skip-image) SKIP_IMAGE=true ;;
     --rotate-key) ROTATE_KEY=true ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -47,6 +49,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 ENV_FILE="$REPO_ROOT/infra/.env"
 AWSCLI=(aws --profile "$PROFILE" --region "$REGION")
+# Git Bash / MSYS rewrites every argument that starts with "/" into a Windows path before aws.exe sees it
+# (/qs-eval/... -> C:/Program Files/Git/qs-eval/...). Exempt the SSM parameter and log-group names only; other
+# paths (docker build context, file:// work files) still convert. No effect outside MSYS.
+export MSYS2_ARG_CONV_EXCL="/${PREFIX}/;/aws/lambda/"
 WORK="$(mktemp -d)"
 # Git Bash / MSYS on Windows: aws.exe cannot open an MSYS path such as /tmp/tmp.x in a file:// argument ("Unable to
 # load paramfile"), so keep the work directory (every file:// target lives in it) in mixed form, C:/..., which both
@@ -99,6 +105,47 @@ render() {
       -e "s|\${BUDGET_EMAIL}|${BUDGET_EMAIL}|g" "$src" > "$dst"
   echo "$dst"
 }
+
+# Value of KEY in infra/.env; the last occurrence wins (as in docker compose), surrounding quotes and a trailing
+# " # comment" are dropped. Empty when absent. Callers must never print it.
+env_value() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  local line v
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=" "$ENV_FILE" | tail -n 1 | tr -d '\r')" || true
+  [[ -n "$line" ]] || return 0
+  v="${line#*=}"
+  v="${v#"${v%%[![:space:]]*}"}"
+  if [[ "$v" =~ ^\"([^\"]*)\" ]] || [[ "$v" =~ ^\'([^\']*)\' ]] || [[ "$v" =~ ^([^[:space:]]*) ]]; then v="${BASH_REMATCH[1]}"; fi
+  printf '%s' "$v"
+}
+
+# OPENROUTER_API_KEY from infra/.env -> SSM SecureString. The value goes through a private temp file (file://), so it
+# never appears on a command line, in the dry-run plan or in the output.
+sync_openrouter_key() {
+  local key f="$WORK/openrouter-key.txt"
+  key="$(env_value OPENROUTER_API_KEY)"
+  if [[ -n "$key" ]]; then
+    if $DRY; then
+      plan "${AWSCLI[*]} ssm put-parameter --name $SSM_PARAM --type SecureString --overwrite --value file://<temp file with OPENROUTER_API_KEY from $ENV_FILE>"
+    else
+      (umask 077; printf '%s' "$key" > "$f")
+      "${AWSCLI[@]}" ssm put-parameter --name "$SSM_PARAM" --type SecureString --overwrite --value "file://$f" \
+        --description "OpenRouter API key for the $PREFIX pipeline Lambdas" >/dev/null
+      rm -f "$f"
+      echo "  stored OPENROUTER_API_KEY from $ENV_FILE in $SSM_PARAM (value not printed)"
+    fi
+  elif check ssm get-parameter --name "$SSM_PARAM"; then
+    echo "  no OPENROUTER_API_KEY in $ENV_FILE; keeping the key already stored in $SSM_PARAM"
+  else
+    echo "  NOTE: no OPENROUTER_API_KEY in $ENV_FILE and $SSM_PARAM does not exist. Evaluations that use OpenRouter"
+    echo "        fail fast (at ingest) until it is set: add the key to $ENV_FILE and re-run this script."
+  fi
+  key=""
+}
+
+# Function environment, applied on create AND update: the SSM parameter name only, never the key itself.
+LAMBDA_ENV="$WORK/lambda-env.json"
+printf '{"Variables":{"LOG_LEVEL":"INFO","OPENROUTER_SECRET_PARAM":"%s"}}\n' "$SSM_PARAM" > "$LAMBDA_ENV"
 
 # ------------------------------------------------------------------ 1. S3
 say "S3 bucket $BUCKET"
@@ -154,7 +201,11 @@ else
   run docker push "${REPO_URI}:latest"
 fi
 
-# ------------------------------------------------------------------ 3. IAM roles
+# ------------------------------------------------------------------ 3. OpenRouter key (SSM)
+say "OpenRouter API key -> SSM SecureString $SSM_PARAM"
+sync_openrouter_key
+
+# ------------------------------------------------------------------ 4. IAM roles
 ensure_role() { # name trust-file policy-name policy-file description
   local name="$1" trust="$2" pname="$3" pfile="$4" desc="$5"
   if check iam get-role --role-name "$name"; then
@@ -169,7 +220,7 @@ ensure_role() { # name trust-file policy-name policy-file description
 }
 say "IAM role $LAMBDA_ROLE"
 ensure_role "$LAMBDA_ROLE" "$(render "$HERE/policies/lambda-trust.json")" qs-eval-lambda-inline \
-  "$(render "$HERE/policies/lambda-role-policy.json")" "qs-eval Lambda execution role (S3 prefixes, Bedrock models, logs)"
+  "$(render "$HERE/policies/lambda-role-policy.json")" "qs-eval Lambda execution role (S3 prefixes, Bedrock models, OpenRouter key parameter, logs)"
 NEW_ROLES=$ROLE_CREATED
 say "IAM role $SFN_ROLE"
 ensure_role "$SFN_ROLE" "$(render "$HERE/policies/sfn-trust.json")" qs-eval-sfn-inline \
@@ -180,7 +231,7 @@ if [[ "$NEW_ROLES" == true ]]; then
   $DRY && plan "sleep 15" || sleep 15
 fi
 
-# ------------------------------------------------------------------ 4. Lambda functions
+# ------------------------------------------------------------------ 5. Lambda functions
 # name | handler | memory MB | ephemeral MB | reserved concurrency
 FUNCTIONS=(
   "ingest|worker.handlers.ingest|3008|10240|3"
@@ -211,9 +262,9 @@ for spec in "${FUNCTIONS[@]}"; do
 
   img_cfg="{\"Command\":[\"${handler}\"]}"
   if check lambda get-function --function-name "$fn"; then
-    echo "  function $fn exists (updating configuration + code)"
+    echo "  function $fn exists (updating configuration + environment + code)"
     aws_run lambda update-function-configuration --function-name "$fn" --role "$LAMBDA_ROLE_ARN" --timeout 900 \
-      --memory-size "$mem" --ephemeral-storage "Size=$eph" --image-config "$img_cfg"
+      --memory-size "$mem" --ephemeral-storage "Size=$eph" --image-config "$img_cfg" --environment "file://$LAMBDA_ENV"
     wait_fn function-updated-v2 "$fn"
     aws_run lambda update-function-code --function-name "$fn" --image-uri "$IMAGE_URI"
     wait_fn function-updated-v2 "$fn"
@@ -223,13 +274,13 @@ for spec in "${FUNCTIONS[@]}"; do
       if $DRY; then
         aws_run lambda create-function --function-name "$fn" --package-type Image --code "ImageUri=$IMAGE_URI" \
           --role "$LAMBDA_ROLE_ARN" --timeout 900 --memory-size "$mem" --ephemeral-storage "Size=$eph" \
-          --architectures x86_64 --image-config "$img_cfg" --environment "Variables={LOG_LEVEL=INFO}" \
+          --architectures x86_64 --image-config "$img_cfg" --environment "file://$LAMBDA_ENV" \
           --description "qs-eval pipeline: $short"
         created=true; break
       fi
       if "${AWSCLI[@]}" lambda create-function --function-name "$fn" --package-type Image --code "ImageUri=$IMAGE_URI" \
           --role "$LAMBDA_ROLE_ARN" --timeout 900 --memory-size "$mem" --ephemeral-storage "Size=$eph" \
-          --architectures x86_64 --image-config "$img_cfg" --environment "Variables={LOG_LEVEL=INFO}" \
+          --architectures x86_64 --image-config "$img_cfg" --environment "file://$LAMBDA_ENV" \
           --description "qs-eval pipeline: $short" >/dev/null; then
         created=true; break
       fi
@@ -251,7 +302,7 @@ else
   echo "  SKIPPED: unreserved concurrency is $UNRESERVED, need >= $((TOTAL_RESERVED + 100)). Request a Lambda concurrency quota increase, then re-run."
 fi
 
-# ------------------------------------------------------------------ 5. State machine
+# ------------------------------------------------------------------ 6. State machine
 say "Step Functions state machine $STATE_MACHINE"
 ASL="$WORK/statemachine.asl.json"
 sed -e "s|\${IngestFnArn}|$(fn_arn ingest)|g" -e "s|\${ExtractDocFnArn}|$(fn_arn extract-doc)|g" \
@@ -264,7 +315,7 @@ else
   aws_run stepfunctions create-state-machine --name "$STATE_MACHINE" --type STANDARD --definition "file://$ASL" --role-arn "$SFN_ROLE_ARN"
 fi
 
-# ------------------------------------------------------------------ 6. Backend IAM user + key
+# ------------------------------------------------------------------ 7. Backend IAM user + key
 say "IAM user $APP_USER"
 if check iam get-user --user-name "$APP_USER"; then
   echo "  user exists"
@@ -315,7 +366,7 @@ else
   fi
 fi
 
-# ------------------------------------------------------------------ 7. Budget
+# ------------------------------------------------------------------ 8. Budget
 say "AWS Budget $BUDGET_NAME (\$25/month, alerts to $BUDGET_EMAIL)"
 if check budgets describe-budget --account-id "$ACCOUNT_ID" --budget-name "$BUDGET_NAME"; then
   echo "  budget exists"
@@ -330,5 +381,6 @@ if $DRY; then
 else
   echo "Bucket:        $BUCKET"
   echo "State machine: $SM_ARN"
+  echo "SSM parameter: $SSM_PARAM (OpenRouter key, read only by evaluations that run on OpenRouter)"
   echo "Credentials and ids are in infra/.env. Update code later with aws/deploy-lambdas.sh."
 fi

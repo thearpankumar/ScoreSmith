@@ -7,29 +7,22 @@ import uuid
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.bedrock_client import BedrockClient, BedrockClientProtocol
+from app.ai import providers
+from app.ai.bedrock_client import BedrockClientProtocol
 from app.ai.jev_client import JevClient, JevClientProtocol
-from app.ai.web_search import AgentCoreWebSearchClient, WebSearchClientProtocol
+from app.ai.web_search import WebSearchClientProtocol, web_search_for
 from app.auth.security import SAFE_METHODS, decode_access_token, extract_access_token, verify_csrf
 from app.db import get_db
 from app.models.user import ROLE_ADMIN, User
 from app.pipeline.aws_jobs import AwsJobsProtocol, Boto3AwsJobs
 from app.pipeline.jev_scorer import JevScoreClient, JevScoreClientProtocol
 
-# Single process-lifetime BedrockClient. Construction is cheap/lazy (see
-# app/ai/bedrock_client.py — the boto3 client itself is only created on first real call),
-# so a module-level singleton is safe to share across requests.
-_bedrock_client: BedrockClientProtocol = BedrockClient()
-
-# Single process-lifetime AgentCoreWebSearchClient, mirroring _bedrock_client above.
-# Construction is cheap/lazy too — it only reads config; no network/HTTP client is
-# created until the first real .search() call (see app/ai/web_search.py). Safe (and
-# correct) to construct even when the AGENTCORE_GATEWAY_* settings are unset: `.search()`
-# then just returns [] rather than failing the chat turn.
-_web_search_client: WebSearchClientProtocol = AgentCoreWebSearchClient()
+# The LLM clients (one per AI provider: Bedrock / OpenRouter) and the web-search clients are process singletons
+# owned by app/ai/providers.py and app/ai/web_search.py; which one a request gets depends on the provider an admin
+# chose in Settings (see get_bedrock_client below).
 
 # Single process-lifetime JevClient (OpenRouter-backed quality gate — see
-# app/ai/jev_client.py), mirroring _bedrock_client/_web_search_client above. Cheap/lazy
+# app/ai/jev_client.py; its own OPENROUTER_JEV_API key, never OPENROUTER_API_KEY). Cheap/lazy
 # too — nothing is created until the first real `.rate_match()` call, and it's safe to
 # construct even when OPENROUTER_JEV_API is unset: `quality_gate()` then just degrades
 # every checkpoint to "passed" rather than failing a chat turn.
@@ -51,18 +44,22 @@ def get_jev_score_client() -> JevScoreClientProtocol:
     return _jev_score_client
 
 
-def get_bedrock_client() -> BedrockClientProtocol:
-    """FastAPI dependency for the AI routers (app/api/v1/chat.py, scorecards.py's
-    suggest-similar, evaluations.py's run). Overridden in tests with a `FakeBedrockClient`
-    via `app.dependency_overrides` — see tests/conftest.py."""
-    return _bedrock_client
+async def get_bedrock_client() -> BedrockClientProtocol:
+    """FastAPI dependency for the AI routers (app/api/v1/chat.py, scorecards.py's suggest-similar,
+    evaluations.py's run): the LLM client of the ACTIVE AI provider (Bedrock or OpenRouter, chosen by an admin -
+    see app/ai/providers.py). Never raises. The name is kept for the tests, which override it with a
+    `FakeBedrockClient` via `app.dependency_overrides` - see tests/conftest.py."""
+    return await providers.active_client()
 
 
-def get_web_search_client() -> WebSearchClientProtocol:
+async def get_web_search_client(
+    llm: BedrockClientProtocol = Depends(get_bedrock_client),
+) -> WebSearchClientProtocol:
     """FastAPI dependency for app/api/v1/chat.py's chat-builder endpoints, letting
-    `propose_kpis` offer the model a real web_search tool. Overridden in tests with a
+    `propose_kpis` offer the model a real web_search tool: AgentCore when configured, else OpenRouter's search
+    when the request's LLM is OpenRouter (see app/ai/web_search.py::web_search_for). Overridden in tests with a
     `FakeWebSearchClient` via `app.dependency_overrides` — see tests/conftest.py."""
-    return _web_search_client
+    return web_search_for(providers.provider_of(llm))
 
 
 def get_jev_client() -> JevClientProtocol:

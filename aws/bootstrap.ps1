@@ -7,7 +7,8 @@
   .\aws\bootstrap.ps1                  create / update everything
 
   Everything uses `aws --profile arpan-aws --region us-east-1`. Secrets are written to git-ignored infra/.env and
-  never printed.
+  never printed. A non-empty OPENROUTER_API_KEY in infra/.env is stored as the SSM SecureString
+  /qs-eval/openrouter-api-key, which the Lambdas read for evaluations that run on OpenRouter.
 
 .PARAMETER WhatIf
   Print planned commands only (no AWS calls at all, not even read-only ones). Alias: -DryRun.
@@ -39,6 +40,7 @@ $LambdaRole = 'qs-eval-lambda-role'
 $SfnRole = 'qs-eval-sfn-role'
 $AppUser = 'qs-backend-app'
 $BudgetName = 'qs-eval-monthly'
+$SsmParam = "/$Prefix/openrouter-api-key"
 $Dry = [bool]$WhatIf
 
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -105,6 +107,49 @@ function Render([string]$Src, [hashtable]$Extra = @{}) {
   return $dst
 }
 
+# Value of $Key in infra/.env; the last occurrence wins (as in docker compose), surrounding quotes and a trailing
+# ' # comment' are dropped. Empty when absent. Callers must never print it.
+function Get-EnvFileValue([string]$Key) {
+  if (-not (Test-Path $EnvFile)) { return '' }
+  $line = Get-Content $EnvFile | Where-Object { $_ -match "^\s*(export\s+)?$([regex]::Escape($Key))\s*=" } | Select-Object -Last 1
+  if (-not $line) { return '' }
+  $v = ($line -replace '^[^=]*=', '').Trim()
+  if ($v -match '^"([^"]*)"' -or $v -match "^'([^']*)'" -or $v -match '^(\S*)') { return $Matches[1] }
+  return ''
+}
+
+# OPENROUTER_API_KEY from infra/.env -> SSM SecureString. The value goes through a private temp file (file://), so it
+# never appears on a command line, in the dry-run plan or in the output.
+function Sync-OpenRouterKey {
+  $key = Get-EnvFileValue 'OPENROUTER_API_KEY'
+  if ($key) {
+    if ($Dry) {
+      Plan "aws $($AwsBase -join ' ') ssm put-parameter --name $SsmParam --type SecureString --overwrite --value file://<temp file with OPENROUTER_API_KEY from $EnvFile>"
+    } else {
+      $keyFile = Join-Path $Work 'openrouter-key.txt'
+      [System.IO.File]::WriteAllText($keyFile, $key, $Utf8)
+      try {
+        & aws @AwsBase ssm put-parameter --name $SsmParam --type SecureString --overwrite --value (FileUrl $keyFile) --description "OpenRouter API key for the $Prefix pipeline Lambdas" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "aws ssm put-parameter failed (exit $LASTEXITCODE)" }
+      } finally {
+        Remove-Item -Force $keyFile -ErrorAction SilentlyContinue
+      }
+      Write-Host "  stored OPENROUTER_API_KEY from $EnvFile in $SsmParam (value not printed)"
+    }
+  } elseif (Test-Aws ssm get-parameter --name $SsmParam) {
+    Write-Host "  no OPENROUTER_API_KEY in $EnvFile; keeping the key already stored in $SsmParam"
+  } else {
+    Write-Host "  NOTE: no OPENROUTER_API_KEY in $EnvFile and $SsmParam does not exist. Evaluations that use OpenRouter"
+    Write-Host "        fail fast (at ingest) until it is set: add the key to $EnvFile and re-run this script."
+  }
+  $key = $null
+}
+
+# Function environment, applied on create AND update: the SSM parameter name only, never the key itself.
+$LambdaEnvFile = Join-Path $Work 'lambda-env.json'
+[System.IO.File]::WriteAllText($LambdaEnvFile, (@{ Variables = [ordered]@{ LOG_LEVEL = 'INFO'; OPENROUTER_SECRET_PARAM = $SsmParam } } | ConvertTo-Json -Compress), $Utf8)
+$LambdaEnv = FileUrl $LambdaEnvFile
+
 try {
   # ---------------------------------------------------------------- 1. S3
   Say "S3 bucket $Bucket"
@@ -158,7 +203,11 @@ try {
     }
   }
 
-  # ---------------------------------------------------------------- 3. IAM roles
+  # ---------------------------------------------------------------- 3. OpenRouter key (SSM)
+  Say "OpenRouter API key -> SSM SecureString $SsmParam"
+  Sync-OpenRouterKey
+
+  # ---------------------------------------------------------------- 4. IAM roles
   function Ensure-Role([string]$Name, [string]$Trust, [string]$PolicyName, [string]$PolicyFile, [string]$Desc) {
     $created = $false
     if (Test-Aws iam get-role --role-name $Name) {
@@ -172,7 +221,7 @@ try {
     return $created
   }
   Say "IAM role $LambdaRole"
-  $c1 = Ensure-Role $LambdaRole (Render "$Here/policies/lambda-trust.json") 'qs-eval-lambda-inline' (Render "$Here/policies/lambda-role-policy.json") 'qs-eval Lambda execution role (S3 prefixes, Bedrock models, logs)'
+  $c1 = Ensure-Role $LambdaRole (Render "$Here/policies/lambda-trust.json") 'qs-eval-lambda-inline' (Render "$Here/policies/lambda-role-policy.json") 'qs-eval Lambda execution role (S3 prefixes, Bedrock models, OpenRouter key parameter, logs)'
   Say "IAM role $SfnRole"
   $c2 = Ensure-Role $SfnRole (Render "$Here/policies/sfn-trust.json") 'qs-eval-sfn-inline' (Render "$Here/policies/sfn-role-policy.json") 'qs-eval Step Functions role (invoke the six functions only)'
   if ($c1 -or $c2) {
@@ -180,7 +229,7 @@ try {
     if ($Dry) { Plan 'Start-Sleep 15' } else { Start-Sleep 15 }
   }
 
-  # ---------------------------------------------------------------- 4. Lambda functions
+  # ---------------------------------------------------------------- 5. Lambda functions
   # name | handler | memory MB | ephemeral MB | reserved concurrency
   $Functions = @(
     @('ingest', 'worker.handlers.ingest', 3008, 10240, 3),
@@ -211,8 +260,8 @@ try {
     [System.IO.File]::WriteAllText($imgCfgFile, "{`"Command`":[`"$handler`"]}", $Utf8)
     $imgCfg = FileUrl $imgCfgFile
     if (Test-Aws lambda get-function --function-name $fn) {
-      Write-Host "  function $fn exists (updating configuration + code)"
-      Invoke-AwsMut lambda update-function-configuration --function-name $fn --role $LambdaRoleArn --timeout 900 --memory-size $mem --ephemeral-storage "Size=$eph" --image-config $imgCfg
+      Write-Host "  function $fn exists (updating configuration + environment + code)"
+      Invoke-AwsMut lambda update-function-configuration --function-name $fn --role $LambdaRoleArn --timeout 900 --memory-size $mem --ephemeral-storage "Size=$eph" --image-config $imgCfg --environment $LambdaEnv
       Wait-Fn 'function-updated-v2' $fn
       Invoke-AwsMut lambda update-function-code --function-name $fn --image-uri $ImageUri
       Wait-Fn 'function-updated-v2' $fn
@@ -220,7 +269,7 @@ try {
       $created = $false
       for ($attempt = 1; $attempt -le 4 -and -not $created; $attempt++) {
         try {
-          Invoke-AwsMut lambda create-function --function-name $fn --package-type Image --code "ImageUri=$ImageUri" --role $LambdaRoleArn --timeout 900 --memory-size $mem --ephemeral-storage "Size=$eph" --architectures x86_64 --image-config $imgCfg --environment 'Variables={LOG_LEVEL=INFO}' --description "qs-eval pipeline: $short"
+          Invoke-AwsMut lambda create-function --function-name $fn --package-type Image --code "ImageUri=$ImageUri" --role $LambdaRoleArn --timeout 900 --memory-size $mem --ephemeral-storage "Size=$eph" --architectures x86_64 --image-config $imgCfg --environment $LambdaEnv --description "qs-eval pipeline: $short"
           $created = $true
         } catch {
           Write-Host "  create-function failed (IAM propagation?); retrying in 10s ($attempt/4)"
@@ -242,7 +291,7 @@ try {
     Write-Host "  SKIPPED: unreserved concurrency is $Unreserved, need >= $($TotalReserved + 100). Request a Lambda concurrency quota increase, then re-run."
   }
 
-  # ---------------------------------------------------------------- 5. State machine
+  # ---------------------------------------------------------------- 6. State machine
   Say "Step Functions state machine $StateMachine"
   $asl = [System.IO.File]::ReadAllText("$Here/statemachine.asl.json")
   foreach ($pair in @(@('IngestFnArn', 'ingest'), @('ExtractDocFnArn', 'extract-doc'), @('PlanAudioFnArn', 'plan-audio'),
@@ -257,7 +306,7 @@ try {
     Invoke-AwsMut stepfunctions create-state-machine --name $StateMachine --type STANDARD --definition (FileUrl $AslFile) --role-arn $SfnRoleArn
   }
 
-  # ---------------------------------------------------------------- 6. Backend IAM user + key
+  # ---------------------------------------------------------------- 7. Backend IAM user + key
   Say "IAM user $AppUser"
   if (Test-Aws iam get-user --user-name $AppUser) { Write-Host '  user exists' } else { Invoke-AwsMut iam create-user --user-name $AppUser }
   Invoke-AwsMut iam put-user-policy --user-name $AppUser --policy-name 'qs-backend-app-inline' --policy-document (FileUrl (Render "$Here/policies/backend-user-policy.json"))
@@ -303,7 +352,7 @@ try {
     }
   }
 
-  # ---------------------------------------------------------------- 7. Budget
+  # ---------------------------------------------------------------- 8. Budget
   Say "AWS Budget $BudgetName (`$25/month, alerts to $Email)"
   if (Test-Aws budgets describe-budget --account-id $AccountId --budget-name $BudgetName) {
     Write-Host '  budget exists'
@@ -317,6 +366,7 @@ try {
   } else {
     Write-Host "Bucket:        $Bucket"
     Write-Host "State machine: $SmArn"
+    Write-Host "SSM parameter: $SsmParam (OpenRouter key, read only by evaluations that run on OpenRouter)"
     Write-Host 'Credentials and ids are in infra/.env. Update code later with aws/deploy-lambdas.ps1.'
   }
 } finally {

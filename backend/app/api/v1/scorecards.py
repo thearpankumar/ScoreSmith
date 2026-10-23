@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from app.activity import log_edit
 from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
+from app.ai.embedding_backfill import schedule_backfill
 from app.ai.scoring_formula import validate as validate_scoring_formula_expr
 from app.ai.similarity import SIMILARITY_THRESHOLD, SimilarScorecardResult, find_similar_scorecards
 from app.api.v1.sharing import leave_chart
@@ -69,15 +70,20 @@ async def suggest_similar_scorecards(
     current_user: User = Depends(get_current_user),
 ) -> list[SimilarScorecardResult]:
     """Free-text query -> ranked existing scorecards worth reusing/adapting (the "suggest
-    similar scorecard" feature from the plan). Embeds `query` with Titan, then runs a
-    pgvector cosine-similarity search over `scorecard_embeddings`."""
+    similar scorecard" feature from the plan). Embeds `query` with the active provider's
+    embedding model, then runs a pgvector cosine-similarity search over the
+    `scorecard_embeddings` rows of that same model."""
     try:
-        return await find_similar_scorecards(
+        results = await find_similar_scorecards(
             db, bedrock, payload.query, top_n=payload.top_n, threshold=payload.threshold,
             owner_id=current_user.id,
         )
     except BedrockUnavailableError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    # Versions embedded only with the other provider's model are invisible to this search: fill them in
+    # (background, debounced, a no-op for test fakes) so later searches see them.
+    schedule_backfill(bedrock, reason="suggest-similar")
+    return results
 
 
 class ValidateFormulaDraftRequest(BaseModel):

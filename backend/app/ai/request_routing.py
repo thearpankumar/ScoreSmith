@@ -16,8 +16,9 @@ main model, so this module can only ever REMOVE work, never change an answer):
      probability per option plus a confidence, in roughly 70-500 ms, which makes it a
      better fit for this job than for the instruction/answer scoring it was first used
      for. Only a CONFIDENT answer is used.
-   - the small Bedrock judge model (`settings.bedrock_judge_model_id`, GLM-4.7-Flash) with
-     a forced single-tool enum answer, when Jev is unconfigured, fails or is unsure.
+   - the client's small judge-tier model (`models_of(bedrock).judge`: GLM-4.7-Flash on Bedrock,
+     gpt-5-mini on OpenRouter) with a forced single-tool enum answer, when Jev is
+     unconfigured, fails or is unsure.
 3. Only when the router answers `open_ended` with confidence does the caller skip the main
    model; `user_specified`, `hybrid`, `unsure`, any failure, and any strong structural
    list evidence (2+ bullet lines) all fall through to the full extraction. The harmful
@@ -39,6 +40,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.ai.bedrock_client import BedrockClientProtocol, ToolSpec
+from app.ai.providers import models_of
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -238,7 +240,7 @@ async def route_request(
                 system=_ROUTE_SYSTEM_PROMPT,
                 tools=[ROUTE_REQUEST_TOOL],
                 force_tool_use=True,
-                model_id=get_settings().bedrock_judge_model_id,
+                model_id=models_of(bedrock).judge,
             )
             if result.is_tool_use and result.tool_name == "route_request" and not result.truncated:
                 mode = str((result.tool_input or {}).get("mode") or "")

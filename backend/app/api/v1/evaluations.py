@@ -14,9 +14,9 @@ from app import idempotency as idem
 from app.activity import log_edit
 from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
 from app.ai.judge import compute_final_score, effective_leaf_weights, leaf_nodes, run_judge
+from app.ai.providers import models_of
 from app.audit import audit
 from app.authz import accessible_evaluations, get_accessible_evaluation, get_accessible_version
-from app.config import get_settings
 from app.db import get_db
 from app.deps import get_bedrock_client, get_current_user
 from app.models.enums import AuditAction, EvaluationStatus, rag_band_for_score
@@ -62,11 +62,8 @@ async def run_evaluation(
     evaluation.input_reference = {**(evaluation.input_reference or {}), "text": payload.input_text}
     await db.flush()
 
-    settings = get_settings()
     try:
-        await run_judge(
-            db, evaluation, payload.input_text, bedrock, judge_model_id=settings.bedrock_judge_model_id
-        )
+        await run_judge(db, evaluation, payload.input_text, bedrock, judge_model_id=models_of(bedrock).judge)
     except BedrockUnavailableError as exc:
         evaluation.status = EvaluationStatus.FAILED
         await db.commit()

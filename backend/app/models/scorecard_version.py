@@ -42,9 +42,9 @@ class ScorecardVersion(UUIDPKMixin, TimestampMixin, Base):
     kpi_nodes: Mapped[list[KpiNode]] = relationship(
         "KpiNode", back_populates="scorecard_version", cascade="all, delete-orphan"
     )
-    embedding: Mapped[ScorecardEmbedding | None] = relationship(
-        "ScorecardEmbedding", back_populates="scorecard_version", cascade="all, delete-orphan",
-        uselist=False,
+    # One similarity vector per embedding model (see ScorecardEmbedding).
+    embeddings: Mapped[list[ScorecardEmbedding]] = relationship(
+        "ScorecardEmbedding", back_populates="scorecard_version", cascade="all, delete-orphan"
     )
 
     def __repr__(self) -> str:  # pragma: no cover
