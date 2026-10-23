@@ -42,7 +42,7 @@ def normalize_key(raw: str | None) -> str | None:
         return None
     if len(key) > MAX_KEY_LENGTH:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Idempotency-Key is longer than {MAX_KEY_LENGTH} characters."
+            status.HTTP_422_UNPROCESSABLE_CONTENT, detail=f"Idempotency-Key is longer than {MAX_KEY_LENGTH} characters."
         )
     return key
 
@@ -73,7 +73,7 @@ async def begin(
     stored_hash, result = row
     if stored_hash != request_hash:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="This Idempotency-Key was already used with a different request.",
         )
     if result is None:

@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import uuid
-from io import BytesIO
 
 import pytest
-from openpyxl import load_workbook
 
 from app.reporting import palette as P
 from app.reporting.export_data import EvidenceItem, ExportBundle, normalize_evidence
 from app.reporting.insights import compute_insights
 from app.reporting.workbook import ExportOptions, build_workbook
-from tests.reporting_fixtures import make_bundle, make_eval, make_version
+from tests.reporting_fixtures import load_export, make_bundle, make_eval, make_version
 
 EVIL = ['=HYPERLINK("http://evil","x")', "+cmd|' /C calc'!A0", "@SUM(1+1)", "-2+3"]
 
@@ -20,7 +18,7 @@ EVIL = ['=HYPERLINK("http://evil","x")', "+cmd|' /C calc'!A0", "@SUM(1+1)", "-2+
 def _open(bundle: ExportBundle, **opts):
     data = build_workbook(bundle, ExportOptions(generated_by="Tester", **opts))
     assert data[:2] == b"PK"
-    return load_workbook(BytesIO(data))
+    return load_export(data)
 
 
 def _texts(ws) -> list[str]:
@@ -276,7 +274,7 @@ def test_endpoint_with_stubbed_loader(monkeypatch) -> None:
         assert resp.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         assert resp.headers["x-export-count"] == "6" and resp.headers["x-export-skipped"] == "1"
         assert 'filename="evaluations_Interview-Scorecard_' in resp.headers["content-disposition"]
-        wb = load_workbook(BytesIO(resp.content))
+        wb = load_export(resp.content)
         assert wb.sheetnames[0] == "Summary" and "Status: Completed" in " ".join(_texts(wb["Summary"]))
         # an export of evaluations that all lack a score is rejected
         for e in bundle.evaluations:

@@ -8,7 +8,7 @@ import re
 import uuid
 
 import pytest
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, iter_route_contexts
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -88,8 +88,9 @@ def _template(path: str) -> str:
 
 def _routes() -> list[tuple[str, str]]:
     found = []
-    for r in app.routes:
-        if isinstance(r, APIRoute) and r.path.startswith("/api/v1"):
+    # `app.routes` keeps included routers as nodes of a tree (FastAPI 0.137+): walk the effective, prefixed routes.
+    for r in iter_route_contexts(app.routes):
+        if isinstance(r.route, APIRoute) and r.path.startswith("/api/v1"):
             for m in sorted(r.methods - {"HEAD", "OPTIONS"}):
                 found.append((m, r.path))
     return found

@@ -164,7 +164,7 @@ async def share_chat(
     if payload.with_chart:
         if session.target_scorecard_id is None:
             raise _err(
-                status.HTTP_422_UNPROCESSABLE_ENTITY, "no_chart_yet",
+                status.HTTP_422_UNPROCESSABLE_CONTENT, "no_chart_yet",
                 "This chat has no saved chart yet. Save the chart first, or share the chat only.",
             )
         scorecard = await get_accessible_scorecard(db, user, session.target_scorecard_id)
@@ -173,9 +173,9 @@ async def share_chat(
     if target is None:
         raise _err(status.HTTP_404_NOT_FOUND, "user_not_found", "No active user matches that username or email.")
     if target.id == user.id:
-        raise _err(status.HTTP_422_UNPROCESSABLE_ENTITY, "self_invite", "That is you - you already have this chat.")
+        raise _err(status.HTTP_422_UNPROCESSABLE_CONTENT, "self_invite", "That is you - you already have this chat.")
     if target.id == session.user_id:
-        raise _err(status.HTTP_422_UNPROCESSABLE_ENTITY, "is_owner", "That person owns this chat.")
+        raise _err(status.HTTP_422_UNPROCESSABLE_CONTENT, "is_owner", "That person owns this chat.")
 
     share = (
         await db.execute(
@@ -361,12 +361,12 @@ async def save_shared_chat_as_my_chart(
         return {"scorecard_id": str(share.saved_scorecard_id), "already_saved": True}
     turn = await get_session_state(str(session_id))
     if turn is None or not turn.draft:
-        raise _err(status.HTTP_422_UNPROCESSABLE_ENTITY, "no_draft", "This chat has no KPIs to save yet.")
+        raise _err(status.HTTP_422_UNPROCESSABLE_CONTENT, "no_draft", "This chat has no KPIs to save yet.")
     try:
         draft = ScorecardDraft.model_validate(turn.draft)
         scorecard, _version = await materialize_draft(db, draft, owner_id=user.id)
     except ValueError as exc:
-        raise _err(status.HTTP_422_UNPROCESSABLE_ENTITY, "draft_incomplete", str(exc)) from exc
+        raise _err(status.HTTP_422_UNPROCESSABLE_CONTENT, "draft_incomplete", str(exc)) from exc
     share.saved_scorecard_id = scorecard.id
     audit(db, request, actor_id=user.id, entity_type="scorecard", entity_id=scorecard.id, action=AuditAction.CREATE,
           event="saved_from_shared_chat", diff={"session_id": str(session_id)})

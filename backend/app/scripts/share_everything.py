@@ -17,7 +17,7 @@ import argparse
 import asyncio
 import sys
 
-if sys.platform == "win32":
+if sys.platform == "win32" and not isinstance(asyncio.get_event_loop_policy(), asyncio.WindowsSelectorEventLoopPolicy):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from sqlalchemy import select  # noqa: E402

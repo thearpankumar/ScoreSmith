@@ -18,7 +18,7 @@ from openpyxl.utils import get_column_letter
 
 from app.reporting.export_data import EvidenceItem, ExportBundle
 from app.reporting.workbook import ExportOptions, build_workbook
-from tests.reporting_fixtures import DEFAULT_LEAVES, make_bundle, make_eval, make_version
+from tests.reporting_fixtures import DEFAULT_LEAVES, load_export, make_bundle, make_eval, make_version
 
 PX_PER_UNIT = 7.0  # Calibri 11 digit width
 AVG_CHAR_PX = 6.3  # average mixed-text glyph at 11pt (conservative: real Calibri is ~5.8)
@@ -325,7 +325,7 @@ OPTION_SETS = {
 def test_workbook_layout_has_no_defects(shape: str, opts: str) -> None:
     bundle = shape_bundles()[shape]
     data = build_workbook(bundle, OPTION_SETS[opts])
-    wb = load_workbook(BytesIO(data))
+    wb = load_export(data)
     problems: list[str] = []
     for ws in wb.worksheets:
         problems += check_sheet(ws)
@@ -351,7 +351,7 @@ def test_checker_detects_a_planted_chart_overlap() -> None:
 
 def test_student_sheet_per_exported_student_and_evidence_never_lost() -> None:
     bundle = shape_bundles()["evidence_stress"]
-    wb = load_workbook(BytesIO(build_workbook(bundle, ExportOptions(include_reasoning=True))))
+    wb = load_export(build_workbook(bundle, ExportOptions(include_reasoning=True)))
     students = [n for n in wb.sheetnames if n[:2].isdigit()]
     assert len(students) == 3
     ws = wb[students[0]]

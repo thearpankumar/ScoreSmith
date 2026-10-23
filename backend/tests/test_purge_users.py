@@ -3,7 +3,6 @@ accounts that own anything are refused; audit rows stay (un-attributed) and a to
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -29,10 +28,6 @@ def _user(db: Session, email: str, **kw) -> User:
     return u
 
 
-def _run(patterns: list[str], dry_run: bool):
-    return asyncio.run(purge_users(patterns, dry_run=dry_run))
-
-
 def test_patterns_must_be_specific() -> None:
     for bad in ("%", "%@example.com", "a%@example.com", "e2e-%@%", "e2e-%", "e2e-%@exa_ple.com"):
         with pytest.raises(PatternError):
@@ -40,7 +35,7 @@ def test_patterns_must_be_specific() -> None:
     assert validate_pattern("E2E-%@Example.com") == "e2e-%@example.com"
 
 
-def test_dry_run_lists_and_changes_nothing_then_yes_deletes_only_clean_test_accounts(db_session: Session) -> None:
+async def test_dry_run_lists_and_changes_nothing_then_yes_deletes_only_clean_test_accounts(db_session: Session) -> None:
     clean = _user(db_session, "e2e-clean@example.com")
     with_token = _user(db_session, "e2e-token@example.com")
     owner = _user(db_session, "e2e-owner@example.com")
@@ -62,7 +57,7 @@ def test_dry_run_lists_and_changes_nothing_then_yes_deletes_only_clean_test_acco
     bystander_id = bystander.id
     pats = ["e2e-%@example.com", "e2e-%@qualityscorecard.local", "deleted-%@deleted.invalid"]
 
-    dry = _run(pats, True)
+    dry = await purge_users(pats, dry_run=True)
     assert {c.email for c in dry.would_delete} == {
         "e2e-clean@example.com", "e2e-token@example.com", "deleted-abc@deleted.invalid"
     }
@@ -73,7 +68,7 @@ def test_dry_run_lists_and_changes_nothing_then_yes_deletes_only_clean_test_acco
     db_session.expire_all()
     assert {u.id for u in db_session.execute(select(User)).scalars()} == ids  # a dry run deletes nothing
 
-    real = _run(pats, False)
+    real = await purge_users(pats, dry_run=False)
     assert real.deleted == 3 and real.audit_rows_unattributed == 1
     db_session.expire_all()
     left = {u.email for u in db_session.execute(select(User)).scalars()}
@@ -89,6 +84,6 @@ def test_dry_run_lists_and_changes_nothing_then_yes_deletes_only_clean_test_acco
     assert len(tombs) == 3 and {t.entity_id for t in tombs} == purged_ids
     assert all("@" not in str(t.diff) for t in tombs)  # only the domain is kept, never the address
 
-    again = _run(pats, False)  # idempotent
+    again = await purge_users(pats, dry_run=False)  # idempotent
     assert again.deleted == 0
     assert db_session.get(User, bystander_id) is not None

@@ -30,7 +30,7 @@ import sys
 import uuid
 from dataclasses import dataclass, field
 
-if sys.platform == "win32":
+if sys.platform == "win32" and not isinstance(asyncio.get_event_loop_policy(), asyncio.WindowsSelectorEventLoopPolicy):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from sqlalchemy import delete, func, or_, select  # noqa: E402

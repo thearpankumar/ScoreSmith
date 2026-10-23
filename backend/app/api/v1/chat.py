@@ -862,7 +862,7 @@ async def start_chat_session(
     message = payload.message.strip()
     if payload.target_scorecard_id is None and not message:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="`message` is required unless `target_scorecard_id` is given.",
         )
 
@@ -1007,7 +1007,7 @@ async def _start_refine_session(
     scorecard = await get_accessible_scorecard(db, current_user, scorecard_id)
     if scorecard.current_version_id is None:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Scorecard has no current version to refine."
+            status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Scorecard has no current version to refine."
         )
     version = (
         await db.execute(

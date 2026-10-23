@@ -337,6 +337,9 @@ class FakeAwsJobs:
         self.stopped: list[str] = []
         self.corpus_text: str | None = None
         self.fail_start: Exception | None = None
+        # When set, start_execution records the run and then waits for the gate before returning its ARN: a test
+        # can land a cancel between AWS starting the run and the dispatcher saving the ARN.
+        self.start_gate: threading.Event | None = None
         self._lock = threading.Lock()
 
     # --- S3 ---
@@ -394,6 +397,8 @@ class FakeAwsJobs:
             self.executions[arn] = {"status": "RUNNING", "payload": payload, "name": name}
         if not self.hold:
             self.finish(payload["evaluation_id"], self.default_outcome)
+        if self.start_gate is not None:
+            self.start_gate.wait(30)
         return arn
 
     def describe_execution(self, arn: str):

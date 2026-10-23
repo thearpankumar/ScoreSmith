@@ -97,7 +97,7 @@ def _clean_username(raw: str | None) -> str | None:
     value = raw.strip().lower()
     if not _USERNAME_RE.match(value):
         raise _err(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_username",
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_username",
             "Usernames are 2-63 characters: letters, digits, dot, dash or underscore, starting with a letter or digit.",
         )
     return value
@@ -167,7 +167,7 @@ async def create_user(
         else sec.password_problem(payload.password, email)
     )
     if problem:
-        raise _err(status.HTTP_422_UNPROCESSABLE_ENTITY, "weak_password", problem)
+        raise _err(status.HTTP_422_UNPROCESSABLE_CONTENT, "weak_password", problem)
     password_hash = await sec.hash_password(payload.password)
     await lock_user_provisioning(db)
     await _unique(db, email=email, username=username, exclude=None)
@@ -240,7 +240,7 @@ async def set_password(
         else sec.password_problem(payload.password, user.email)
     )
     if problem:
-        raise _err(status.HTTP_422_UNPROCESSABLE_ENTITY, "weak_password", problem)
+        raise _err(status.HTTP_422_UNPROCESSABLE_CONTENT, "weak_password", problem)
     user.password_hash = await sec.hash_password(payload.password)
     user.failed_logins, user.locked_until = 0, None
     await auth_service.revoke_all_sessions(db, user)

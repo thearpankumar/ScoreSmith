@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import secrets
@@ -83,19 +82,20 @@ def test_email_helpers() -> None:
 # --- hashing ------------------------------------------------------------------------------------------
 
 
-def test_argon2_hash_verifies_and_rejects() -> None:
+async def test_argon2_hash_verifies_and_rejects() -> None:
     pw = secrets.token_urlsafe(16)
     h = sec.hash_password_sync(pw)
     assert h.startswith("$argon2id$") and pw not in h
     assert h != sec.hash_password_sync(pw)  # salted
-    assert asyncio.run(sec.verify_password(pw, h)) is True
-    assert asyncio.run(sec.verify_password(pw + "x", h)) is False
-    assert asyncio.run(sec.verify_password("", h)) is False
+    assert await sec.verify_password(pw, h) is True
+    assert await sec.verify_password(pw + "x", h) is False
+    assert await sec.verify_password("", h) is False
 
 
-def test_verify_password_is_false_for_passwordless_and_corrupt_hashes() -> None:
-    assert asyncio.run(sec.verify_password("anything-at-all-1", None)) is False
-    assert asyncio.run(sec.verify_password("anything-at-all-1", "not-a-hash")) is False
+async def test_verify_password_is_false_for_passwordless_and_corrupt_hashes() -> None:
+    pw = secrets.token_urlsafe(16)
+    assert await sec.verify_password(pw, None) is False
+    assert await sec.verify_password(pw, "not-a-hash") is False
 
 
 def test_needs_rehash_flags_weaker_parameters_and_garbage() -> None:
@@ -269,7 +269,7 @@ def test_memory_window_slides(monkeypatch) -> None:
     assert win.hit(item, "k")[0]
 
 
-def test_rate_limit_dependency_buckets_per_user_vs_ip_and_can_be_disabled(monkeypatch) -> None:
+async def test_rate_limit_dependency_buckets_per_user_vs_ip_and_can_be_disabled(monkeypatch) -> None:
     s = get_settings()
     monkeypatch.setattr(s, "redis_url", "")
     reset_rate_limits()
@@ -277,44 +277,38 @@ def test_rate_limit_dependency_buckets_per_user_vs_ip_and_can_be_disabled(monkey
     dep_user = rate_limit("t-user", lambda _s: "1/minute", per_user=True)
     u1, u2 = sec.create_access_token(uuid.uuid4())[0], sec.create_access_token(uuid.uuid4())[0]
 
-    async def go():
-        anon = _request()
+    anon = _request()
+    await dep_ip(anon)
+    await dep_ip(anon)
+    with pytest.raises(HTTPException) as err:
         await dep_ip(anon)
-        await dep_ip(anon)
-        with pytest.raises(HTTPException) as err:
-            await dep_ip(anon)
-        assert err.value.status_code == 429 and int(err.value.headers["Retry-After"]) >= 1
+    assert err.value.status_code == 429 and int(err.value.headers["Retry-After"]) >= 1
+    await dep_user(_request({"Authorization": f"Bearer {u1}"}))
+    await dep_user(_request({"Authorization": f"Bearer {u2}"}))  # another user: own bucket
+    with pytest.raises(HTTPException):
         await dep_user(_request({"Authorization": f"Bearer {u1}"}))
-        await dep_user(_request({"Authorization": f"Bearer {u2}"}))  # another user: own bucket
-        with pytest.raises(HTTPException):
-            await dep_user(_request({"Authorization": f"Bearer {u1}"}))
-        # Without a token, per-user limits fall back to the client IP bucket.
+    # Without a token, per-user limits fall back to the client IP bucket.
+    await dep_user(_request())
+    with pytest.raises(HTTPException):
         await dep_user(_request())
-        with pytest.raises(HTTPException):
-            await dep_user(_request())
-        monkeypatch.setattr(s, "rate_limit_enabled", False)
-        for _ in range(10):
-            await dep_ip(anon)  # disabled: never raises
-        assert await within_limit("t", "1/minute", "x") and await within_limit("t", "1/minute", "x")
-
-    asyncio.run(go())
+    monkeypatch.setattr(s, "rate_limit_enabled", False)
+    for _ in range(10):
+        await dep_ip(anon)  # disabled: never raises
+    assert await within_limit("t", "1/minute", "x") and await within_limit("t", "1/minute", "x")
     reset_rate_limits()
 
 
-def test_within_limit_counts_per_identifier(monkeypatch) -> None:
+async def test_within_limit_counts_per_identifier(monkeypatch) -> None:
     monkeypatch.setattr(get_settings(), "redis_url", "")
     reset_rate_limits()
 
-    async def go():
-        assert [await within_limit("w", "2/hour", "a") for _ in range(3)] == [True, True, False]
-        assert await within_limit("w", "2/hour", "b") is True
-        assert await within_limit("w2", "2/hour", "a") is True
-
-    asyncio.run(go())
+    assert [await within_limit("w", "2/hour", "a") for _ in range(3)] == [True, True, False]
+    assert await within_limit("w", "2/hour", "b") is True
+    assert await within_limit("w2", "2/hour", "a") is True
     reset_rate_limits()
 
 
-def test_rate_limit_falls_back_to_memory_when_redis_errors(monkeypatch) -> None:
+async def test_rate_limit_falls_back_to_memory_when_redis_errors(monkeypatch) -> None:
     """A dead Redis must never block requests: the in-process limiter takes over and Redis is skipped for a while."""
     import app.ratelimit as rl
 
@@ -329,12 +323,9 @@ def test_rate_limit_falls_back_to_memory_when_redis_errors(monkeypatch) -> None:
 
     monkeypatch.setattr(rl, "_redis", lambda: Boom() if rl._redis_down_until == 0.0 else None)
 
-    async def go():
-        assert await within_limit("fo", "1/minute", "z") is True  # error -> memory limiter allowed it
-        assert rl._redis_down_until > 0.0  # breaker armed
-        assert await within_limit("fo", "1/minute", "z") is False  # memory limiter now enforces
-
-    asyncio.run(go())
+    assert await within_limit("fo", "1/minute", "z") is True  # error -> memory limiter allowed it
+    assert rl._redis_down_until > 0.0  # breaker armed
+    assert await within_limit("fo", "1/minute", "z") is False  # memory limiter now enforces
     monkeypatch.setattr(rl, "_redis_down_until", 0.0)
     reset_rate_limits()
 
@@ -344,7 +335,7 @@ def test_utcnow_is_timezone_aware() -> None:
     assert now.tzinfo is UTC and abs(now - datetime.now(UTC)) < timedelta(seconds=2)
 
 
-def test_rate_limit_survives_a_redis_storage_that_cannot_even_be_built(monkeypatch) -> None:
+async def test_rate_limit_survives_a_redis_storage_that_cannot_even_be_built(monkeypatch) -> None:
     """Regression: with REDIS_URL set but the storage driver unusable, every rate-limited route used to raise
     (HTTP 500 on login / signup). It must fall back to the in-process window instead."""
     import app.ratelimit as rl
@@ -358,9 +349,6 @@ def test_rate_limit_survives_a_redis_storage_that_cannot_even_be_built(monkeypat
     monkeypatch.setattr(rl, "RedisStorage", broken)
     reset_rate_limits()
 
-    async def go():
-        assert [await within_limit("nb", "2/minute", "q") for _ in range(3)] == [True, True, False]
-
-    asyncio.run(go())
+    assert [await within_limit("nb", "2/minute", "q") for _ in range(3)] == [True, True, False]
     monkeypatch.setattr(rl, "_redis_down_until", 0.0)
     reset_rate_limits()

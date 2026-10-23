@@ -65,7 +65,7 @@ async def export_evaluations(
     if not scored:
         if bundle.evaluations or bundle.excluded_count:
             raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="None of the selected evaluations is completed with a final score; nothing to export.",
             )
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="None of the selected evaluations exist.")
