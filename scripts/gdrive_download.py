@@ -14,9 +14,13 @@ Usage (uv installs the dependencies automatically):
     uv run scripts/gdrive_download.py --force               # re-download everything
     uv run scripts/gdrive_download.py --only am8131 --dry-run
     uv run scripts/gdrive_download.py --clean               # wipe the whole GdriveDownload folder
+    uv run scripts/gdrive_download.py --subfolders --xlsx "scripts/SampleFiles/Failed Evaluations.xlsx" \
+        --out scripts/FailedGDriveDownload                  # students who nested their files in subfolders
 
 Behaviour
-  * Only top-level files of each Drive folder are fetched (subfolders ignored).
+  * Only top-level files of each Drive folder are fetched (subfolders ignored), unless --subfolders:
+    then only pdf/docx/mp4 files are fetched from the top level AND from any subfolder depth
+    (code, images, zips... are skipped) and saved flat into <email-id>/.
   * Folder name = local part of the email (am8131@srmist.edu.in -> am8131).
   * A per-student `.manifest.json` remembers Drive file id -> local name/size.
       - id known and file intact on disk          -> skipped
@@ -229,8 +233,11 @@ def doc_title(kind: str, doc_id: str) -> str:
 
 
 # --------------------------------------------------------------------------- core
-def list_remote(kind: str, rid: str, tries: int) -> tuple[list[tuple[str, str]], int]:
-    """Return ([(drive_id, filename)] of top-level files, number of files hidden in subfolders)."""
+def list_remote(kind: str, rid: str, tries: int, subfolders: bool = False) -> tuple[list[tuple[str, str]], int]:
+    """Return ([(drive_id, filename)] of top-level files, number of files hidden in subfolders).
+
+    With subfolders=True, pdf/docx/mp4 files at any depth are returned (flattened to their base name).
+    """
     if kind in ("folder", "open"):
         try:
             files = retry(
@@ -242,6 +249,9 @@ def list_remote(kind: str, rid: str, tries: int) -> tuple[list[tuple[str, str]],
                 raise
             files = None  # open?id= pointing at a single file
         if files is not None:
+            if subfolders:
+                keep = [(f.id, re.split(r"[\/]", f.path)[-1]) for f in files if f.path.lower().endswith(WANTED)]
+                return keep, len(files) - len(keep)
             top = [(f.id, f.path) for f in files if "/" not in f.path and "\\" not in f.path]
             return top, len(files) - len(top)
     # single file: name is learned when downloaded
@@ -264,7 +274,7 @@ def process(sid: str, url: str, out: Path, args) -> dict:
         if kind in EXPORTS:
             remote, nested = [(rid, safe_name(doc_title(kind, rid)))], 0
         else:
-            remote, nested = list_remote(kind, rid, args.retries)
+            remote, nested = list_remote(kind, rid, args.retries, args.subfolders)
     except Exception as e:
         log(f"[{sid}] FAIL listing: {short_err(e)}")
         stats["inaccessible"].append(short_err(e))
@@ -276,10 +286,13 @@ def process(sid: str, url: str, out: Path, args) -> dict:
 
     # Report students whose top level has nothing we want (subfolders are never entered).
     if not remote:
-        stats["issue"] = (
-            f"top level has no files ({nested} file(s) only inside subfolders, not downloaded)"
-            if nested else "folder is empty"
-        )
+        if args.subfolders:
+            stats["issue"] = f"no pdf/docx/mp4 anywhere in the folder ({nested} other file(s) skipped)" if nested else "folder is empty"
+        else:
+            stats["issue"] = (
+                f"top level has no files ({nested} file(s) only inside subfolders, not downloaded)"
+                if nested else "folder is empty"
+            )
         log(f"[{sid}] NOTHING: {stats['issue']}")
         return stats
     named = [n for _, n in remote if n]
@@ -287,7 +300,7 @@ def process(sid: str, url: str, out: Path, args) -> dict:
         stats["issue"] = "no pdf/docx/mp4 at top level (found: " + ", ".join(named[:5]) + ")"
         log(f"[{sid}] WARNING: {stats['issue']}")
     if nested:
-        log(f"[{sid}] note: ignored {nested} file(s) inside subfolders")
+        log(f"[{sid}] note: ignored {nested} " + ("non pdf/docx/mp4 file(s)" if args.subfolders else "file(s) inside subfolders"))
 
     if not args.dry_run:
         sdir.mkdir(parents=True, exist_ok=True)
@@ -495,6 +508,8 @@ def clean(out: Path, yes: bool, dry_run: bool) -> int:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles (cp1252) choke on emoji in Drive file names
+        stream.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--xlsx", type=Path, help="submission sheet (default: first .xlsx in scripts/SampleFiles)")
     ap.add_argument("--out", type=Path, default=HERE / "GdriveDownload", help="output root (default: scripts/GdriveDownload)")
@@ -502,6 +517,7 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="re-download every file, even unchanged ones")
     ap.add_argument("--only", nargs="+", metavar="ID", help="only these email ids (e.g. am8131) ")
     ap.add_argument("--ext", nargs="+", metavar="EXT", type=str.lower, help="only download files with these extensions (e.g. pdf docx)")
+    ap.add_argument("--subfolders", action="store_true", help="also look inside subfolders, but only fetch pdf/docx/mp4 (flattened into <id>/)")
     ap.add_argument("--clean", action="store_true", help="delete the entire output folder (all downloads, manifests, summary) and exit")
     ap.add_argument("--yes", action="store_true", help="with --clean: skip the confirmation prompt")
     ap.add_argument("--dry-run", action="store_true", help="show what would happen, download nothing")
@@ -512,7 +528,7 @@ def main() -> int:
     if args.clean:
         return clean(args.out, args.yes, args.dry_run)
 
-    xlsx = args.xlsx or next(iter(sorted((HERE / "SampleFiles").glob("*.xlsx"))), None)
+    xlsx = args.xlsx or next(iter(sorted(f for f in (HERE / "SampleFiles").glob("*.xlsx") if "failed" not in f.name.lower())), None)
     if not xlsx or not xlsx.exists():
         raise SystemExit("No spreadsheet found; pass --xlsx PATH")
 

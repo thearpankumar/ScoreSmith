@@ -319,7 +319,7 @@ def scan_student(root: Path, folder: str, identity: tuple[str | None, str]) -> S
 
 
 def scan_all(root: Path, sheet: Path | None = None) -> tuple[list[Student], int]:
-    sheet = sheet or next(iter(sorted((Path(__file__).resolve().parent / "SampleFiles").glob("*.xlsx"))), None)
+    sheet = sheet or next(iter(sorted(f for f in (Path(__file__).resolve().parent / "SampleFiles").glob("*.xlsx") if "failed" not in f.name.lower())), None)
     sheet_ids: dict[str, tuple[str, str]] = {}
     if sheet and sheet.exists():
         try:
@@ -819,7 +819,36 @@ def wait_terminal(ctx: Ctx, folders: list[str]) -> None:
         SLEEP(ctx.args.poll_interval)
 
 
-def process_wave(ctx: Ctx, folders: list[str], label: str) -> None:
+class Background:
+    """Runs wait_terminal() for already-submitted evaluations in threads, so the NEXT wave can upload and queue
+    while earlier waves are still being scored (the server queue caps real concurrency)."""
+
+    def __init__(self) -> None:
+        self.threads: list[tuple[threading.Thread, list[BaseException]]] = []
+
+    def spawn(self, fn) -> None:
+        errs: list[BaseException] = []
+
+        def run_() -> None:
+            try:
+                fn()
+            except BaseException as e:  # noqa: BLE001 - re-raised from join()
+                errs.append(e)
+
+        t = threading.Thread(target=run_, daemon=True)
+        t.start()
+        self.threads.append((t, errs))
+
+    def join(self) -> None:
+        for t, errs in self.threads:
+            while t.is_alive():
+                t.join(timeout=1)
+            if errs:
+                raise errs[0]
+        self.threads.clear()
+
+
+def process_wave(ctx: Ctx, folders: list[str], label: str, bg: Background | None = None) -> None:
     log(f"=== {label}: {', '.join(folders)} ===")
     retry_now = [f for f in folders if ctx.state.rec(f)["evaluation_id"] and ctx.state.rec(f)["uploaded"]
                  and ctx.state.status(f) == "failed"]
@@ -850,6 +879,10 @@ def process_wave(ctx: Ctx, folders: list[str], label: str) -> None:
     for f in retry_now:
         if retry_evaluation(ctx, f):
             live.append(f)
+    if live and bg is not None:
+        log(f"=== {label}: {len(live)} evaluation(s) queued; scoring in the background, next wave may start ===")
+        bg.spawn(lambda: wait_terminal(ctx, live))
+        return
     if live:
         wait_terminal(ctx, live)
     done = Counter(ctx.state.status(f) for f in folders)
@@ -942,6 +975,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--only", default="", help="comma-separated folder ids")
     p.add_argument("--skip", default="", help="comma-separated folder ids")
     p.add_argument("--limit", type=int, default=0, help="only the first N students (after --only/--skip)")
+    p.add_argument("--sequential", action="store_true",
+                   help="wait for each wave to finish scoring before uploading the next (default: overlap waves)")
     p.add_argument("--canary", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--canary-folder", default=None)
     p.add_argument("--no-canary-gate", action="store_true", help="continue even if the canary fails")
@@ -982,7 +1017,7 @@ def resolve_scorecard(api: Api, args: argparse.Namespace) -> dict:
             if e.status == 404:
                 raise Fatal(f"Scorecard {args.scorecard_id} not found (try --list-scorecards).") from e
             raise
-    cards = api.get("/api/v1/scorecards?limit=500") or []
+    cards = api.get("/api/v1/scorecards?limit=200") or []
     want = (args.scorecard_name or "").strip().lower()
     for pool, how in (
         ([c for c in cards if (c.get("name") or "").strip().lower() == want], "exact"),
@@ -1118,9 +1153,10 @@ def run(args: argparse.Namespace) -> int:
 
     rc = 0
     try:
+        bg = Background()
         if evaluating:
             log(f"Re-attaching to {len(evaluating)} running evaluation(s)")
-            wait_terminal(ctx, evaluating)
+            bg.spawn(lambda: wait_terminal(ctx, evaluating))
         if canary:
             process_wave(ctx, [canary], "canary")
             if state.status(canary) != "completed":
@@ -1136,7 +1172,8 @@ def run(args: argparse.Namespace) -> int:
             todo = [f for f in todo if f != canary]
         waves = chunks(todo, args.batch_size)
         for i, wave in enumerate(waves, 1):
-            process_wave(ctx, wave, f"wave {i}/{len(waves)}")
+            process_wave(ctx, wave, f"wave {i}/{len(waves)}", None if args.sequential else bg)
+        bg.join()
         for rnd in range(1, args.max_retry_rounds + 1):
             queue = [f for f in order if students[f].files and state.status(f) == "failed"]
             if not queue:

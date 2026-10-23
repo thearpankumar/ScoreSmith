@@ -40,4 +40,6 @@ npm-debug.log*
 
 # Local media / sample data downloads
 scripts/GdriveDownload/
+scripts/FailedGDriveDownload/
 scripts/SampleFiles/
+creds.txt
