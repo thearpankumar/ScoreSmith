@@ -195,7 +195,7 @@ flowchart LR
         SFN["Step Functions<br/>one execution per evaluation"]
         L1["ingest<br/>Drive to S3"]
         L2["extract-doc<br/>pdf, docx to text and images"]
-        L3["plan-audio and transcribe-chunk<br/>ffmpeg plus Voxtral"]
+        L3["plan-audio and transcribe-chunk<br/>ffmpeg plus Amazon Transcribe or Voxtral"]
         L4["analyze-image<br/>Kimi K2.5, Qwen3-VL"]
         L5["assemble<br/>corpus.json"]
     end
@@ -274,7 +274,7 @@ sequenceDiagram
 |---|---|
 | Ingest (Lambda) | Drive links are validated against an allowlist (`drive.google.com`, `docs.google.com`, `drive.usercontent.google.com`, https only, public IPs only, every redirect re-checked), then the files are streamed into S3. Folders are listed with `gdown` (Google caps a folder listing at 50 files), single files are streamed with a size cap. The file type comes from the extension **or, when there is none, from the content** (PDF `%PDF`, DOCX zip with `word/document.xml`, video by ffmpeg probe). |
 | Extract (Lambda) | PDFs and DOCX are turned into text in reading order plus images, vector figures and tables (PyMuPDF / python-docx, ported from `scripts/extract_assets.py`). Markdown and text files are split into page-sized sections. Each image is read by a vision model (Kimi K2.5, then Qwen3-VL, then Maverick as fallbacks — `scripts/analyze_images.py`), told what the scorecard is about so it brings out the details that matter for it. |
-| Transcribe (Lambda) | The audio track is cut into ~5-minute chunks at pauses and each chunk is transcribed with Mistral Voxtral through the Bedrock Converse API, in parallel (`scripts/transcribe_videos.py`). No Amazon Transcribe job is needed. |
+| Transcribe (Lambda) | The audio track is cut into ~5-minute chunks at pauses and each chunk is transcribed with Amazon Transcribe on Bedrock runs (Bedrock's Voxtral no longer accepts audio) or Mistral Voxtral through OpenRouter on OpenRouter runs, in parallel (`scripts/transcribe_videos.py`). No Amazon Transcribe job is needed. |
 | Assemble (Lambda) | Everything is stitched into `derived/{evaluation}/corpus.json`: one section per PDF page, per transcript chunk and per image analysis, with warnings for anything skipped. |
 | Identify | Llama 4 Maverick reads the file names and cover text and returns the submitter's name and email — only if they literally appear in the text; otherwise the sheet row, then a regex. The same call writes a short content-based title; the evaluation is named `Name (email)` when a submitter is known, else that title, else the main file's name. |
 | Evidence | For every leaf KPI Maverick (the "master agent") picks the relevant passages from a section index. Every quote must be a verbatim substring of the corpus or it is dropped. The corpus is wrapped as untrusted data, so instructions hidden inside a submission are ignored. |

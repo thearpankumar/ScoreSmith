@@ -76,6 +76,9 @@ NO_FOREIGN_ID = {
     ("POST", "/api/v1/admin/users/{user_id}/deactivate"),
     ("POST", "/api/v1/admin/users/{user_id}/reactivate"),
     ("DELETE", "/api/v1/admin/users/{user_id}"),
+    # product-wide AI provider setting: admin-only, no per-user data (tests/test_admin_ai_provider.py)
+    ("GET", "/api/v1/admin/settings/ai-provider"),
+    ("PUT", "/api/v1/admin/settings/ai-provider"),
 }
 
 

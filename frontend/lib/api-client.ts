@@ -107,7 +107,7 @@ export class BedrockUnavailableError extends ApiError {
 }
 
 interface RequestOptions {
-  method?: "GET" | "POST" | "PATCH" | "DELETE";
+  method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   body?: unknown;
   /** Aborts the request (e.g. an unmounted poller) — surfaces as the native AbortError. */
   signal?: AbortSignal;

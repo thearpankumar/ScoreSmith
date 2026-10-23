@@ -18,6 +18,10 @@
   the evaluation sees it in `_poll_until_done` / between KPIs (`graph._check_cancel`) and stops. The API process
   need not own the driver.
 - Transient scoring failures (model unavailable) are retried up to `ai_eval_scoring_retries` times in `_drive`.
+- AI provider (Bedrock / OpenRouter, admin-selected): resolved ONCE per evaluation when its execution starts. It is
+  sent to the Lambdas as the start input's `provider` and stored in `evaluations.ai_provider`; scoring uses the
+  stored provider (or the current one if that is no longer available), so an evaluation that was running when an
+  admin switched providers finishes on the provider it started with. `retry()` clears it.
 - `settings.ai_eval_inline` (tests): no background loop; drive it with `run_until_idle()`.
 """
 
@@ -36,6 +40,7 @@ from typing import Any
 from sqlalchemy import exists, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai import providers
 from app.ai.bedrock_client import BedrockClientProtocol
 from app.config import get_settings
 from app.db import AsyncSessionLocal
@@ -132,7 +137,7 @@ class Dispatcher:
     def __init__(
         self,
         aws: AwsJobsProtocol,
-        bedrock: BedrockClientProtocol,
+        bedrock: BedrockClientProtocol | None,
         jev: JevScoreClientProtocol | None,
         *,
         max_concurrent: int | None = None,
@@ -142,6 +147,8 @@ class Dispatcher:
         score_retry_delays: tuple[float, ...] | None = None,
     ) -> None:
         self.aws = aws
+        # None (production, see get_dispatcher): resolve the AI provider's client per evaluation. A client given
+        # here (tests) is used for every evaluation, and its provider is the one recorded.
         self.bedrock = bedrock
         self.jev = jev
         # Identifies this dispatcher as a lease holder (unique per instance, so two in one test process differ).
@@ -500,6 +507,11 @@ class Dispatcher:
             scorecard = await db.get(Scorecard, version.scorecard_id) if version else None
             if scorecard is not None:
                 payload["context"] = ScorecardContext.of(scorecard).payload()
+        # Which AI provider the Lambdas (image analysis, transcription) and later the scoring use for this run.
+        provider = (
+            providers.provider_of(self.bedrock) if self.bedrock is not None else await providers.active_provider()
+        )
+        payload["provider"] = provider
         name = execution_name(str(ev.id), ev.attempt)
         try:
             arn = await asyncio.to_thread(self.aws.start_execution, name, payload)
@@ -513,7 +525,7 @@ class Dispatcher:
             await db.execute(
                 update(Evaluation)
                 .where(Evaluation.id == ev.id, Evaluation.status.in_(ACTIVE_EVALUATION_STATUSES))
-                .values(sfn_execution_arn=arn, stage="ingest")
+                .values(sfn_execution_arn=arn, stage="ingest", ai_provider=provider)
             )
             await db.commit()
         await emit_evaluation_event(ev.id, "ingest_started", "Fetching and extracting the submission on AWS.")
@@ -644,11 +656,24 @@ class Dispatcher:
                 if ev is None or ev.status != EvaluationStatus.SCORING:
                     return  # cancelled / removed while waiting
 
+    async def _client_for(self, ev: Evaluation | None) -> BedrockClientProtocol:
+        """The client that scores `ev`: the injected one, else the provider stored when its execution started
+        (the current provider when that one is no longer available, or for a row started before providers)."""
+        if self.bedrock is not None:
+            return self.bedrock
+        stored = ev.ai_provider if ev is not None else None
+        return providers.client_for(await providers.provider_for_job(stored))
+
     async def _score(self, eid: uuid.UUID) -> None:
         settings = get_settings()
         extra = {} if self._patience_waits is None else {"patience_waits": self._patience_waits}
-        deps = ScoringDeps(self.aws, self.bedrock, self.jev, jev_retry_delays=self._jev_retry_delays, **extra)
         ev = await self._load(eid)
+        client = await self._client_for(ev)
+        models = providers.models_of(client)
+        deps = ScoringDeps(
+            self.aws, client, self.jev, master_model_id=models.master, fallback_model_id=models.judge,
+            jev_retry_delays=self._jev_retry_delays, **extra,
+        )
         remaining = settings.ai_eval_timeout_seconds
         if ev is not None and ev.started_at is not None:
             deadline = ev.started_at + timedelta(seconds=settings.ai_eval_timeout_seconds)
@@ -799,6 +824,7 @@ class Dispatcher:
             ev.error_code = None
             ev.error_message = None
             ev.sfn_execution_arn = None
+            ev.ai_provider = None  # the new attempt runs on whichever provider is active when it starts
             ev.progress = None
             ev.stage = "queued"
             ev.queued_at = _now()
@@ -847,7 +873,8 @@ def get_dispatcher() -> Dispatcher:
     if _dispatcher is None:
         from app import deps
 
-        _dispatcher = Dispatcher(deps.get_aws_jobs(), deps.get_bedrock_client(), deps.get_jev_score_client())
+        # bedrock=None: each evaluation resolves the admin-selected AI provider when it starts (see the docstring).
+        _dispatcher = Dispatcher(deps.get_aws_jobs(), None, deps.get_jev_score_client())
     return _dispatcher
 
 

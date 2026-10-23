@@ -1,68 +1,33 @@
-"""Bedrock calls: Voxtral transcription and vision analysis with model fallbacks.
+"""AWS calls for Bedrock runs: transcription (Amazon Transcribe, then Bedrock Voxtral) and vision analysis with model
+fallbacks.
 
 Ported from scripts/transcribe_videos.py and scripts/analyze_images.py. Auth is the Lambda execution role (no API key).
+The step entry points (S3 in/out, progress markers) are in media.py.
 """
 from __future__ import annotations
 
-import io
 import os
-from datetime import datetime, timezone
+import re
+import time
 
-from . import scorecard_context
-from .errors import PipelineError, TransientError
-from .progress import Progress
-from .store import derived
+from .errors import TransientError
+from .images import TooLarge, analyse_with_shrink, is_size_error
+from .prompts import IMAGE_MAX_TOKENS, IMAGE_PROMPT, TRANSCRIBE_PROMPT
 
-TRANSCRIBE_MODELS = ["mistral.voxtral-small-24b-2507", "mistral.voxtral-mini-3b-2507"]
+# Since Oct 2026 Bedrock's Voxtral (now in its Legacy period) rejects every audio request with "Model does not support
+# audio modality", on Converse, InvokeModel and the OpenAI-compatible endpoints alike. Bedrock runs therefore
+# transcribe with Amazon Transcribe (a batch job reading the chunk from S3); Voxtral stays as the fallback in case AWS
+# restores audio input.
+AMAZON_TRANSCRIBE = "amazon.transcribe"
+TRANSCRIBE_MODELS = [AMAZON_TRANSCRIBE, "mistral.voxtral-small-24b-2507", "mistral.voxtral-mini-3b-2507"]
+# How long one step waits for its job (Lambda timeout 900 s). A step that runs out of time raises TransientError; the
+# state machine's retry then finds the same job by name and keeps waiting instead of paying for a second one.
+TRANSCRIBE_WAIT_S = 720.0
 VISION_MODELS = [
     "moonshotai.kimi-k2.5",
     "qwen.qwen3-vl-235b-a22b",
     "us.meta.llama4-maverick-17b-instruct-v1:0",
 ]
-# tested wording; longer prompts made the model translate
-TRANSCRIBE_PROMPT = "Transcribe this audio verbatim. Output only the transcript."
-IMAGE_PROMPT = """You are analysing one image taken from a document submitted for evaluation (a report, slide deck,
-solution document or similar).
-
-Reply in Markdown with exactly these sections:
-
-## Text (OCR)
-Transcribe ALL text visible in the image exactly as written, in reading order. Keep table rows on one line each,
-separated by " | ". If there is no text, write "(none)".
-
-## Description
-Say what kind of image this is (screenshot, architecture diagram, flow chart, chart/graph, table, photo, logo, other).
-Describe the key elements, how they connect or flow, and any numbers/values shown. Be factual and concise.
-
-## Summary
-One sentence."""
-
-
-def image_prompt(context: object) -> str:
-    """IMAGE_PROMPT, preceded by what the evaluation's scorecard is about (see scorecard_context) so the description
-    brings out the details that matter for that kind of evaluation. No context: the neutral IMAGE_PROMPT."""
-    ctx = scorecard_context.clean(context)
-    if not ctx:
-        return IMAGE_PROMPT
-    head = "Context: the document is being evaluated"
-    if ctx.get("scorecard"):
-        head += f' with the scorecard "{ctx["scorecard"]}"'
-    if ctx.get("domain"):
-        head += f" (domain: {ctx['domain']})"
-    lines = [head + "."]
-    if ctx.get("purpose"):
-        lines.append(f"Purpose of the scorecard: {ctx['purpose']}")
-    if ctx.get("scope"):
-        lines.append(f"Scope: {ctx['scope']}")
-    lines.append("Use this context only to decide which visible details are worth describing. "
-                 "Never describe anything that is not in the image.")
-    return "\n".join(lines) + "\n\n" + IMAGE_PROMPT
-
-# Converse documents 3.75 MB / 8000 px per image, but that limit is really on the request BODY, where the image is
-# base64-encoded (+33%). Measured: Kimi K2.5 and Qwen3-VL accept raw images up to ~2.61 MiB; one budget safe for all:
-MAX_BYTES = 2_700_000
-MAX_PX = 8000
-MAX_IMAGE_PIXELS = 100_000_000  # decompression-bomb guard for Pillow
 
 
 def bedrock_client(region: str | None = None):
@@ -71,6 +36,18 @@ def bedrock_client(region: str | None = None):
 
     return boto3.client("bedrock-runtime", region_name=region or os.environ.get("AWS_REGION", "us-east-1"),
                         config=Config(read_timeout=300, retries={"max_attempts": 6, "mode": "adaptive"}))
+
+
+# the interface media.py dispatches on (openrouter_ops has the same three)
+default_client = bedrock_client
+
+
+def transcribe_models() -> list[str]:
+    return list(TRANSCRIBE_MODELS)
+
+
+def vision_models() -> list[str]:
+    return list(VISION_MODELS)
 
 
 def _is_client_error(e: Exception) -> bool:
@@ -87,10 +64,87 @@ def _text_of(resp: dict) -> str:
 
 
 # --------------------------------------------------------------------------- transcription
-def transcribe(client, models: list[str], audio: bytes, prompt: str = TRANSCRIBE_PROMPT) -> tuple[str, str, dict]:
+def transcribe_client(region: str | None = None):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client("transcribe", region_name=region or os.environ.get("AWS_REGION", "us-east-1"),
+                        config=Config(retries={"max_attempts": 6, "mode": "adaptive"}))
+
+
+def safe_job_name(name: str) -> str:
+    """Transcribe job names allow [0-9a-zA-Z._-], up to 200 characters. media.py names one job per chunk
+    ("qs-eval-{eid}-{sid}-c{n}"), so a retried step or evaluation finds the job it already started; the qs-eval-
+    prefix is also what the Lambda role may read and delete."""
+    return re.sub(r"[^0-9A-Za-z._-]", "-", name)[:200]
+
+
+def _error_code(e: Exception) -> str:
+    return ((getattr(e, "response", None) or {}).get("Error") or {}).get("Code", "")
+
+
+def _start_job(t, s3_uri: str, job_name: str) -> None:
+    try:
+        t.start_transcription_job(TranscriptionJobName=job_name, Media={"MediaFileUri": s3_uri}, MediaFormat="mp3",
+                                  IdentifyLanguage=True)
+    except Exception as e:
+        if _error_code(e) != "ConflictException":
+            raise
+        # the job already exists (this step or evaluation is a retry): wait for it below
+
+
+def _fetch_transcript(uri: str, session=None) -> str:
+    """The job's output, from the short-lived pre-signed URL Transcribe hands out (no output bucket to grant)."""
+    import requests
+
+    try:
+        r = (session or requests).get(uri, timeout=(10, 60))
+        r.raise_for_status()
+        body = r.json()
+    except Exception as e:  # network trouble or an expired URL: the retried step asks for a fresh one
+        raise TransientError(f"could not download the Amazon Transcribe output: {type(e).__name__}") from None
+    transcripts = (body.get("results") or {}).get("transcripts") or [{}]
+    return str(transcripts[0].get("transcript") or "").strip()
+
+
+def transcribe_job(t, s3_uri: str, job_name: str, *, sleep=time.sleep, clock=time.monotonic,
+                   wait_s: float = TRANSCRIBE_WAIT_S, session=None) -> str:
+    """Run (or pick up) the Amazon Transcribe job for one chunk, language identified automatically. A FAILED job is
+    deleted and started once more; a job still running when the wait ends raises TransientError (retried step)."""
+    deadline = clock() + wait_s
+    _start_job(t, s3_uri, job_name)
+    restarted, delay = False, 2.0
+    while True:
+        job = t.get_transcription_job(TranscriptionJobName=job_name)["TranscriptionJob"]
+        status = job.get("TranscriptionJobStatus")
+        if status == "COMPLETED":
+            return _fetch_transcript(job["Transcript"]["TranscriptFileUri"], session)
+        if status == "FAILED":
+            reason = str(job.get("FailureReason") or "no reason given")[:200]
+            if restarted:
+                raise RuntimeError(f"Amazon Transcribe job failed: {reason}")
+            print(f"    {job_name}: FAILED ({reason}); starting it again")
+            t.delete_transcription_job(TranscriptionJobName=job_name)
+            _start_job(t, s3_uri, job_name)
+            restarted = True
+            continue
+        if clock() + delay > deadline:
+            raise TransientError(f"Amazon Transcribe job {job_name} still {status} after {wait_s:.0f}s")
+        sleep(delay)
+        delay = min(10.0, delay * 1.5)
+
+
+def transcribe(client, models: list[str], audio: bytes, prompt: str = TRANSCRIBE_PROMPT, *,
+               s3_uri: str | None = None, job_name: str | None = None, transcriber=None) -> tuple[str, str, dict]:
+    """The first model that answers. `amazon.transcribe` needs the chunk's S3 location (s3_uri) and a job name;
+    without them it is skipped. The Bedrock models get the audio bytes."""
     last: Exception | None = None
     for model in models:
         try:
+            if model == AMAZON_TRANSCRIBE:
+                if not (s3_uri and job_name):
+                    continue
+                return transcribe_job(transcriber or transcribe_client(), s3_uri, safe_job_name(job_name)), model, {}
             r = client.converse(
                 modelId=model,
                 messages=[{"role": "user", "content": [{"audio": {"format": "mp3", "source": {"bytes": audio}}},
@@ -106,85 +160,7 @@ def transcribe(client, models: list[str], audio: bytes, prompt: str = TRANSCRIBE
     raise TransientError(f"all transcription models failed (last: {last})")
 
 
-def run_transcribe_chunk(event: dict, store, client=None, models: list[str] | None = None) -> dict:
-    eid, sid, chunk = event["evaluation_id"], event["source_id"], event["chunk"]
-    n = int(chunk["index"])
-    client = client or bedrock_client()
-    audio = store.get_bytes(chunk["key"])
-    text, model, usage = transcribe(client, models or TRANSCRIBE_MODELS, audio)
-    prefix = derived(eid, "video", sid, "chunks")
-    store.put_text(f"{prefix}/c{n}.txt", text)
-    store.put_json(f"{prefix}/c{n}.json", {"chunk": n, "start": chunk.get("start"), "end": chunk.get("end"),
-                                           "model": model, "chars": len(text),
-                                           "tokens_in": usage.get("inputTokens", 0), "tokens_out": usage.get("outputTokens", 0)})
-    Progress(store, eid).mark("chunk", sid, n, True)
-    return {"source_id": sid, "index": n, "chars": len(text), "model": model}
-
-
 # --------------------------------------------------------------------------- images
-class TooLarge(Exception):
-    """The service rejected the request body as too big (shrink the image and retry)."""
-
-
-def is_size_error(e: Exception) -> bool:
-    m = str(e).lower()
-    return "length limit" in m or "too large" in m or "exceeds the maximum" in m or "request body" in m
-
-
-def _pil():
-    from PIL import Image
-
-    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-    return Image
-
-
-def encode_best(img, budget: int) -> bytes:
-    """Highest JPEG quality (bisection, 30..95) whose size fits the budget; shrink pixels only if even q=30 doesn't."""
-    Image = _pil()
-    for _ in range(8):
-        def enc(q: int, im=img) -> bytes:
-            buf = io.BytesIO()
-            im.save(buf, "JPEG", quality=q, optimize=True)
-            return buf.getvalue()
-
-        best = enc(95)
-        if len(best) <= budget:
-            return best
-        lo, hi, found = 30, 94, None
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            data = enc(mid)
-            if len(data) <= budget:
-                found, lo = data, mid + 1
-            else:
-                hi = mid - 1
-        if found:
-            return found
-        scale = max(0.5, min(0.9, (budget / len(enc(30))) ** 0.5 * 0.95))  # size ~ pixels ~ scale^2
-        img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS)
-    raise RuntimeError("could not shrink image under the size budget")
-
-
-def prepare(raw: bytes, ext: str, budget: int = MAX_BYTES) -> tuple[bytes, str]:
-    """Bytes + Converse format. Original bytes are sent untouched when they fit; otherwise re-encoded at the
-    highest quality that fits `budget`."""
-    Image = _pil()
-    fmt = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp", "gif": "gif"}.get(ext.lower().lstrip("."))
-    img = Image.open(io.BytesIO(raw))
-    if fmt and len(raw) <= budget and max(img.size) <= MAX_PX:
-        return raw, fmt
-    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
-        rgba = img.convert("RGBA")
-        bg = Image.new("RGB", rgba.size, "white")
-        bg.paste(rgba, mask=rgba.split()[3])
-        img = bg
-    else:
-        img = img.convert("RGB")
-    if max(img.size) > MAX_PX:
-        img.thumbnail((MAX_PX, MAX_PX), Image.LANCZOS)
-    return encode_best(img, budget), "jpeg"
-
-
 def analyse(client, models: list[str], data: bytes, fmt: str, prompt: str = IMAGE_PROMPT) -> tuple[str, str, dict]:
     last: Exception | None = None
     for model in models:
@@ -193,7 +169,7 @@ def analyse(client, models: list[str], data: bytes, fmt: str, prompt: str = IMAG
                 modelId=model,
                 messages=[{"role": "user", "content": [{"image": {"format": fmt, "source": {"bytes": data}}},
                                                        {"text": prompt}]}],
-                inferenceConfig={"maxTokens": 3000, "temperature": 0},
+                inferenceConfig={"maxTokens": IMAGE_MAX_TOKENS, "temperature": 0},
             )
             text = _text_of(r)
             if not text:
@@ -211,44 +187,5 @@ def analyse(client, models: list[str], data: bytes, fmt: str, prompt: str = IMAG
 
 def analyse_image(client, models: list[str], raw: bytes, ext: str,
                   prompt: str = IMAGE_PROMPT) -> tuple[str, str, dict]:
-    """prepare + analyse, shrinking the budget by 15% and retrying if the service still says the body is too big."""
-    budget = MAX_BYTES
-    for _ in range(4):
-        data, fmt = prepare(raw, ext, budget)
-        try:
-            return analyse(client, models, data, fmt, prompt)
-        except TooLarge:
-            budget = int(min(budget, len(data)) * 0.85)
-            print(f"    body too large ({len(data) / 1e6:.2f} MB); retrying at <= {budget / 1e6:.2f} MB")
-    raise RuntimeError("image still too large after 3 shrink attempts")
-
-
-def analysis_key(image_key: str) -> str:
-    stem = image_key.rsplit(".", 1)[0]
-    return stem + ".analysis.md"
-
-
-def run_analyze_image(event: dict, store, client=None, models: list[str] | None = None, now=None) -> dict:
-    eid, sid, key = event["evaluation_id"], event["source_id"], event["image_key"]
-    # the key must live under this evaluation's docs prefix (never trust the payload blindly)
-    if not key.startswith(derived(eid, "docs", sid, "images") + "/"):
-        raise PipelineError("internal", "image key outside the evaluation prefix")
-    seq = os.path.basename(key).split("_", 1)[0]
-    client = client or bedrock_client()
-    raw = store.get_bytes(key)
-    ext = key.rsplit(".", 1)[-1]
-    prog = Progress(store, eid)
-    prompt = image_prompt(scorecard_context.load(store, eid))
-    try:
-        text, model, usage = analyse_image(client, models or VISION_MODELS, raw, ext, prompt)
-    except TransientError:
-        raise
-    except Exception as e:  # undecodable image etc.: soft failure, the evaluation continues
-        prog.mark("img", sid, seq, False)
-        return {"source_id": sid, "image_key": key, "ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}"}
-    stamp = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M")
-    store.put_text(analysis_key(key),
-                   f"<!-- source: {os.path.basename(key)} | model: {model} | analysed: {stamp} -->\n\n{text}\n",
-                   "text/markdown; charset=utf-8")
-    prog.mark("img", sid, seq, True)
-    return {"source_id": sid, "image_key": key, "ok": True, "model": model}
+    """prepare + analyse, shrinking the image while Bedrock says the request body is too big."""
+    return analyse_with_shrink(lambda data, fmt: analyse(client, models, data, fmt, prompt), raw, ext)

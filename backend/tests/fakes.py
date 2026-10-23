@@ -173,6 +173,18 @@ class FakeBedrockClient:
         return [v / norm for v in raw]
 
 
+class FakeOpenRouterClient(FakeBedrockClient):
+    """A `FakeBedrockClient` that presents itself as the OpenRouter client: `provider` and the model attributes
+    `app.ai.providers.models_of()` reads. (`FakeBedrockClient` itself deliberately has NO such attributes, so the
+    many tests that pin Bedrock model ids keep getting them through the `models_of` fallback.)"""
+
+    provider = "openrouter"
+    chat_model_id = "openai/gpt-5-mini"
+    judge_model_id = "openai/gpt-5-mini"
+    master_model_id = "openai/gpt-5-mini"
+    embedding_model_id = "fake-embed"
+
+
 def tool_use_result(name: str, tool_input: dict[str, Any]) -> ConverseResult:
     return ConverseResult(stop_reason="tool_use", tool_name=name, tool_input=tool_input)
 

@@ -26,6 +26,8 @@ from sqlalchemy.orm import selectinload
 
 from app import notifications as notif
 from app.activity import log_edit
+from app.ai import providers
+from app.ai import web_search as web_search_mod
 from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
 from app.ai.draft_materialize import draft_from_scorecard, materialize_draft
 from app.ai.draft_schema import ScorecardDraft
@@ -165,14 +167,13 @@ async def _generate_and_persist_title(
     """Issue 1 (see task notes): a brand-new session's title must be generated as the
     VERY FIRST thing on its first turn — before check_similarity/research_kpis/
     propose_kpis (the heavier LangGraph work — see scorecard_builder.py) ever run — via
-    ONE fast/cheap Bedrock call (settings.bedrock_judge_model_id, not the heavier chat
-    model), and persisted immediately so a concurrent request (a different tab's session
+    ONE fast/cheap call on the client's judge-tier model (`models_of(bedrock).judge`, not the
+    heavier chat model), and persisted immediately so a concurrent request (a different tab's session
     list poll, or this same request's own eventual response) can see it well before the
     graph call returns. Best-effort: never raises, never blocks session creation on a
     cosmetic feature — see generate_session_title's own "never raise" contract."""
-    settings = get_settings()
     title = await asyncio.to_thread(
-        generate_session_title, bedrock, settings.bedrock_judge_model_id, first_message
+        generate_session_title, bedrock, providers.models_of(bedrock).judge, first_message
     )
     if not title:
         return None
@@ -284,6 +285,20 @@ async def _notify_turn(session: ChatSession, turn: BuilderTurnResult, turn_start
         )
 
 
+async def _record_cancelled_turn(session_id: uuid.UUID, turn_started_at: datetime) -> None:
+    """A background turn's task was cancelled: by the user ("cancelled") or by shutdown / a lost lease
+    ("interrupted", so the UI offers a retry). Shielded, so the record lands even while cancelling."""
+    if session_id in _user_cancelled:
+        _user_cancelled.discard(session_id)
+        await asyncio.shield(_record_turn_failure(session_id, turn_started_at, "cancelled", "This turn was cancelled."))
+    else:
+        await asyncio.shield(
+            _record_turn_failure(
+                session_id, turn_started_at, "interrupted", "The server restarted while working on your message."
+            )
+        )
+
+
 async def _background_turn(
     *,
     session_id: uuid.UUID,
@@ -315,7 +330,7 @@ async def _background_turn(
                     str(session_id),
                     message,
                     bedrock,
-                    chat_model_id=settings.bedrock_chat_model_id,
+                    chat_model_id=providers.models_of(bedrock).chat,
                     db=db,
                     web_search_client=web_search,
                     turn_started_at=turn_started_at,
@@ -326,17 +341,7 @@ async def _background_turn(
             )
             await _notify_turn(session, turn, turn_started_at)
     except asyncio.CancelledError:
-        if session_id in _user_cancelled:
-            _user_cancelled.discard(session_id)
-            await asyncio.shield(
-                _record_turn_failure(session_id, turn_started_at, "cancelled", "This turn was cancelled.")
-            )
-        else:
-            await asyncio.shield(
-                _record_turn_failure(
-                    session_id, turn_started_at, "interrupted", "The server restarted while working on your message."
-                )
-            )
+        await _record_cancelled_turn(session_id, turn_started_at)
         raise
     except BedrockUnavailableError as exc:
         await _record_turn_failure(session_id, turn_started_at, "bedrock_unavailable", str(exc))
@@ -352,6 +357,34 @@ async def _background_turn(
         await _record_turn_failure(
             session_id, turn_started_at, "turn_failed", "Something went wrong while processing your message."
         )
+
+
+async def _run_claimed_turn(
+    *, session_id: uuid.UUID, message: str, first_turn: bool, turn_started_at: datetime
+) -> None:
+    """A turn claimed by `ChatTurnRunner.claim()`. A worker has no request to inject clients from, so this resolves
+    the admin-selected provider's client (and the matching web-search backend) itself - inside the task, so the
+    whole turn (title, graph, embedding) uses ONE provider and a slow settings read never stalls the claim loop -
+    then runs the ordinary `_background_turn` (looked up at call time). Never raises except on cancellation."""
+    from app import deps
+
+    try:
+        client = await providers.active_client()
+        web_search = web_search_mod.web_search_for(providers.provider_of(client))
+        jev = deps.get_jev_client()
+    except asyncio.CancelledError:
+        await _record_cancelled_turn(session_id, turn_started_at)
+        raise
+    except Exception as exc:  # noqa: BLE001 - a background task has no caller to raise to
+        logger.exception("Could not resolve the AI provider for chat turn session_id=%s.", session_id)
+        await _record_turn_failure(
+            session_id, turn_started_at, "bedrock_unavailable", f"The AI provider is not available: {exc}"
+        )
+        return
+    await _background_turn(
+        session_id=session_id, message=message, first_turn=first_turn, persist_user_message=False,
+        turn_started_at=turn_started_at, bedrock=client, web_search=web_search, jev=jev,
+    )
 
 
 def _chat_lease_values(worker_id: str) -> dict:
@@ -441,17 +474,13 @@ class ChatTurnRunner:
                 )
             ).all()
             await db.commit()
-        if rows:
-            from app import deps  # a worker has no request to inject clients: use the process singletons
-
-            bedrock, web_search, jev = deps.get_bedrock_client(), deps.get_web_search_client(), deps.get_jev_client()
         for session_id, message, first_turn, started_at in rows:
             logger.info("Claimed chat turn for session_id=%s", session_id)
+            # The clients are resolved inside the task (current AI provider): see `_run_claimed_turn`.
             self.spawn(
                 session_id,
-                _background_turn(
-                    session_id=session_id, message=message, first_turn=bool(first_turn), persist_user_message=False,
-                    turn_started_at=started_at, bedrock=bedrock, web_search=web_search, jev=jev,
+                _run_claimed_turn(
+                    session_id=session_id, message=message, first_turn=bool(first_turn), turn_started_at=started_at
                 ),
             )
         return len(rows)
@@ -725,8 +754,9 @@ async def _maybe_materialize(
     # scorecard never got a `scorecard_embeddings` row, so `check_similarity`'s "next
     # time a similar query comes in, suggest existing stuff" reuse feature (see
     # scorecard_builder.py) could never find it. Best-effort for the same reason
-    # materialization above is: a Titan embedding failure must not fail the chat turn
-    # that just successfully saved a real scorecard.
+    # materialization above is: an embedding failure must not fail the chat turn
+    # that just successfully saved a real scorecard. The row is keyed by the turn's own
+    # client's embedding model (Titan on Bedrock, text-embedding-3-small on OpenRouter).
     try:
         await upsert_scorecard_embedding(db, version.id, bedrock)
     except Exception:  # noqa: BLE001 — best-effort, see comment above
@@ -863,7 +893,6 @@ async def start_chat_session(
     # this row gets, instead of a server-only id the client can't learn until this whole
     # (long-running) request returns.
     session_id = payload.session_id or uuid.uuid4()
-    settings = get_settings()
     session = ChatSession(id=session_id, user_id=current_user.id)
     db.add(session)
     try:
@@ -900,7 +929,7 @@ async def start_chat_session(
             str(session_id),
             payload.message,
             bedrock,
-            chat_model_id=settings.bedrock_chat_model_id,
+            chat_model_id=providers.models_of(bedrock).chat,
             db=db,
             web_search_client=web_search,
             turn_started_at=turn_started_at,
@@ -1036,13 +1065,12 @@ async def _start_refine_session(
         await _persist_message(db, session.id, ChatMessageRole.USER, message)
         await db.commit()
         turn_started_at = await _mark_new_turn(db, session.id)
-        settings = get_settings()
         try:
             turn = await send_message(
                 str(session.id),
                 message,
                 bedrock,
-                chat_model_id=settings.bedrock_chat_model_id,
+                chat_model_id=providers.models_of(bedrock).chat,
                 db=db,
                 web_search_client=web_search,
                 turn_started_at=turn_started_at,
@@ -1135,13 +1163,12 @@ async def send_chat_message(
         response.status_code = status.HTTP_202_ACCEPTED
         return await _accepted_response(session)
 
-    settings = get_settings()
     try:
         turn = await send_message(
             str(session.id),
             payload.message,
             bedrock,
-            chat_model_id=settings.bedrock_chat_model_id,
+            chat_model_id=providers.models_of(bedrock).chat,
             db=db,
             web_search_client=web_search,
             turn_started_at=turn_started_at,

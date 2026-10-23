@@ -32,7 +32,8 @@ $SmArn = "arn:aws:states:${Region}:${AccountId}:stateMachine:$Prefix-pipeline"
 Write-Host "This will PERMANENTLY delete in account $AccountId ($Region):"
 Write-Host "  S3 bucket $Bucket and ALL its objects, ECR repo $Prefix-worker, 6 Lambda functions + log groups,"
 Write-Host "  state machine $Prefix-pipeline, IAM roles $Prefix-lambda-role / $Prefix-sfn-role, IAM user qs-backend-app (+keys),"
-Write-Host "  budget $Prefix-monthly, and the related lines in infra/.env."
+Write-Host "  SSM parameter /$Prefix/openrouter-api-key, budget $Prefix-monthly, and the related lines in infra/.env"
+Write-Host "  (OPENROUTER_API_KEY stays there)."
 if (-not $Dry -and -not $Yes) {
   $answer = Read-Host "Type the bucket name ($Bucket) to continue"
   if ($answer -ne $Bucket) { Write-Host 'Aborted.'; exit 1 }
@@ -45,6 +46,8 @@ foreach ($s in 'ingest', 'extract-doc', 'plan-audio', 'transcribe-chunk', 'analy
   Invoke-AwsMut lambda delete-function --function-name "$Prefix-$s"
   Invoke-AwsMut logs delete-log-group --log-group-name "/aws/lambda/$Prefix-$s"
 }
+Write-Host '==> SSM parameter (OpenRouter key)'
+Invoke-AwsMut ssm delete-parameter --name "/$Prefix/openrouter-api-key"
 Write-Host '==> ECR'
 Invoke-AwsMut ecr delete-repository --repository-name "$Prefix-worker" --force
 Write-Host '==> S3 (empties the bucket first)'

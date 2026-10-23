@@ -28,6 +28,7 @@ from sqlalchemy.orm import selectinload
 
 from app.ai.bedrock_client import BedrockClientProtocol
 from app.ai.judge import compute_final_score, effective_leaf_weights, leaf_nodes
+from app.ai.providers import models_of
 from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.limits.redis_semaphore import get_semaphore
@@ -473,11 +474,11 @@ async def run_scoring(evaluation_id: uuid.UUID, deps: ScoringDeps) -> None:
     `PipelineError` on a business failure; any other exception is wrapped as `scoring_failed`."""
     from app.ai.bedrock_client import BedrockUnavailableError
 
-    settings = get_settings()
+    models = models_of(deps.bedrock)  # the client's own provider's models (Bedrock or OpenRouter)
     if deps.master_model_id is None:
-        deps.master_model_id = settings.bedrock_master_model_id
+        deps.master_model_id = models.master
     if deps.fallback_model_id is None:
-        deps.fallback_model_id = settings.bedrock_judge_model_id
+        deps.fallback_model_id = models.judge
     loaded = await _load_evaluation(evaluation_id)
     graph = build_scoring_graph(evaluation_id, deps, loaded)
     try:

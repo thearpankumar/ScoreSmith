@@ -6,7 +6,8 @@ Template with comments: [`infra/.env.example`](../infra/.env.example). **Never c
 
 How values reach the containers: `infra/docker-compose.yml` loads `infra/.env` into `migrate`, `backend` (api) and `worker`
 (`env_file`) and then overrides a few keys (`DATABASE_URL`, `REDIS_URL`, `ROLE`, `ENV`, `FRONTEND_URL`, `CORS_ORIGINS`,
-`FORWARDED_ALLOW_IPS`, `LOG_FORMAT`, `DB_POOL_*`, `AWS_BEARER_TOKEN_BEDROCK`). The `frontend` container gets **no** env_file, only
+`FORWARDED_ALLOW_IPS`, `LOG_FORMAT`, `DB_POOL_*`, `AWS_BEARER_TOKEN_BEDROCK`) and passes the AI keys (`OPENROUTER_JEV_API`,
+`OPENROUTER_API_KEY`) explicitly. The `frontend` container gets **no** env_file, only
 `INTERNAL_API_BASE_URL`.
 
 "Required" below means required to *start the dev stack*; production adds the checks listed in [Production validation](#production-validation).
@@ -109,7 +110,7 @@ How values reach the containers: `infra/docker-compose.yml` loads `infra/.env` i
 | `RATE_LIMIT_EXPORT` | `10/minute` | per user (export and bulk delete) |
 | `RATE_LIMIT_SHARE_LOOKUP` | `20/hour` | per *sender*: every invite / share attempt, bounds username probing |
 | `RATE_LIMIT_SHARE` | `60/minute` | per user |
-| `RATE_LIMIT_ADMIN` | `60/minute` | per admin |
+| `RATE_LIMIT_ADMIN` | `60/minute` | per admin (user management and settings) |
 
 ## LLM providers
 
@@ -128,10 +129,77 @@ How values reach the containers: `infra/docker-compose.yml` loads `infra/.env` i
 | `OPENROUTER_JEV_API` | no | empty | OpenRouter key for Jev (quality gate, mode router, per-KPI scoring). Empty: gates degrade to "passed"; evaluation scoring falls back to a model judgment flagged `needs_review` |
 | `OPENROUTER_JEV_MODEL_ID` | no | `typesafe/jev-1.13` | Pinned Jev model |
 | `REQUEST_ROUTER` | no | `auto` | `auto` / `jev` / `small_model` / `off`: cheap intent router in front of the full extraction |
-| `AGENTCORE_GATEWAY_WEB_SEARCH_URL`, `_TOOL_NAME`, `AGENTCORE_GATEWAY_AWS_ACCESS_KEY_ID`, `AGENTCORE_GATEWAY_AWS_SECRET_ACCESS_KEY` | no | empty | Web search for the research fan-out (a separate IAM principal). Any unset: web search returns no results, turns still succeed |
+| `AGENTCORE_GATEWAY_WEB_SEARCH_URL`, `_TOOL_NAME`, `AGENTCORE_GATEWAY_AWS_ACCESS_KEY_ID`, `AGENTCORE_GATEWAY_AWS_SECRET_ACCESS_KEY` | no | empty | Web search for the research fan-out (a separate IAM principal). Used whenever all four are set, whichever AI provider is active. Any unset: OpenRouter's web search when OpenRouter is the active provider, otherwise no results (turns still succeed) |
 
-Provider split in one line: chat, judge, master agent and embeddings use **Bedrock** (bearer token above); Jev uses **OpenRouter**;
+Provider split in one line: chat, judge, master agent, embeddings and the extraction Lambda's vision / transcription models use
+**the AI provider an admin chose** (Bedrock or OpenRouter, next section); Jev always uses **OpenRouter** with its own key;
 S3 and Step Functions use the dedicated `AWS_APP_*` keys below, never the Bedrock token.
+
+## AI provider: Bedrock or OpenRouter
+
+An **admin chooses the AI provider product-wide in Settings** (`GET` / `PUT /api/v1/admin/settings/ai-provider`). The choice is
+stored in the database (`app_settings`, key `ai_provider`), audit-logged, and applies to new chat turns and new evaluations within
+a few seconds on every container (each process caches it for 5 s). Running jobs finish on the provider they started with: an
+evaluation records it in `evaluations.ai_provider` and passes it to the extraction Lambda with its run.
+
+**Availability.** A provider can only be chosen while its credentials exist in the server environment; the other option is
+locked in the UI and a `PUT` for it answers 409.
+
+- **Bedrock** is available when `AWS_BEARER_TOKEN_BEDROCK` is longer than one character (compose sends `"A"` + the secret, so a
+  bare `"A"` means no key), or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are both set, or profile / container / web-identity
+  credentials are present (`AWS_PROFILE`, `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` / `_FULL_URI`, `AWS_WEB_IDENTITY_TOKEN_FILE`,
+  which covers ECS task roles), or botocore finds credentials in the shared AWS config (`~/.aws` default profile, SSO;
+  checked once per process). The EC2 instance metadata service is not probed, so `BEDROCK_AVAILABLE=true|false` overrides
+  the detection (for example for an EC2 instance role, which leaves no trace in the environment).
+- **OpenRouter** is available when `OPENROUTER_API_KEY` is set and not blank.
+
+**Effective provider.** The saved choice while it is available; otherwise the only available provider (Bedrock when both are and
+nothing was saved). With neither available the app behaves as Bedrock and AI calls fail with the usual "AI unavailable" errors.
+
+**Embeddings follow the provider.** Similarity search only compares vectors of the active embedding model. After a switch, a
+background backfill embeds the existing scorecards with the new model (the Titan rows stay, so switching back reuses them).
+
+| Name | Required | Default | Purpose |
+|---|---|---|---|
+| `OPENROUTER_API_KEY` | for OpenRouter | empty | OpenRouter key for the AI provider. **Separate from `OPENROUTER_JEV_API`**: Jev never uses it and it never falls back to the Jev key. `aws/bootstrap` and `aws/deploy-lambdas` copy it to SSM Parameter Store, where the extraction Lambda reads it |
+| `BEDROCK_AVAILABLE` | no | unset (detect) | `true` / `false` overrides the Bedrock credential detection above |
+| `OPENROUTER_AGENT_MODEL` | no | `openai/gpt-5-mini` | Chat, scorecard builder, judge-tier and evaluation-master calls |
+| `OPENROUTER_EMBED_MODEL` | no | `openai/text-embedding-3-small` | Embeddings, requested with `dimensions=1024` (the same width as Titan) |
+| `OPENROUTER_REASONING` | no | `low` | Reasoning effort, sent as `{"effort": ..., "exclude": true}` (`minimal` / `low` / `medium` / `high`; empty = model default) |
+| `OPENROUTER_MAX_OUTPUT_TOKENS` | no | `32000` | `max_tokens` per call; reasoning tokens count against it (`0` omits it) |
+| `OPENROUTER_PROVIDER_SORT` | no | `latency` | `provider.sort` for routing. `latency` keeps chat off the slower, capacity-limited `openai/flex` endpoint; empty = OpenRouter's default cheapest-first routing (flex's 50% discount, but slower) |
+| `OPENROUTER_MAX_CONCURRENCY` | no | `8` | Max simultaneous OpenRouter calls from the research fan-out per process (a separate pool from Bedrock's) |
+| `OPENROUTER_GLOBAL_CONCURRENCY` | no | `0` | Cluster-wide cap (Redis); `0` = `OPENROUTER_MAX_CONCURRENCY` |
+| `OPENROUTER_READ_TIMEOUT_SECONDS` / `OPENROUTER_CONNECT_TIMEOUT_SECONDS` | no | `240` / `10` | httpx client timeouts |
+| `OPENROUTER_MAX_ATTEMPTS` | no | `2` | Attempts on HTTP 502 / 503 and connection errors. A 429 is retried once (honouring `Retry-After`), then reported as throttling |
+| `OPENROUTER_SEARCH_ENGINE` | no | empty | Engine for the `openrouter:web_search` tool (empty = OpenRouter's default). Only used when AgentCore web search is not configured |
+| `OPENROUTER_SEARCH_MAX_RESULTS` | no | `5` | Results per OpenRouter web search (a search costs roughly a cent, mostly the injected page text) |
+| `OPENROUTER_API_BASE` | no | `https://openrouter.ai/api/v1` | API base URL |
+| `OPENROUTER_HTTP_REFERER` / `OPENROUTER_APP_TITLE` | no | empty / `ScoreSmith` | Optional app-attribution headers (`HTTP-Referer`, `X-OpenRouter-Title`) |
+
+Request details for `openai/gpt-5-mini`: `temperature` / `top_p` are never sent (the model rejects them; a call that asked for
+`temperature=0` sends `seed` instead), a single forced tool uses a named-function `tool_choice`, `provider.require_parameters` is
+`true`, and a parameter OpenRouter rejects for a model is dropped and remembered for the life of the process.
+
+**Model map**
+
+| Task | Bedrock | OpenRouter |
+|---|---|---|
+| Chat agent and scorecard builder | `zai.glm-5` (`BEDROCK_CHAT_MODEL_ID`) | `openai/gpt-5-mini` (`OPENROUTER_AGENT_MODEL`) |
+| Judge-tier calls (routing, dedupe, header, session title, judge ensemble, Jev fallback) | `zai.glm-4.7-flash` (`BEDROCK_JUDGE_MODEL_ID`) | `openai/gpt-5-mini` |
+| Evaluation master and batch column mapping | `us.meta.llama4-maverick-17b-instruct-v1:0` (`BEDROCK_MASTER_MODEL_ID`) | `openai/gpt-5-mini` |
+| Embeddings (1024 dims) | `amazon.titan-embed-text-v2:0` (`BEDROCK_EMBEDDING_MODEL_ID`) | `openai/text-embedding-3-small` (`OPENROUTER_EMBED_MODEL`) |
+| Lambda image analysis | Kimi K2.5, then Qwen3-VL-235B, then Llama 4 Maverick | `qwen/qwen3.7-flash`, then `qwen/qwen3-vl-235b-a22b-instruct` |
+| Lambda audio transcription | Amazon Transcribe, then Voxtral Small 24B / Mini 3B (Bedrock's Voxtral rejects audio since Oct 2026) | `mistralai/voxtral-small-24b-2507` (chat `input_audio`), then `mistralai/voxtral-mini-3b-2507` (`/audio/transcriptions`) |
+| `web_search` tool | AgentCore (if configured) | AgentCore if configured, else the `openrouter:web_search` server tool |
+| Jev quality gate | `OPENROUTER_JEV_API`, unchanged | same |
+
+The Lambda owns its model lists (see [aws/README.md](../aws/README.md)); Settings shows them for information only.
+
+**Ignored legacy names.** An earlier prototype used `LLM_PROVIDER`, `OPENROUTER_BASE_URL`, `OPENROUTER_CHAT_MODEL_ID`,
+`OPENROUTER_JUDGE_MODEL_ID`, `OPENROUTER_MASTER_MODEL_ID`, `OPENROUTER_EMBEDDING_MODEL_ID`, `OPENROUTER_SEARCH_MODEL_ID`,
+`OPENROUTER_REASONING_EFFORT`, `OPENROUTER_WEB_SEARCH_ENGINE` and `OR_*` aliases. None of them has any effect; the api logs a
+warning at startup naming any that are still set (names only, never values). Remove them from `infra/.env`.
 
 ## Chat builder tuning
 

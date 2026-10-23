@@ -1,4 +1,4 @@
-"""Adaptive concurrency limiter for the master model's Bedrock calls.
+"""Adaptive concurrency limiter for the master model's LLM calls (one per AI provider).
 
 Several evaluations score at once and share one Bedrock quota. A fixed number of in-flight calls is
 either too timid (slow batches) or too bold (a throttling storm). This limiter is AIMD: it starts at
@@ -122,13 +122,19 @@ class AdaptiveLimiter:
             )
 
 
-_limiter: AdaptiveLimiter | None = None
+_limiters: dict[str, AdaptiveLimiter] = {}
 
 
-def get_master_limiter() -> AdaptiveLimiter:
-    """Process-wide limiter, sized from `bedrock_max_concurrency`."""
-    global _limiter
-    maximum = get_settings().bedrock_max_concurrency
-    if _limiter is None or _limiter.maximum != maximum:
-        _limiter = AdaptiveLimiter(maximum, name="master")
-    return _limiter
+def get_master_limiter(provider: str = "bedrock") -> AdaptiveLimiter:
+    """Process-wide limiter for one AI provider's master-model calls. Each provider has its own quota, so its
+    own AIMD state: Bedrock keeps the shared name "master" (its live Redis keys are unchanged) and is sized from
+    `bedrock_max_concurrency`; OpenRouter uses "master:openrouter" sized from `openrouter_max_concurrency`."""
+    settings = get_settings()
+    if provider == "openrouter":
+        key, name, maximum = "openrouter", "master:openrouter", settings.openrouter_max_concurrency
+    else:
+        key, name, maximum = "bedrock", "master", settings.bedrock_max_concurrency
+    limiter = _limiters.get(key)
+    if limiter is None or limiter.maximum != max(1, maximum):
+        limiter = _limiters[key] = AdaptiveLimiter(maximum, name=name)
+    return limiter

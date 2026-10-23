@@ -2,11 +2,13 @@ import io
 
 import pytest
 
-from fakes import FakeConverse, MemoryStore
-from worker import audio, bedrock_ops as bo
+from fakes import FakeConverse, FakeTranscribe, MemoryStore, client_error
+from worker import audio, bedrock_ops as bo, images, media, prompts
 from worker.errors import PipelineError, TransientError
 
 EID = "e1"
+# captured at import, before tests/conftest.py's guard replaces it for every test
+REAL_FETCH_TRANSCRIPT = bo._fetch_transcript
 
 
 # ----------------------------------------------------------------------------- chunk planning
@@ -84,9 +86,10 @@ def test_run_plan_audio_no_audio_and_invalid(tmp_path):
 # ----------------------------------------------------------------------------- transcription fallback
 def test_voxtral_small_then_mini_fallback():
     fc = FakeConverse({"mistral.voxtral-small-24b-2507": RuntimeError("throttled"), "mistral.voxtral-mini-3b-2507": "hello world"})
+    # no S3 location: Amazon Transcribe is skipped, the Bedrock models get the bytes
     text, model, usage = bo.transcribe(fc, bo.TRANSCRIBE_MODELS, b"mp3")
     assert (text, model) == ("hello world", "mistral.voxtral-mini-3b-2507")
-    assert [c["modelId"] for c in fc.calls] == bo.TRANSCRIBE_MODELS
+    assert [c["modelId"] for c in fc.calls] == bo.TRANSCRIBE_MODELS[1:]
     call = fc.calls[0]["messages"][0]["content"]
     assert call[0]["audio"]["format"] == "mp3" and call[1]["text"] == "Transcribe this audio verbatim. Output only the transcript."
     assert fc.calls[0]["inferenceConfig"] == {"maxTokens": 8000, "temperature": 0}
@@ -98,14 +101,104 @@ def test_transcribe_all_models_fail_is_transient():
         bo.transcribe(fc, bo.TRANSCRIBE_MODELS, b"x")
 
 
+# ----------------------------------------------------------------------------- Amazon Transcribe (Bedrock runs)
+URI = "s3://b/derived/e1/video/v1/chunks/c1.mp3"
+
+
+def fake_clock():
+    t = [0.0]
+
+    def sleep(s):
+        t[0] += s
+
+    return t, sleep, (lambda: t[0])
+
+
+def test_amazon_transcribe_is_first_and_waits_for_the_job(monkeypatch):
+    monkeypatch.setattr(bo, "_fetch_transcript", lambda uri, session=None: f"text from {uri}")
+    ft = FakeTranscribe(statuses=["QUEUED", "IN_PROGRESS", "COMPLETED"])
+    t, sleep, clock = fake_clock()
+    text = bo.transcribe_job(ft, URI, "qs-eval-e1-v1-c1", sleep=sleep, clock=clock)
+    assert text == "text from https://transcripts.test/qs-eval-e1-v1-c1"
+    assert [c[0] for c in ft.calls] == ["start", "get", "get", "get"]
+    assert ft.calls[0][1] == {"TranscriptionJobName": "qs-eval-e1-v1-c1", "Media": {"MediaFileUri": URI},
+                              "MediaFormat": "mp3", "IdentifyLanguage": True}
+    assert 0 < t[0] < 10  # two short polls
+
+
+def test_a_retried_step_picks_up_the_existing_job(monkeypatch):
+    monkeypatch.setattr(bo, "_fetch_transcript", lambda uri, session=None: "ok")
+    ft = FakeTranscribe(statuses=["IN_PROGRESS", "COMPLETED"], start_exc=client_error("ConflictException"))
+    _t, sleep, clock = fake_clock()
+    assert bo.transcribe_job(ft, URI, "j", sleep=sleep, clock=clock) == "ok"
+    assert [c[0] for c in ft.calls] == ["start", "get", "get"]  # no second job, no delete
+
+
+def test_a_failed_job_is_restarted_once_then_falls_through(monkeypatch):
+    monkeypatch.setattr(bo, "_fetch_transcript", lambda uri, session=None: "ok")
+    _t, sleep, clock = fake_clock()
+    ft = FakeTranscribe(statuses=["FAILED", "COMPLETED"], start_exc=None)
+    assert bo.transcribe_job(ft, URI, "j", sleep=sleep, clock=clock) == "ok"
+    assert [c[0] for c in ft.calls] == ["start", "get", "delete", "start", "get"]
+    ft2 = FakeTranscribe(statuses=["FAILED"])
+    with pytest.raises(RuntimeError, match="bad media"):
+        bo.transcribe_job(ft2, URI, "j", sleep=sleep, clock=clock)
+
+
+def test_a_job_still_running_at_the_deadline_is_transient():
+    _t, sleep, clock = fake_clock()
+    ft = FakeTranscribe(statuses=["IN_PROGRESS"])
+    with pytest.raises(TransientError, match="still IN_PROGRESS"):
+        bo.transcribe_job(ft, URI, "j", sleep=sleep, clock=clock, wait_s=60)
+    assert all(c[0] != "delete" for c in ft.calls)  # the retried step keeps waiting on the same job
+
+
+def test_transcribe_falls_back_to_voxtral_when_amazon_transcribe_is_denied():
+    fc = FakeConverse({"mistral.voxtral-small-24b-2507": "from voxtral"})
+    ft = FakeTranscribe(start_exc=client_error("AccessDeniedException"))
+    text, model, _ = bo.transcribe(fc, bo.TRANSCRIBE_MODELS, b"x", s3_uri=URI, job_name="qs-eval-e1-v1-c1",
+                                   transcriber=ft)
+    assert (text, model) == ("from voxtral", "mistral.voxtral-small-24b-2507")
+
+
+def test_job_names_are_made_safe():
+    assert bo.safe_job_name("qs-eval-e1-v 1/x-c1") == "qs-eval-e1-v-1-x-c1"
+    assert len(bo.safe_job_name("qs-eval-" + "a" * 300)) == 200
+
+
+def test_fetch_transcript_reads_the_output_json():
+    class Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"results": {"transcripts": [{"transcript": " spoken words "}]}}
+
+    class Session:
+        def get(self, uri, timeout=None):
+            assert uri == "https://transcripts.test/j" and timeout == (10, 60)
+            return Resp()
+
+    class Down:
+        def get(self, uri, timeout=None):
+            raise ConnectionError("network down")
+
+    assert REAL_FETCH_TRANSCRIPT("https://transcripts.test/j", Session()) == "spoken words"
+    with pytest.raises(TransientError, match="could not download"):
+        REAL_FETCH_TRANSCRIPT("https://transcripts.test/j", Down())
+
+
 def test_run_transcribe_chunk_writes_outputs():
     s = MemoryStore()
     s.put_bytes("derived/e1/video/v1/chunks/c1.mp3", b"audio")
     fc = FakeConverse({"mistral.voxtral-small-24b-2507": " spoken words "})
-    out = bo.run_transcribe_chunk({"evaluation_id": EID, "bucket": "b", "source_id": "v1",
-                                   "chunk": {"index": 1, "key": "derived/e1/video/v1/chunks/c1.mp3", "start": 0, "end": 60}}, s, client=fc)
+    out = media.run_transcribe_chunk({"evaluation_id": EID, "bucket": "b", "source_id": "v1",
+                                   "chunk": {"index": 1, "key": "derived/e1/video/v1/chunks/c1.mp3", "start": 0, "end": 60}}, s, client=fc,
+                                     models=bo.TRANSCRIBE_MODELS[1:])  # the Voxtral path (Amazon Transcribe: see below)
     assert out["chars"] == 12
     assert s.get_text("derived/e1/video/v1/chunks/c1.txt") == "spoken words"
+    meta = s.get_json("derived/e1/video/v1/chunks/c1.json")
+    assert (meta["model"], meta["tokens_in"], meta["tokens_out"]) == ("mistral.voxtral-small-24b-2507", 1, 2)
     assert s.exists("derived/e1/progress/chunk/v1/1.done")
 
 
@@ -126,8 +219,8 @@ def test_vision_fallback_order_kimi_qwen_maverick():
     text, model, _ = bo.analyse(fc, bo.VISION_MODELS, jpeg(), "jpeg")
     assert model == "us.meta.llama4-maverick-17b-instruct-v1:0" and [c["modelId"] for c in fc.calls] == bo.VISION_MODELS
     content = fc.calls[0]["messages"][0]["content"]
-    assert content[1]["text"] == bo.IMAGE_PROMPT  # no scorecard context given: the neutral prompt
-    assert fc.calls[0]["inferenceConfig"] == {"maxTokens": 3000, "temperature": 0}
+    assert content[1]["text"] == prompts.IMAGE_PROMPT  # no scorecard context given: the neutral prompt
+    assert fc.calls[0]["inferenceConfig"] == {"maxTokens": 4000, "temperature": 0}
 
 
 def test_vision_empty_response_falls_through():
@@ -137,10 +230,10 @@ def test_vision_empty_response_falls_through():
 
 def test_prepare_keeps_small_original_and_shrinks_large():
     raw = jpeg((300, 300))
-    data, fmt = bo.prepare(raw, "jpg")
+    data, fmt = images.prepare(raw, "jpg")
     assert data == raw and fmt == "jpeg"
     big = jpeg((1500, 1500), noise=True)
-    data, fmt = bo.prepare(big, "jpg", budget=60_000)
+    data, fmt = images.prepare(big, "jpg", budget=60_000)
     assert len(data) <= 60_000 and fmt == "jpeg"
 
 
@@ -165,13 +258,13 @@ def test_run_analyze_image_writes_analysis_and_rejects_foreign_keys():
     key = "derived/e1/docs/d1/images/0002_p01_image.jpg"
     s.put_bytes(key, jpeg())
     fc = FakeConverse({bo.VISION_MODELS[0]: "## Summary\nA chart."})
-    out = bo.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": key}, s, client=fc)
+    out = media.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": key}, s, client=fc)
     assert out["ok"]
     body = s.get_text("derived/e1/docs/d1/images/0002_p01_image.analysis.md")
     assert body.startswith("<!-- source: 0002_p01_image.jpg | model: moonshotai.kimi-k2.5") and "A chart." in body
     assert s.exists("derived/e1/progress/img/d1/0002.done")
     with pytest.raises(PipelineError):
-        bo.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": "derived/other/docs/d1/images/1_x.jpg"}, s, client=fc)
+        media.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": "derived/other/docs/d1/images/1_x.jpg"}, s, client=fc)
 
 
 CONTEXT = {"scorecard": "Billing Support QA", "domain": "Customer Support",
@@ -179,20 +272,20 @@ CONTEXT = {"scorecard": "Billing Support QA", "domain": "Customer Support",
 
 
 def test_image_prompt_is_neutral_without_context():
-    assert bo.image_prompt(None) == bo.IMAGE_PROMPT == bo.image_prompt({}) == bo.image_prompt({"other": "x"})
-    assert "hackathon" not in bo.IMAGE_PROMPT.lower()
-    assert bo.IMAGE_PROMPT.startswith("You are analysing one image taken from a document submitted for evaluation")
+    assert prompts.image_prompt(None) == prompts.IMAGE_PROMPT == prompts.image_prompt({}) == prompts.image_prompt({"other": "x"})
+    assert "hackathon" not in prompts.IMAGE_PROMPT.lower()
+    assert prompts.IMAGE_PROMPT.startswith("You are analysing one image taken from a document submitted for evaluation")
 
 
 def test_image_prompt_carries_the_scorecard_context_and_a_guard():
-    prompt = bo.image_prompt(CONTEXT)
-    assert prompt.endswith(bo.IMAGE_PROMPT)
-    head = prompt[: -len(bo.IMAGE_PROMPT)]
+    prompt = prompts.image_prompt(CONTEXT)
+    assert prompt.endswith(prompts.IMAGE_PROMPT)
+    head = prompt[: -len(prompts.IMAGE_PROMPT)]
     assert '"Billing Support QA"' in head and "Customer Support" in head
     assert "first-contact resolution" in head and "Call transcripts." in head
     assert "never describe anything that is not in the image" in head.lower()
-    long = bo.image_prompt({"scorecard": "S", "purpose": "p" * 9000})
-    assert len(long) < len(bo.IMAGE_PROMPT) + 2500  # clipped, a hostile payload cannot blow up every image call
+    long = prompts.image_prompt({"scorecard": "S", "purpose": "p" * 9000})
+    assert len(long) < len(prompts.IMAGE_PROMPT) + 2500  # clipped, a hostile payload cannot blow up every image call
 
 
 def test_analyze_image_uses_the_context_saved_by_ingest():
@@ -201,8 +294,8 @@ def test_analyze_image_uses_the_context_saved_by_ingest():
     s.put_bytes(key, jpeg())
     s.put_json("derived/e1/context.json", CONTEXT)
     fc = FakeConverse({bo.VISION_MODELS[0]: "## Summary\nA call-flow diagram."})
-    assert bo.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": key}, s, client=fc)["ok"]
-    assert fc.calls[0]["messages"][0]["content"][1]["text"] == bo.image_prompt(CONTEXT)
+    assert media.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": key}, s, client=fc)["ok"]
+    assert fc.calls[0]["messages"][0]["content"][1]["text"] == prompts.image_prompt(CONTEXT)
 
 
 def test_analyze_image_without_saved_context_uses_the_neutral_prompt():
@@ -211,13 +304,13 @@ def test_analyze_image_without_saved_context_uses_the_neutral_prompt():
     s.put_bytes(key, jpeg())
     s.put_bytes("derived/e1/context.json", b"{not json")  # unreadable context never fails the image step
     fc = FakeConverse({bo.VISION_MODELS[0]: "## Summary\nA chart."})
-    assert bo.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": key}, s, client=fc)["ok"]
-    assert fc.calls[0]["messages"][0]["content"][1]["text"] == bo.IMAGE_PROMPT
+    assert media.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": key}, s, client=fc)["ok"]
+    assert fc.calls[0]["messages"][0]["content"][1]["text"] == prompts.IMAGE_PROMPT
 
 
 def test_undecodable_image_is_soft_failure():
     s = MemoryStore()
     key = "derived/e1/docs/d1/images/0003_image.jpg"
     s.put_bytes(key, b"not an image")
-    out = bo.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": key}, s, client=FakeConverse({}))
+    out = media.run_analyze_image({"evaluation_id": EID, "bucket": "b", "source_id": "d1", "image_key": key}, s, client=FakeConverse({}))
     assert out["ok"] is False and s.exists("derived/e1/progress/img/d1/0003.failed")

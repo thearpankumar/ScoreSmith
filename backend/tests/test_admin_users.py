@@ -44,6 +44,8 @@ def test_every_admin_endpoint_is_403_for_a_normal_user_and_401_anonymous(client:
         ("PATCH", f"{ADMIN}/{uid}", {"name": "y"}), ("POST", f"{ADMIN}/{uid}/password", {"password": GOOD_PW}),
         ("POST", f"{ADMIN}/{uid}/deactivate", None), ("POST", f"{ADMIN}/{uid}/reactivate", None),
         ("DELETE", f"{ADMIN}/{uid}", None),
+        ("GET", "/api/v1/admin/settings/ai-provider", None),
+        ("PUT", "/api/v1/admin/settings/ai-provider", {"provider": "bedrock"}),
     ]
     for method, path, body in calls:
         r = client.request(method, path, json=body, headers=hdr(team.owner))

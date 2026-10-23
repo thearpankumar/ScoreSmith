@@ -227,7 +227,7 @@ ScoreSmith/
 |---|---|
 | Backend | Python 3.12, FastAPI, SQLAlchemy 2.0 (async), Alembic, `psycopg` v3, Pydantic v2, gunicorn + uvicorn |
 | Agents / LLMs | LangGraph with Postgres checkpoints; AWS Bedrock (GLM-5 chat, GLM-4.7-Flash judge, Llama 4 Maverick master, Titan embeddings); Jev via OpenRouter; AgentCore Gateway web search |
-| Evaluation processing | S3 + Step Functions + six Lambda functions (PyMuPDF, python-docx, ffmpeg, Voxtral, vision OCR) |
+| Evaluation processing | S3 + Step Functions + six Lambda functions (PyMuPDF, python-docx, ffmpeg, Amazon Transcribe / Voxtral, vision OCR) |
 | Data | PostgreSQL 17 with `pgvector` and `ltree`; Redis 7 (optional) |
 | Auth | Argon2id, JWT access tokens, rotating refresh tokens, `limits` rate limiting |
 | Frontend | Next.js 15, React 19, TypeScript, Tailwind CSS 4, shadcn/ui on Radix, Recharts, TanStack Table |

@@ -933,6 +933,30 @@ async def test_weighting_step_proposes_weights_and_a_validated_formula_with_rati
 
 
 @pytest.mark.usefixtures("_migrated_db")
+async def test_a_proposed_formula_that_does_not_gate_is_dropped_and_the_weights_stay() -> None:
+    # seen live with gpt-5-mini: an equal-weight avg() over every KPI, which would silently cancel the weights
+    plain = [
+        'avg(kpi["Defect Rate"], kpi["Review Coverage"], kpi["On-time Delivery"])',
+        'kpi["Defect Rate"] * 0.6 + kpi["Review Coverage"] * 0.3 + kpi["On-time Delivery"] * 0.1',
+    ]
+    for formula in plain:
+        pipeline = _Pipeline(weighting=_weighting(formula))
+        fake = FakeBedrockClient(converse_fn=pipeline, classify_fn=_classify_with(_FLAT_KPIS))
+        turn = await sb.start_session(str(uuid.uuid4()), _USER_MESSAGE, fake, web_search_client=None)
+        assert turn.draft["scoring_formula"] is None
+        assert {k["name"]: k["weight"] for k in turn.draft["kpis"]}["Defect Rate"] == pytest.approx(60.0)
+
+
+def test_is_gating_formula() -> None:
+    assert sb._is_gating_formula(_GATING)
+    assert sb._is_gating_formula('max(kpi["A"], kpi["B"])') and sb._is_gating_formula('(kpi["A"] * kpi["B"]) ** 0.5')
+    assert sb._is_gating_formula('sqrt(kpi["A"] * kpi["B"])') and sb._is_gating_formula('(kpi["A"] >= 3) * kpi["B"]')
+    assert not sb._is_gating_formula('avg(kpi["A"], kpi["B"])')
+    assert not sb._is_gating_formula('kpi["A"] * 0.5 + kpi["B"] / 2')
+    assert not sb._is_gating_formula('avg(kpi["Min response time"], kpi["Score <3 rate"])')  # names don't count
+
+
+@pytest.mark.usefixtures("_migrated_db")
 async def test_a_proposed_formula_that_skips_a_kpi_or_is_invalid_is_not_applied() -> None:
     for formula in ('min(kpi["Defect Rate"], kpi["Review Coverage"])', 'kpi["Nope"] * 1'):
         pipeline = _Pipeline(weighting=_weighting(formula))

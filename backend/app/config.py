@@ -7,7 +7,7 @@ import secrets
 from functools import lru_cache
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -195,6 +195,49 @@ class Settings(BaseSettings):
     # Pinned version (not the "~typesafe/jev-latest" rolling alias) — confirmed live
     # against this account's OpenRouter access on 2026-09-30 (see jev_client.py).
     openrouter_jev_model_id: str = "typesafe/jev-1.13"
+
+    # --- AI provider: AWS Bedrock or OpenRouter (app/ai/providers.py) ---
+    # An admin picks the provider product-wide in Settings (stored in the app_settings table); a provider is
+    # only selectable when its credentials exist here. OPENROUTER_API_KEY is SEPARATE from OPENROUTER_JEV_API
+    # above: the Jev quality gate never falls back to it, and it never falls back to the Jev key.
+    openrouter_api_key: str = ""
+    openrouter_api_base: str = "https://openrouter.ai/api/v1"
+    # One model for chat, judge-tier and evaluation-master calls; embeddings at 1024 dims (same width as Titan).
+    openrouter_agent_model: str = "openai/gpt-5-mini"
+    openrouter_embed_model: str = "openai/text-embedding-3-small"
+    # Reasoning effort sent as {"effort": ..., "exclude": true} (minimal | low | medium | high; empty = omit).
+    openrouter_reasoning: str = "low"
+    # max_tokens per call. Reasoning tokens count against it, so it is larger than Bedrock's ceiling. 0 = omit.
+    openrouter_max_output_tokens: int = 32000
+    # Per-process / cluster-wide (Redis) caps on concurrent OpenRouter calls from the research fan-out
+    # (0 = use the per-process cap cluster-wide too).
+    openrouter_max_concurrency: int = 8
+    openrouter_global_concurrency: int = 0
+    openrouter_read_timeout_seconds: int = 240
+    openrouter_connect_timeout_seconds: int = 10
+    # Total attempts on 502/503 (a 429 is retried once, honouring Retry-After).
+    openrouter_max_attempts: int = 2
+    # provider.sort for routing: "latency" keeps chat off the slower, capacity-limited flex endpoint;
+    # empty = OpenRouter's default (cheapest-first) routing.
+    openrouter_provider_sort: str = "latency"
+    # The `openrouter:web_search` server tool, used only when AgentCore web search is not configured.
+    # Engine empty = OpenRouter's default (native where the provider has one, else Exa).
+    openrouter_search_engine: str = ""
+    openrouter_search_max_results: int = 5
+    # Optional app attribution headers (HTTP-Referer / X-OpenRouter-Title).
+    openrouter_http_referer: str = ""
+    openrouter_app_title: str = "ScoreSmith"
+    # Overrides Bedrock credential detection: true = always selectable, false = always locked,
+    # unset = detected from AWS_BEARER_TOKEN_BEDROCK / access keys / profile / container credentials.
+    bedrock_available: bool | None = None
+
+    @field_validator("bedrock_available", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        # docker compose passes `${BEDROCK_AVAILABLE:-}` as an empty string when it is not set.
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     # --- AI evaluation pipeline (file / Google Drive evaluations; see docs/ai-eval-contract.md) ---
     # Master model for identify / digest / evidence selection / reasoning (Llama 4 Maverick profile).

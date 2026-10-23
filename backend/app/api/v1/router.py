@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from app.api.v1 import (
+    admin_settings,
     admin_users,
     auth,
     chat,
@@ -31,6 +32,7 @@ api_router.include_router(sharing.router)
 api_router.include_router(notifications.router)
 api_router.include_router(notifications.slots_router)
 api_router.include_router(admin_users.router)
+api_router.include_router(admin_settings.router)
 api_router.include_router(kpi_nodes.router)
 # AI evaluation routes first: literal `/evaluations/ai/...` paths must win over `/evaluations/{id}`.
 api_router.include_router(evaluations_ai.router)

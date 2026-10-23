@@ -36,6 +36,24 @@
       ]
     },
     {
+      "Sid": "ReadOpenRouterKey",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter/qs-eval/openrouter-api-key"
+    },
+    {
+      "Sid": "StartTranscriptionJobs",
+      "Effect": "Allow",
+      "Action": "transcribe:StartTranscriptionJob",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadAndDeleteOwnTranscriptionJobs",
+      "Effect": "Allow",
+      "Action": ["transcribe:GetTranscriptionJob", "transcribe:DeleteTranscriptionJob"],
+      "Resource": "arn:aws:transcribe:${REGION}:${ACCOUNT_ID}:transcription-job/qs-eval-*"
+    },
+    {
       "Sid": "WriteOwnLogs",
       "Effect": "Allow",
       "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
