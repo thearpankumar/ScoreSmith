@@ -1,4 +1,7 @@
-"""Video -> audio -> silence-aware chunks (ported from scripts/transcribe_videos.py) and the PlanAudio step."""
+"""Video -> audio -> silence-aware chunks (ported from scripts/transcribe_videos.py) and the PlanAudio step.
+
+PlanAudio runs in parallel with PlanFrames (frames.py), which samples the same video's pictures. A video without an
+audio track is therefore only "skipped" when its visual analysis is off as well."""
 from __future__ import annotations
 
 import os
@@ -7,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 
+from . import video_settings
 from .errors import PipelineError
 from .progress import Progress
 from .store import derived
@@ -98,6 +102,10 @@ def run_plan_audio(event: dict, store, probe_fn=probe, extract_fn=extract_audio,
     out = {"source_id": sid, "chunks": [], "has_audio": False}
     prefix = derived(eid, "video", sid)
     prog.file(sid, name, "running", "extracting audio")
+
+    def frames_analysed() -> bool:  # PlanFrames works on the same video: no audio is then not the end of the file
+        return video_settings.load(store, eid).mode != "off"
+
     tmp = tempfile.mkdtemp(prefix="plan_", dir=tmp_root)
     try:
         video = os.path.join(tmp, "video." + (f["raw_key"].rsplit(".", 1)[-1] if "." in f["raw_key"] else "bin"))
@@ -108,7 +116,10 @@ def run_plan_audio(event: dict, store, probe_fn=probe, extract_fn=extract_audio,
         if not has_audio:
             store.put_json(f"{prefix}/plan.json", {"source": name, "duration_sec": round(duration, 1),
                                                    "has_audio": False, "chunks": []})
-            prog.file(sid, name, "skipped", "no audio track in this video")
+            if frames_analysed():
+                prog.file(sid, name, "running", "no audio track; analysing the frames")
+            else:
+                prog.file(sid, name, "skipped", "no audio track in this video")
             return out
         if duration > MAX_DURATION_S:
             raise PipelineError("file_too_large", f"Video is {duration / 3600:.1f} h long (limit {MAX_DURATION_S // 3600} h)")
@@ -141,7 +152,10 @@ def run_plan_audio(event: dict, store, probe_fn=probe, extract_fn=extract_audio,
         return out
     except PipelineError as e:
         store.put_json(f"{prefix}/plan.json", {"source": name, "error": e.message, "chunks": [], "has_audio": False})
-        prog.file(sid, name, "failed", e.message[:200])
+        if frames_analysed():
+            prog.file(sid, name, "running", f"audio: {e.message}"[:200])
+        else:
+            prog.file(sid, name, "failed", e.message[:200])
         return out  # per-file failure: the evaluation continues with whatever else has content
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

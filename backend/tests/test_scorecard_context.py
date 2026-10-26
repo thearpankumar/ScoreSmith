@@ -78,8 +78,9 @@ async def test_every_scoring_step_and_the_aws_job_get_the_scorecard_context(asyn
     await _run(aws, _recording(seen), jev)
 
     assert (await get_eval(ev.id)).status == EvaluationStatus.COMPLETED
-    # the AWS job carries it for the image-description step
-    assert aws.start_payloads[0]["context"] == {"scorecard": NAME, "domain": DOMAIN, "purpose": PURPOSE, "scope": SCOPE}
+    # the AWS job carries it for the image and video-frame steps, with the leaf KPI names
+    assert aws.start_payloads[0]["context"] == {"scorecard": NAME, "domain": DOMAIN, "purpose": PURPOSE, "scope": SCOPE,
+                                                "kpis": ["Innovation", "Execution"]}
     for tool in ("record_identity", "record_digest", "record_evidence", "record_reasoning"):
         assert seen.get(tool), tool
         assert all(NAME in told and PURPOSE in told and SCOPE in told for told in seen[tool]), tool

@@ -12,6 +12,18 @@
       ]
     },
     {
+      "Sid": "ChatAttachments",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::${BUCKET}/chat/*"
+    },
+    {
+      "Sid": "InvokeChatExtract",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:qs-eval-extract-doc"
+    },
+    {
       "Sid": "ListAppPrefixes",
       "Effect": "Allow",
       "Action": "s3:ListBucket",

@@ -6,7 +6,8 @@ contract (names, S3 layout, JSON schemas, error codes) is `docs/ai-eval-contract
 
 ```
 Ingest -> Map files (2) -+- pdf/docx/md/txt -> ExtractDoc -> Map images (3) -> AnalyzeImage
-                         +- video           -> PlanAudio  -> Map chunks (3) -> TranscribeChunk -> MergeTranscript
+                         +- video -> Parallel -+- PlanAudio  -> Map chunks (3)  -> TranscribeChunk -+-> MergeVideo
+                                               +- PlanFrames -> Map batches (3) -> AnalyzeSheet  ---+
          -> Assemble  => derived/{eid}/corpus.json + corpus.md + progress.json
 any failure -> HandleFailure (status.json + progress.json stage "failed") -> Fail
 ```
@@ -25,15 +26,17 @@ any failure -> HandleFailure (status.json + progress.json stage "failed") -> Fai
 ## What bootstrap creates (all in us-east-1, profile `arpan-aws`)
 
 - **S3** `qs-eval-<account>-us-east-1`: Block Public Access, BucketOwnerEnforced, SSE-S3, deny-non-TLS policy, CORS
-  for `http://localhost:3000` (+ `--cors-origin`), lifecycle `uploads/ raw/ batches/` 14 d, `derived/` 90 d, abort
-  incomplete multipart uploads after 1 d.
+  for `http://localhost:3000` (+ `--cors-origin`), lifecycle `uploads/ raw/ batches/` 14 d, `chat/` 30 d, `derived/`
+  90 d, abort incomplete multipart uploads after 1 d.
 - **ECR** `qs-eval-worker` (scan on push, keep last 5 images) and the image build/push.
-- **IAM** `qs-eval-lambda-role` (S3: read `uploads/*`, read/write `raw/*` `derived/*`; `bedrock:InvokeModel` on only the
-  Voxtral small/mini, Kimi K2.5, Qwen3-VL foundation models, the Maverick `us.` inference profile and its underlying
-  regional foundation models; `ssm:GetParameter` on `/qs-eval/openrouter-api-key` only; its own log groups),
-  `qs-eval-sfn-role` (`lambda:InvokeFunction` on the six functions only), user `qs-backend-app` (S3 put/get/abort/list
-  on `uploads/ batches/ derived/`, `states:StartExecution` on the one state machine, `Describe/StopExecution` on its
-  executions; no Bedrock, no admin).
+- **IAM** `qs-eval-lambda-role` (S3: read `uploads/*`, read/write `raw/*` `derived/*` `chat/*`; `bedrock:InvokeModel` on
+  only the Voxtral small/mini, Kimi K2.5, Qwen3-VL foundation models, the Maverick and Nova 2 Lite `us.` inference
+  profiles and their underlying regional foundation models; `ssm:GetParameter` on `/qs-eval/openrouter-api-key` only;
+  its own log groups), `qs-eval-sfn-role` (`lambda:InvokeFunction` on the six functions only), user `qs-backend-app`
+  (S3 put/get/abort/list on `uploads/ batches/ derived/`, put/get/delete on `chat/`, `lambda:InvokeFunction` on
+  `qs-eval-extract-doc` only (chat attachment text), `states:StartExecution` on the one state machine,
+  `Describe/StopExecution` on its executions; no Bedrock, no admin). `deploy-lambdas` re-applies only the Lambda role
+  policy: re-run `bootstrap` for the backend user policy and the bucket lifecycle.
 - **SSM SecureString** `/qs-eval/openrouter-api-key` (default `aws/ssm` KMS key), written from `OPENROUTER_API_KEY` in
   `infra/.env` when that is set and non-empty. The last `OPENROUTER_API_KEY=` line wins, as in docker compose. The value
   is passed to the CLI in a private temp file and is never printed. Without a key the parameter is left as it is. If no
@@ -52,7 +55,8 @@ any failure -> HandleFailure (status.json + progress.json stage "failed") -> Fai
 ## Running it
 
 Prerequisites: AWS CLI v2 with profile `arpan-aws` and Docker (Linux images; Docker Desktop on Windows is fine). For
-Bedrock runs, model access must already be granted for the five models. For OpenRouter runs, put `OPENROUTER_API_KEY`
+Bedrock runs, model access must already be granted for the six models (Voxtral small/mini, Kimi K2.5, Qwen3-VL,
+Maverick and, for video frames, Nova 2 Lite). For OpenRouter runs, put `OPENROUTER_API_KEY`
 in `infra/.env` before running bootstrap or deploy-lambdas. Re-run either script after changing the key.
 
 ```powershell
@@ -103,6 +107,7 @@ provider). One deployment serves both providers.
 | --- | --- | --- |
 | Transcription (`transcribe-chunk`) | Amazon Transcribe (batch job on the chunk in S3, language identified automatically), then `mistral.voxtral-small-24b-2507`, then `mistral.voxtral-mini-3b-2507` | `mistralai/voxtral-small-24b-2507` through chat `input_audio` (mp3), then `mistralai/voxtral-mini-3b-2507` through `/audio/transcriptions`, because Mini is not offered on chat |
 | Image analysis (`analyze-image`) | `moonshotai.kimi-k2.5`, then `qwen.qwen3-vl-235b-a22b`, then Llama 4 Maverick | `qwen/qwen3.7-flash`, then `qwen/qwen3-vl-235b-a22b-instruct` |
+| Video frame sheets (`analyze-image`, `mode: video_sheets`) | `us.amazon.nova-2-lite-v1:0` (inference profile), then `qwen.qwen3-vl-235b-a22b` | `qwen/qwen3.7-flash`, then `google/gemini-3.1-flash-lite` (`OPENROUTER_VIDEO_MODELS` overrides) |
 
 Bedrock transcription (`worker/bedrock_ops.py`): since Oct 2026 Bedrock's Voxtral (now in its Legacy period) rejects audio with "Model does not support audio modality" on every API, so Bedrock runs use Amazon Transcribe. One job per chunk, named `qs-eval-{evaluation}-{source}-c{n}`: a retried step finds its job by name and keeps waiting (up to 720 s per attempt) instead of paying for a second one; a FAILED job is deleted and restarted once. The transcript comes back through Transcribe's pre-signed URL, so no output bucket is granted. The chunk JSON records `model: amazon.transcribe` with `tokens_in`/`tokens_out` = 0. IAM: `transcribe:StartTranscriptionJob` (this action has no resource type, so `*`) and Get/Delete on `transcription-job/qs-eval-*`. About $0.024 per audio minute.
 
@@ -152,6 +157,39 @@ cap is 4000 tokens. Images that are too large are re-encoded under a body budget
 the service still refuses. `scripts/analyze_images.py`, the local Bedrock tool, keeps a copy of the same prompt, and a
 test checks that the two match.
 
+## Video visual analysis
+
+A video's audio and pictures are processed side by side (a `Parallel` state). The visual branch:
+
+- **PlanFrames** (`plan-audio` function, `mode: "plan_frames"`, it re-downloads the video into its 10 GB `/tmp`). ffmpeg
+  decodes keyframes only (an hour-long video stays well inside 900 s) and keeps the first frame, one at least every
+  `FRAME_MAX_GAP_S` and scene changes at least `FRAME_MIN_GAP_S` apart (`select` + `showinfo`, standard filters only).
+  A short video (up to 5 min) whose keyframes are too sparse is decoded in full. Pillow then drops near-duplicates
+  (dHash), caps the count at `MAX_FRAMES_PER_VIDEO` (strongest changes first, the rest spread over time), tiles them
+  into 3x3 contact sheets with `[mm:ss]` printed in each cell, and measures brightness, black frames, low-detail
+  (blurred) frames and static stretches. Outputs: `video/{sid}/frames/sheet_NN.jpg`, `sheets.json`, `quality.json`.
+- **AnalyzeSheets** (`analyze-image` function, `mode: "video_sheets"`, Map of 3): up to 4 sheets per request, with the
+  scorecard context and its KPI names, to a cheap vision model (table above). The answer has `[mm:ss] SHOWN:` lines,
+  the steps observed, the visual quality and what the frames do not show (`batch_NN.md`; tokens and OpenRouter's cost
+  in `batch_NN.json`).
+- **MergeVideo** interleaves `[mm:ss] SAID:` (transcript; Bedrock keeps Amazon Transcribe's sentence times) and
+  `[mm:ss] SHOWN:` lines per audio window, adds a `VIDEO {name} steps` and a `VIDEO {name} quality` section, and
+  writes `visual.json` (status `ok|failed|off`, frames, mean gap, models, tokens, cost) for the backend. A failure in
+  the visual branch only adds a warning; a silent video gets its sections from the frames.
+- **Knobs** (Lambda env, overridable per run through the execution input's `video` object): `VIDEO_VISUAL_MODE`
+  (`frames`/`off`), `FRAME_MIN_GAP_S` 2 (sampling interval), `FRAME_MAX_GAP_S` 20 (the interval's ceiling for long
+  videos), `FRAME_CHANGE_THRESHOLD` 0.001 (share of pixels that must change for a new picture),
+  `MAX_FRAMES_PER_VIDEO` 108, `GRID` 3x3 (2x2 for text-heavy screen recordings), `SHEETS_PER_REQUEST` 4,
+  `VISUAL_MAX_OUTPUT_TOKENS` 1500. The deploy scripts do not set them, so the defaults apply unless the backend sends
+  overrides (`AI_EVAL_VIDEO_VISUAL_MODE`, `AI_EVAL_VIDEO_KNOBS`).
+
+## Chat attachment extraction
+
+The backend invokes `qs-eval-extract-doc` synchronously with `mode: "chat_extract"` to get the text of a PDF or DOCX
+attached in chat (`chat/{user}/{uuid}.pdf|docx` -> `chat/{user}/{uuid}.json`). It reuses the document extractors (reading
+order, Markdown tables), never analyses images, flags mostly-scanned PDFs as `needs_native`, and answers
+`{"ok": false, "error"}` instead of raising for a bad file. Contract: `docs/ai-eval-contract.md`.
+
 ## Behaviour worth knowing
 
 - Only S3 keys travel between states (256 KB payload limit). Per-file failures (corrupt PDF, undecodable image,
@@ -162,12 +200,13 @@ test checks that the two match.
 - File types: PDF, DOCX, Markdown/plain text (`.md`, `.txt`, split into page-sized sections) and video. A file with no
   extension (a Drive file named `report (final)`) is identified by its content. Archives, legacy `.doc`, slides and
   images are skipped with a warning.
-- A video with no audio track (a silent screen recording) is `skipped`, not `failed`: there is nothing to transcribe and
-  the run continues with the other files.
+- A video with no audio track (a silent screen recording) is analysed from its frames. It is `skipped`, not `failed`,
+  only when its frames could not be analysed either (or the visual analysis is off); the run continues with the other
+  files.
 - A corpus with fewer than 30 words in total (for example a file that only holds a GitHub link) fails with `no_content`.
 - Throttling: the account's Lambda concurrency quota is shared by every evaluation (10 on a new account). A throttled
   invocation is retried up to 25 times with jittered backoff capped at 30 s, and the Map states are kept small
-  (2 files, 3 images, 3 audio chunks) so one evaluation cannot take every slot.
+  (2 files, 3 images, 3 audio chunks, 3 frame-sheet requests) so one evaluation cannot take every slot.
 - Google Docs are fetched as DOCX; Sheets and Slides as PDF. Folder listings are capped by Google at 50 files (warning).
 - Models: see [AI provider per run](#ai-provider-per-run). Bedrock auth is the Lambda role; OpenRouter's key comes
   from SSM.
@@ -183,7 +222,10 @@ test checks that the two match.
 Idle cost is about $0: Lambda, Step Functions Standard, S3 and Budgets are pay-per-use; ECR storage is a few cents.
 Per evaluation the dominant costs are model tokens (Bedrock, or OpenRouter credits for OpenRouter runs: Voxtral per
 audio minute, vision model per image) and Lambda
-GB-seconds (3 GB x run time). A typical submission (one 20-page PDF with 15 images and a 10-minute video) is on the
+GB-seconds (3 GB x run time). Video frames are cheap: a 30-minute video is about 90-108 frames on 10-12 sheets in 3
+requests, roughly $0.001-0.015 (OpenRouter qwen3.7-flash at the low end, Bedrock Nova 2 Lite with ~230 tokens per sheet
+at the high end), less than its Amazon Transcribe job ($0.024 per audio minute). `corpus.json` `stats.visual` records the
+frames, requests, tokens and, on OpenRouter, the reported cost. A typical submission (one 20-page PDF with 15 images and a 10-minute video) is on the
 order of cents to under a dollar; Step Functions adds about $0.025 per 1,000 state transitions (a few hundred per
 evaluation). S3 is cents per month with the 14/90-day lifecycles. The $25/month budget alerts before this matters.
 

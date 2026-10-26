@@ -37,6 +37,9 @@ MAX_STATE_TOKENS = 28_000
 CHARS_PER_TOKEN = 3
 RETRY_DELAYS = (0.5, 1.5)  # two retries after the first attempt
 _TIMEOUT_SECONDS = 30.0
+# `submission_media` characters kept in the state: one line per video plus, when frames were analysed, the note on
+# reading SHOWN lines (see Corpus.media_note)
+MEDIA_NOTE_CHARS = 1200
 
 
 @dataclass(frozen=True)
@@ -215,7 +218,8 @@ def build_score_request(
     if media_note:
         instructions += (
             " `submission_media` says which videos exist and what could be analysed of them: never credit a claim"
-            " about what a video shows or says when it states that content could not be analysed."
+            " about what a video shows or says when it states that content could not be analysed. Where it says"
+            " the frames were analysed, SHOWN lines in the evidence are observations of the video itself."
         )
     base_state: dict[str, Any] = {"kpi": kpi_name}
     if context:
@@ -223,7 +227,7 @@ def build_score_request(
     if direction:
         base_state["emphasis"] = direction[:1000]
     if media_note:
-        base_state["submission_media"] = media_note[:800]
+        base_state["submission_media"] = media_note[:MEDIA_NOTE_CHARS]
     overhead = {"state": base_state, "q": [instructions, relevance, criteria]}
     state = {**base_state, "evidence": trim_evidence(evidence, overhead)}
     return state, instructions, criteria, relevance, [g.score_level for g in levels]

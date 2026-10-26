@@ -377,6 +377,8 @@ def build_scoring_graph(evaluation_id: uuid.UUID, deps: ScoringDeps, loaded: _Lo
             )
         # A KPI about what a video shows or says, with a video that could not be analysed, cannot be verified: the
         # score rests on what the document claims about it. Flag it for a human instead of passing it off as checked.
+        # A video whose frames were analysed (visual.json status "ok") never triggers this; one whose frame analysis
+        # failed always does (see Corpus.has_unanalysed_video).
         video_unverifiable = corpus.has_unanalysed_video() and master.is_video_dependent(kpi, kpi.guidelines)
         jev_raw = dict(ks.jev_raw)
         jev_raw["evidence"] = [{"section_id": s.section_id, "label": s.label} for s in ev.snippets]

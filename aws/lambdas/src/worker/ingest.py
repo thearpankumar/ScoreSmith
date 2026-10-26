@@ -65,8 +65,9 @@ def run_ingest(event: dict, store, drive: DriveClient | None = None, probe_fn=au
     max_bytes, max_files = int(limits["max_file_bytes"]), int(limits["max_files"])
     prog = Progress(store, eid)
     prog.set_stage("ingest", "Fetching and validating files")
-    scorecard_context.save(store, eid, event.get("context"))  # read back by the image step
-    provider = run_config.save(store, eid, event.get("provider"))  # read back by the transcription and image steps
+    scorecard_context.save(store, eid, event.get("context"))  # read back by the image and video-frame steps
+    # read back by the transcription, image and video steps (provider; video knob overrides)
+    provider = run_config.save(store, eid, event.get("provider"), event.get("video"))
     if provider == "openrouter":
         from .openrouter_ops import openrouter_client
 

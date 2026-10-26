@@ -71,6 +71,9 @@ def to_jpg(img, quality: int) -> bytes:
 class Emitter:
     """Writes numbered text/image files and a content.md, preserving the order of calls."""
 
+    # Tables as Markdown grids instead of one " | "-joined line per row (chat_extract's text-only output sets it).
+    markdown_tables = False
+
     def __init__(self, outdir: Path, cfg: ExtractConfig):
         outdir.mkdir(parents=True, exist_ok=True)
         self.out, self.cfg = outdir, cfg
@@ -160,6 +163,10 @@ class Emitter:
         else:
             self.stats.figures += 1
 
+    def table_text(self, rows: list) -> str:
+        """A table's text for the flow ('' when it is not really a table)."""
+        return markdown_table(rows) if self.markdown_tables else table_rows_text(rows)
+
     def finish(self) -> None:
         self.flush()
         (self.out / "content.md").write_text("\n".join(self.md).strip() + "\n", "utf-8")
@@ -182,6 +189,24 @@ def table_rows_text(rows: list) -> str:
         if line:
             lines.append(line)
     return "\n".join(lines) if len(lines) >= 2 else ""  # one row is just a box, not a table
+
+
+def markdown_table(rows: list) -> str:
+    """Table grid -> a Markdown table, the first row as its header ('' for fewer than two non-empty rows). Merged
+    cells leave empty cells, so columns may not line up exactly with the original; a column empty in every row (a
+    ruling artifact) is dropped."""
+    grid = [[" ".join((c or "").split()).replace("|", "\\|") for c in r] for r in rows]
+    grid = [r for r in grid if any(r)]
+    if len(grid) < 2:
+        return ""
+    width = max(len(r) for r in grid)
+    grid = [r + [""] * (width - len(r)) for r in grid]
+    used = [i for i in range(width) if any(r[i] for r in grid)]
+    grid = [[r[i] for i in used] for r in grid]
+    width = len(used)
+    lines = ["| " + " | ".join(grid[0]) + " |", "|" + " --- |" * width]
+    lines += ["| " + " | ".join(r) + " |" for r in grid[1:]]
+    return "\n".join(lines)
 
 
 def extract_pdf(path: str, em: Emitter, cfg: ExtractConfig) -> None:
@@ -226,7 +251,7 @@ def pdf_page(page, em: Emitter, cfg: ExtractConfig) -> None:
     tables: list[tuple] = []
     try:
         for t in page.find_tables().tables:
-            md = table_rows_text(t.extract())
+            md = em.table_text(t.extract())
             if md:
                 tables.append((pymupdf.Rect(t.bbox), md))
     except Exception:
@@ -279,6 +304,24 @@ def pdf_page(page, em: Emitter, cfg: ExtractConfig) -> None:
 
 
 # --------------------------------------------------------------------------- DOCX
+def docx_table_rows(tbl) -> list[list[str]]:
+    """Cell texts of a w:tbl, row by row (a cell spanning several grid columns is followed by empty cells; nested
+    tables are flattened into their cell)."""
+    from docx.oxml.ns import qn
+
+    rows = []
+    for tr in tbl.findall(qn("w:tr")):
+        row = []
+        for tc in tr.findall(qn("w:tc")):
+            paras = ("".join(t.text or "" for t in para.iter(qn("w:t"))) for para in tc.iter(qn("w:p")))
+            row.append(" ".join(x for x in paras if x.strip()))
+            span = tc.find(f"{qn('w:tcPr')}/{qn('w:gridSpan')}")
+            cols = span.get(qn("w:val"), "1") if span is not None else "1"
+            row.extend([""] * (min(int(cols), 50) - 1 if cols.isdigit() and int(cols) > 1 else 0))
+        rows.append(row)
+    return rows
+
+
 def extract_docx(path: str, em: Emitter, cfg: ExtractConfig) -> None:
     from docx import Document
     from docx.oxml.ns import qn
@@ -308,6 +351,13 @@ def extract_docx(path: str, em: Emitter, cfg: ExtractConfig) -> None:
             picture(el.get(qn("r:embed")))
         elif tag == V_IMAGEDATA:
             picture(el.get(qn("r:id")))
+        elif tag == qn("w:tbl") and em.markdown_tables and not depth["cell"]:
+            md = markdown_table(docx_table_rows(el))
+            if md:
+                em.text("\n" + md + "\n\n")
+            else:
+                for child in el:
+                    walk(child)
         elif tag == qn("w:p"):
             for child in el:
                 walk(child)
@@ -361,6 +411,13 @@ def extract_file(path: str, kind: str, outdir: Path, cfg: ExtractConfig | None =
     """Validate magic bytes, extract one pdf/docx into `outdir`. Raises PipelineError."""
     cfg = cfg or ExtractConfig()
     em = Emitter(outdir, cfg)
+    extract_into(path, kind, em, cfg)
+    em.finish()
+    return em.stats
+
+
+def extract_into(path: str, kind: str, em: Emitter, cfg: ExtractConfig) -> None:
+    """Validate magic bytes and run the pdf/docx/text extractor into `em` (any Emitter). Raises PipelineError."""
     try:
         if kind == "pdf":
             with open(path, "rb") as fh:
@@ -378,8 +435,6 @@ def extract_file(path: str, kind: str, outdir: Path, cfg: ExtractConfig | None =
         raise
     except Exception as e:
         raise PipelineError("extract_failed", f"{type(e).__name__}: {str(e)[:150]}") from e
-    em.finish()
-    return em.stats
 
 
 # --------------------------------------------------------------------------- the ExtractDoc step
