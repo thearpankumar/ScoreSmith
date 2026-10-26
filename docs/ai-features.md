@@ -11,6 +11,9 @@ environment variable is in [configuration.md](configuration.md).
 
 ## Key features
 
+- **A chat assistant answers first** — every message goes to a conversational agent (`app/ai/chat_agent.py`) that answers questions itself, searches the web, reads attached files, edits the current draft's KPIs or scoring formula, saves, and hands the request to the scorecard builder **only** when a scorecard has to be drafted or reworked. "Hello" or "what is a good KPI for call quality?" no longer starts the KPI research. See [The chat assistant](#the-chat-assistant).
+- **Pick the chat model (OpenRouter)** — the composer offers the models an admin enabled in Settings (GPT-5 mini, Claude Sonnet 5.5, Claude Opus 5.5, GPT-5.6 Luna by default). The pick drives only the assistant; the scorecard builder always runs on GPT-5.6 Luna and evaluations on GPT-5 mini, so an expensive chat model never multiplies across the research fan-out or an evaluation batch.
+- **Attach files to a chat message (OpenRouter)** — PDF, Word, Excel, CSV, text and images, up to 5 × 20 MB per message. Each file is read once when it is uploaded and its text is reused, so the builder can design a scorecard from an SOP or pick up a KPI list from a spreadsheet. See [Chat attachments](#chat-attachments).
 - **Chat-driven scorecard builder** — a [LangGraph](https://github.com/langchain-ai/langgraph) state machine, backed by AWS Bedrock (Z.ai GLM-5), asks clarifying questions, proposes KPIs "LLM first, human second," and checkpoints every step to Postgres so a session survives a server restart mid-question.
 - **Two ways to start a scorecard, chosen automatically** — if you describe a use case ("a quality scorecard for SRE incident response") the builder designs the KPIs for you (*open-ended mode*). If you paste your own KPI list with the use case, it **keeps your KPIs exactly as written** and only fills in what is missing (*user-specified mode*). A list plus "and suggest more" runs both (*hybrid mode*). See [How the chat decides what to do](#how-the-chat-decides-what-to-do).
 - **Your KPIs are protected** — in user-specified and hybrid mode the builder never drops, renames, re-parents, dedupes or caps your KPIs, and never silently changes a weight or guideline *you* supplied. A later change is accepted only when your latest message actually asks for it (checked server-side, not left to the model). Weights you didn't give are filled in (research-informed risk/impact weighting, optionally with a suggested scoring formula); weights you gave are kept, and only rescaled — with a note — if they don't sum to 100.
@@ -35,9 +38,42 @@ environment variable is in [configuration.md](configuration.md).
 
 The system-level architecture diagram lives in [architecture.md](architecture.md#1-system-architecture). The sections below zoom into the AI flows.
 
+### The chat assistant
+
+Every message first reaches the assistant (`converse` node), which runs on the chat model the user picked (OpenRouter) or the Bedrock chat model, with real tool calling (`tool_choice: auto`, native tool results, at most 6 model steps and 3 web searches per message):
+
+```mermaid
+flowchart TD
+    Msg["User message"] --> Chip{"A chip answer to the<br/>builder's own question?"}
+    Chip -->|yes, no model call| Builder
+    Chip -->|no| Agent["Chat assistant (picked model)<br/>web_search · view_kpis · read_attachment ·<br/>update_scoring_formula (applied at once)"]
+    Agent -->|plain answer| Reply["Reply, pause for the next message"]
+    Agent -->|ask_user| Card["Question card with chips"]
+    Agent -->|edit_kpis| Edit["Server applies the ops, rebalances weights,<br/>writes new rubrics on the builder model"]
+    Agent -->|save_scorecard| Save["Confirm and save"]
+    Agent -->|build_scorecard + brief| Builder["Scorecard builder (GPT-5.6 Luna / GLM-5):<br/>similarity check · research fan-out · drafting"]
+```
+
+The assistant sees a compact outline of the draft (names, weights, categories, what is missing) and pulls rubric text or more of a file with its tools only when needed. A brief it hands the builder is used for the similarity search and the research context, and shown to the builder's model as an internal note. Because small talk no longer reaches the builder, the once-per-session research fan-out is spent only when a scorecard is actually requested. `CHAT_AGENT=false` restores the old wiring (every message straight into the builder). The trace card shows the assistant as its own lane next to the builder ("Master") and the research agents.
+
+**Which model does what (OpenRouter):** the picked chat model answers and decides; `OPENROUTER_KPI_MODEL` (GPT-5.6 Luna) runs every builder call, the builder's judge-tier helpers, session titles and the web-search sub-call; `OPENROUTER_AGENT_MODEL` (GPT-5 mini) stays on evaluations. Claude 5.x rejects a forced `tool_choice`, so it is only ever sent `auto` (the client asks for a tool in words when a caller would force one) and never sampling parameters. The assistant's calls keep the provider's reasoning state between tool steps, put a prompt-cache point after the latest message (Claude), and send `x-session-id` for sticky routing. Each reply in the transcript is labelled with the model that wrote it.
+
+### Chat attachments
+
+Only with OpenRouter (the paperclip is hidden on Bedrock). The browser uploads straight to S3 (`chat/{user}/{id}.{ext}`, presigned multipart, expires after 30 days); on completion the server reads the file **once**:
+
+| Type | How it is read |
+|---|---|
+| PDF, DOCX | The extraction Lambda's `chat_extract` mode, invoked synchronously (uploaded PDF / DOCX are never parsed in the API process). A mostly-scanned PDF (≤ 30 pages) is also sent to the chat model as the file itself. |
+| XLSX, CSV | On the backend: every visible sheet's size, a column profile (type, filled, distinct, range or top values) and its rows as `- a \| b \| c` lines; past the budget the first and last rows are kept with a note of the rows left out. |
+| PNG, JPG, WEBP | Described once by the builder model; the chat model also gets the image itself. |
+| TXT, MD | As they are. |
+
+The message the graph sees carries the files in one `<attached_files>` block (≤ 15k tokens, shared fairly between files); the assistant can read further from any offset with `read_attachment`. Blocks older than the last two user messages are reduced to a one-line stub, so a long chat stops paying for old files. Limits: `CHAT_ATTACHMENT_MAX_BYTES` (20 MB), `CHAT_ATTACHMENT_MAX_FILES` (5).
+
 ### How the chat decides what to do
 
-On a session's first message (and on any later message that pastes a new KPI list) the builder first works out *what you gave it*, cheaply, before spending model time:
+When the builder runs — on a request the assistant handed over, and on any later message that pastes a new KPI list — the builder first works out *what you gave it*, cheaply, before spending model time: (and on any later message that pastes a new KPI list) the builder first works out *what you gave it*, cheaply, before spending model time:
 
 ```mermaid
 flowchart TD
@@ -275,7 +311,8 @@ sequenceDiagram
 | Ingest (Lambda) | Drive links are validated against an allowlist (`drive.google.com`, `docs.google.com`, `drive.usercontent.google.com`, https only, public IPs only, every redirect re-checked), then the files are streamed into S3. Folders are listed with `gdown` (Google caps a folder listing at 50 files), single files are streamed with a size cap. The file type comes from the extension **or, when there is none, from the content** (PDF `%PDF`, DOCX zip with `word/document.xml`, video by ffmpeg probe). |
 | Extract (Lambda) | PDFs and DOCX are turned into text in reading order plus images, vector figures and tables (PyMuPDF / python-docx, ported from `scripts/extract_assets.py`). Markdown and text files are split into page-sized sections. Each image is read by a vision model (Kimi K2.5, then Qwen3-VL, then Maverick as fallbacks — `scripts/analyze_images.py`), told what the scorecard is about so it brings out the details that matter for it. |
 | Transcribe (Lambda) | The audio track is cut into ~5-minute chunks at pauses and each chunk is transcribed with Amazon Transcribe on Bedrock runs (Bedrock's Voxtral no longer accepts audio) or Mistral Voxtral through OpenRouter on OpenRouter runs, in parallel (`scripts/transcribe_videos.py`). No Amazon Transcribe job is needed. |
-| Assemble (Lambda) | Everything is stitched into `derived/{evaluation}/corpus.json`: one section per PDF page, per transcript chunk and per image analysis, with warnings for anything skipped. |
+| Video frames (Lambda) | In parallel with transcription: frames are sampled every 2 s with ffmpeg (stretched to at most one per 20 s for long videos), a sample is kept only when its picture really changed (more than 0.1% of the pixels differ, so a new line of text counts and a moving pointer does not), at most 108 per video, and tiled into timestamped 3×3 contact sheets. A cheap vision model reads up to 4 sheets per call (Nova 2 Lite on Bedrock, Qwen 3.7 Flash on OpenRouter) with the scorecard's context and KPI names, and writes quotable `[mm:ss] SHOWN:` lines, the steps it saw in order, visual quality notes and what is not visible. Basic quality facts (resolution, fps, bitrate, brightness, blur, black and static stretches) come from ffmpeg and the sampled frames, free. About $0.001–0.015 for a 30-minute video. Knobs: `VIDEO_VISUAL_MODE` (`frames` / `off`) and the frame / grid limits in [ai-eval-contract.md](ai-eval-contract.md). |
+| Assemble (Lambda) | Everything is stitched into `derived/{evaluation}/corpus.json`: one section per PDF page, per image analysis, and per audio-chunk window of a video, whose text interleaves `[mm:ss] SAID:` and `[mm:ss] SHOWN:` lines (plus a steps section and a quality section per video), with warnings for anything skipped. `stats.visual` records frames, sheets, calls, tokens and cost. |
 | Identify | Llama 4 Maverick reads the file names and cover text and returns the submitter's name and email — only if they literally appear in the text; otherwise the sheet row, then a regex. The same call writes a short content-based title; the evaluation is named `Name (email)` when a submitter is known, else that title, else the main file's name. |
 | Evidence | For every leaf KPI Maverick (the "master agent") picks the relevant passages from a section index. Every quote must be a verbatim substring of the corpus or it is dropped. The corpus is wrapped as untrusted data, so instructions hidden inside a submission are ignored. |
 | Score | **Jev** places that evidence on the KPI's guideline ladder. Jev's `score` question accepts at most 10 levels, so levels 1–10 are the criteria (score = position + 1, fractional) and a `noul` "is there any relevant evidence?" question in the same call decides level 0 (below 0.10 gives a score of 0). If Jev is unreachable the KPI falls back to one Maverick/GLM judgment and is flagged `needs_review`. |
@@ -413,7 +450,7 @@ What moved the numbers: compact rubrics (≈4× fewer output tokens per KPI), sm
 **AI evaluation pipeline limits**
 
 - **Public links only.** Drive folders and files must be shared as "Anyone with the link". Otherwise the evaluation fails with `drive_inaccessible` and suggests uploading the files. Google can also throttle repeated downloads of the same file (`drive_quota`), and lists at most 50 files per folder; subfolders are ignored.
-- **Supported inputs:** PDF, DOCX, Markdown/plain text (`.md`, `.txt`) and common video formats (mp4, mov, mkv, webm, m4v). Files with no extension are identified by their content. Archives (zip/rar), legacy `.doc`, slides and images are skipped with a warning, and Google Docs/Sheets/Slides links are exported. A submission with fewer than 30 extractable words (for example a file that only holds a GitHub link) fails with `no_content` instead of being scored. A video with no audio track (a silent screen recording) is marked `skipped` and the evaluation continues from the other files; the pipeline does not read what is shown on screen.
+- **Supported inputs:** PDF, DOCX, Markdown/plain text (`.md`, `.txt`) and common video formats (mp4, mov, mkv, webm, m4v). Files with no extension are identified by their content. Archives (zip/rar), legacy `.doc`, slides and images are skipped with a warning, and Google Docs/Sheets/Slides links are exported. A submission with fewer than 30 extractable words (for example a file that only holds a GitHub link) fails with `no_content` instead of being scored. A video is read twice: its audio is transcribed and its frames are analysed (see the "Video frames" step), so a silent screen recording is evaluated from what it shows. The scorer is told the visuals come from sampled frames (about one every N seconds), so a step missing from the frames is weak evidence; a KPI about what a video shows is flagged `needs_review` only when the frames could not be analysed.
 - **Throughput depends on AWS quotas.** A new AWS account allows 10 concurrent Lambda executions and modest Bedrock quotas, so large batches queue and retry rather than run flat out. The pipeline backs off automatically, and a quota increase is the way to go faster.
 - **The scorecard decides what is measurable.** A submission is judged only against the KPIs it is run against; evidence that does not exist for a KPI scores low or zero by design (a customer-support scorecard run on a fleet-safety hackathon entry scores poorly).
 - **Jev is an alpha API** (32k-token context, at most 10 score levels, no published rate limits); a KPI Jev cannot score falls back to one model judgment and is flagged `needs_review`.

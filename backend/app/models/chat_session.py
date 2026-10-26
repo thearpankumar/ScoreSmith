@@ -88,6 +88,9 @@ class ChatSession(UUIDPKMixin, Base):
     turn_cancel_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )
+    # The OpenRouter model the user last picked for the chat assistant (migration 0019, app/ai/chat_models.py);
+    # read by the worker that runs a queued turn. NULL = the admin's default (or Bedrock).
+    chat_model: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
 
     messages: Mapped[list[ChatMessage]] = relationship(
         "ChatMessage", back_populates="session", cascade="all, delete-orphan",

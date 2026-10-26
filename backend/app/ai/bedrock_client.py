@@ -79,10 +79,22 @@ class ToolSpec:
         }
 
 
+@dataclass(frozen=True)
+class ToolCall:
+    """One tool call of a response (a response may carry several)."""
+
+    id: str
+    name: str
+    input: dict[str, Any]
+
+
 @dataclass
 class ConverseResult:
     """Normalized result of a Converse call, regardless of whether the model replied with
-    plain text or a tool call."""
+    plain text or a tool call. `tool_name` / `tool_input` / `tool_use_id` describe the call
+    single-tool callers act on; `tool_calls` lists every call of the response (the chat
+    agent answers each one). `reasoning_details` is the provider's opaque reasoning state,
+    passed back verbatim when a tool loop continues (OpenRouter only)."""
 
     stop_reason: str
     text: str | None = None
@@ -90,6 +102,9 @@ class ConverseResult:
     tool_input: dict[str, Any] | None = None
     tool_use_id: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    reasoning_details: list[Any] | None = None
+    usage: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_tool_use(self) -> bool:
@@ -116,6 +131,9 @@ class BedrockClientProtocol(Protocol):
         force_tool_use: bool = False,
         model_id: str | None = None,
         temperature: float | None = None,
+        reasoning_effort: str | None = None,
+        keep_reasoning: bool = False,
+        session_key: str | None = None,
     ) -> ConverseResult: ...
 
     def converse_stream(
@@ -150,6 +168,7 @@ def _parse_converse_response(response: dict[str, Any]) -> ConverseResult:
     tool_name: str | None = None
     tool_input: dict[str, Any] | None = None
     tool_use_id: str | None = None
+    tool_calls: list[ToolCall] = []
     for block in content_blocks:
         if "text" in block:
             text_parts.append(block["text"])
@@ -158,6 +177,14 @@ def _parse_converse_response(response: dict[str, Any]) -> ConverseResult:
             tool_name = tool_use.get("name")
             tool_input = tool_use.get("input")
             tool_use_id = tool_use.get("toolUseId")
+            if tool_name:
+                tool_calls.append(
+                    ToolCall(
+                        id=str(tool_use_id or f"call_{len(tool_calls)}"),
+                        name=tool_name,
+                        input=tool_input if isinstance(tool_input, dict) else {},
+                    )
+                )
 
     return ConverseResult(
         stop_reason=stop_reason,
@@ -166,6 +193,8 @@ def _parse_converse_response(response: dict[str, Any]) -> ConverseResult:
         tool_input=tool_input,
         tool_use_id=tool_use_id,
         raw=response,
+        tool_calls=tool_calls,
+        usage=response.get("usage") or {},
     )
 
 
@@ -222,6 +251,9 @@ class BedrockClient:
         force_tool_use: bool = False,
         model_id: str | None = None,
         temperature: float | None = None,
+        reasoning_effort: str | None = None,  # OpenRouter only: Bedrock takes no per-call effort here
+        keep_reasoning: bool = False,  # OpenRouter only
+        session_key: str | None = None,  # OpenRouter only (sticky provider routing)
     ) -> ConverseResult:
         client = self._get_client()
         kwargs: dict[str, Any] = {

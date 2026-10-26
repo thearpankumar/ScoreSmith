@@ -26,7 +26,8 @@ from sqlalchemy.orm import selectinload
 
 from app import notifications as notif
 from app.activity import log_edit
-from app.ai import providers
+from app.ai import attachments as att
+from app.ai import chat_models, providers
 from app.ai import web_search as web_search_mod
 from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
 from app.ai.draft_materialize import draft_from_scorecard, materialize_draft
@@ -46,8 +47,9 @@ from app.ai.web_search import WebSearchClientProtocol
 from app.authz import get_accessible_scorecard, get_owned_chat_session
 from app.config import get_settings
 from app.db import AsyncSessionLocal, get_db
-from app.deps import get_bedrock_client, get_current_user, get_jev_client, get_web_search_client
+from app.deps import get_aws_jobs, get_bedrock_client, get_current_user, get_jev_client, get_web_search_client
 from app.logging_config import bind_log_context
+from app.models.chat_attachment import ChatAttachment
 from app.models.chat_message import ChatMessage
 from app.models.chat_session import STALE_TURN_TIMEOUT_SECONDS, ChatSession
 from app.models.chat_turn_event import ChatTurnEvent
@@ -56,10 +58,15 @@ from app.models.kpi_node import KpiNode
 from app.models.scorecard import Scorecard
 from app.models.scorecard_version import ScorecardVersion
 from app.models.user import User
+from app.pipeline.aws_jobs import AwsJobsProtocol
 from app.ratelimit import rate_limit
 from app.schemas.chat import (
+    ChatAttachmentLimits,
+    ChatAttachmentRead,
+    ChatConfigRead,
     ChatMessageCreate,
     ChatMessageRead,
+    ChatModelOption,
     ChatSessionRead,
     ChatSessionStart,
     ChatTurnEventRead,
@@ -167,13 +174,13 @@ async def _generate_and_persist_title(
     """Issue 1 (see task notes): a brand-new session's title must be generated as the
     VERY FIRST thing on its first turn — before check_similarity/research_kpis/
     propose_kpis (the heavier LangGraph work — see scorecard_builder.py) ever run — via
-    ONE fast/cheap call on the client's judge-tier model (`models_of(bedrock).judge`, not the
+    ONE fast/cheap call on the builder's judge-tier model (`models_of(bedrock).builder_judge`, not the
     heavier chat model), and persisted immediately so a concurrent request (a different tab's session
     list poll, or this same request's own eventual response) can see it well before the
     graph call returns. Best-effort: never raises, never blocks session creation on a
     cosmetic feature — see generate_session_title's own "never raise" contract."""
     title = await asyncio.to_thread(
-        generate_session_title, bedrock, providers.models_of(bedrock).judge, first_message
+        generate_session_title, bedrock, providers.models_of(bedrock).builder_judge, first_message
     )
     if not title:
         return None
@@ -182,6 +189,144 @@ async def _generate_and_persist_title(
     session.title = title
     logger.info("Generated chat session title for session_id=%s: %r", session.id, title)
     return title
+
+
+# --- Chat models (app/ai/chat_models.py) ---------------------------------------------------------------------
+#
+# Two models per turn: the scorecard builder always runs on the provider's builder model (OPENROUTER_KPI_MODEL /
+# the Bedrock chat model); the chat assistant in front of it (app/ai/chat_agent.py) runs on the model the user picked
+# in the chat (OpenRouter only; checked against the admin's enabled list, else the admin's default). The pick is
+# stored on the session row, so a worker that claims a queued turn uses it too.
+
+# Assistant decisions whose visible reply the assistant itself wrote (the others are the builder's).
+_ASSISTANT_ROUTES = frozenset({"answer", "ask", "edit", "save"})
+
+
+async def _remember_chat_model(db: AsyncSession, session: ChatSession, bedrock: BedrockClientProtocol,
+                               requested: str | None) -> None:
+    """Stores the user's pick on the session (only with OpenRouter, only an allowed model; otherwise unchanged)."""
+    if not requested:
+        return
+    picked = await chat_models.resolve(providers.provider_of(bedrock), requested)
+    if picked == requested and session.chat_model != picked:
+        session.chat_model = picked
+        await db.execute(update(ChatSession).where(ChatSession.id == session.id).values(chat_model=picked))
+        await db.commit()
+
+
+async def _turn_models(bedrock: BedrockClientProtocol, session: ChatSession) -> tuple[str, str | None]:
+    """(builder model, chat-assistant model) for a turn of `session`; the assistant model is None with Bedrock (the
+    assistant then runs on the builder model)."""
+    conversation = await chat_models.resolve(providers.provider_of(bedrock), session.chat_model)
+    return providers.models_of(bedrock).builder, conversation
+
+
+def _reply_model(turn: BuilderTurnResult, builder: str, conversation: str | None) -> str:
+    """The model that wrote this turn's visible reply."""
+    return (conversation or builder) if turn.agent_route in _ASSISTANT_ROUTES else builder
+
+
+# --- Chat attachments (app/api/v1/chat_attachments.py, app/ai/attachments.py) --------------------------------------
+#
+# A message's `attachment_ids` are claimed for the session when the message is accepted (only the user's own, ready,
+# not-yet-sent files), and bound to the user's chat_messages row once it is written. A turn then reads every ready
+# file of the session: those of the latest user message (or not bound to a message yet, for an inline first turn
+# whose message row is written after the turn) are "current" and go into the message the graph sees; all of them
+# are readable by the chat assistant.
+
+
+async def _claim_attachments(
+    db: AsyncSession, user: User, ids: list[uuid.UUID], session_id: uuid.UUID
+) -> list[ChatAttachment]:
+    if not ids:
+        return []
+    wanted = list(dict.fromkeys(ids))
+    if len(wanted) > get_settings().chat_attachment_max_files:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Too many files for one message.")
+    rows = {
+        r.id: r
+        for r in (
+            await db.execute(
+                select(ChatAttachment).where(ChatAttachment.id.in_(wanted), ChatAttachment.user_id == user.id)
+            )
+        ).scalars().all()
+    }
+    problems: list[str] = []
+    for attachment_id in wanted:
+        row = rows.get(attachment_id)
+        if row is None:
+            problems.append(f"{attachment_id}: not found")
+        elif row.status != "ready":
+            problems.append(f"{row.filename}: {row.error or 'still uploading'}")
+        elif row.message_id is not None and row.session_id != session_id:
+            problems.append(f"{row.filename}: already sent in another chat")
+    if problems:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=problems)
+    for row in rows.values():
+        row.session_id = session_id
+    await db.flush()
+    return [rows[i] for i in wanted]
+
+
+async def _bind_attachments(db: AsyncSession, rows: list[ChatAttachment], message: ChatMessage) -> None:
+    for row in rows:
+        if row.message_id is None:
+            row.message_id = message.id
+    await db.flush()
+
+
+async def _turn_attachments(
+    db: AsyncSession, session_id: uuid.UUID, client: BedrockClientProtocol, aws: AwsJobsProtocol | None
+) -> tuple[list[att.AttachmentView], att.AttachmentContext | None]:
+    """(the current message's files, the assistant's view of every file of the chat). Never raises for a native-block
+    download problem (the extracted text is used alone)."""
+    rows = list(
+        (
+            await db.execute(
+                select(ChatAttachment)
+                .where(ChatAttachment.session_id == session_id, ChatAttachment.status == "ready")
+                .order_by(ChatAttachment.created_at)
+            )
+        ).scalars().all()
+    )
+    if not rows:
+        return [], None
+    latest = await db.scalar(
+        select(ChatMessage.id)
+        .where(ChatMessage.session_id == session_id, ChatMessage.role == ChatMessageRole.USER)
+        .order_by(ChatMessage.created_at.desc())
+        .limit(1)
+    )
+    current = [r for r in rows if r.message_id is None or r.message_id == latest]
+    views = {
+        r.id: att.AttachmentView(
+            id=str(r.id), filename=r.filename, kind=r.kind, text=r.extracted_text or "", outline=r.outline or {},
+            needs_native=r.needs_native,
+        )
+        for r in rows
+    }
+    native: list[dict] = []
+    if aws is not None and providers.provider_of(client) == "openrouter":
+        for r in current:
+            pages = (r.outline or {}).get("pages") or 0
+            is_image = r.kind == "image"
+            is_scan = r.kind == "pdf" and r.needs_native and pages <= att.NATIVE_PDF_MAX_PAGES
+            if not (is_image or is_scan) or r.size_bytes > att.NATIVE_MAX_BYTES:
+                continue
+            try:
+                data = await asyncio.to_thread(aws.get_object_bytes, r.s3_key, att.NATIVE_MAX_BYTES)
+            except Exception:  # noqa: BLE001 - the original may have expired; the text still goes
+                logger.warning("chat attachment %s: original not readable; using its text only", r.id)
+                continue
+            ext = att.extension_of(r.s3_key)
+            if is_image:
+                native.append({"image": {"format": att.IMAGE_FORMATS.get(ext, "png"), "source": {"bytes": data}}})
+            else:
+                native.append({"document": {"format": "pdf", "name": r.filename, "source": {"bytes": data}}})
+    context = att.AttachmentContext(
+        files=list(views.values()), current_ids=[str(r.id) for r in current], native_blocks=native
+    )
+    return [views[r.id] for r in current], context
 
 
 # --- Background turns --------------------------------------------------------------------
@@ -248,6 +393,7 @@ async def _persist_turn_result(
     bedrock: BedrockClientProtocol,
     *,
     user_message: str | None,
+    reply_model: str | None = None,
 ) -> None:
     """Writes the turn's chat_messages rows (the user's message too when `user_message` is given —
     first turns persist it only after success), materializes a confirmed draft and clears the
@@ -259,7 +405,9 @@ async def _persist_turn_result(
         tool_calls = {"question": turn.question}
     elif turn.similar_suggestions:
         tool_calls = {"similar_suggestions": turn.similar_suggestions}
-    await _persist_message(db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls)
+    await _persist_message(
+        db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls, model=reply_model
+    )
     await _maybe_materialize(db, session, turn, bedrock)
     await _clear_turn_in_progress(db, session.id)
     await db.commit()
@@ -309,6 +457,7 @@ async def _background_turn(
     bedrock: BedrockClientProtocol,
     web_search: WebSearchClientProtocol,
     jev: JevClientProtocol,
+    aws: AwsJobsProtocol | None = None,
 ) -> None:
     """The body of one background turn — see the "Background turns" comment above. Never raises
     (except re-raising cancellation after recording it)."""
@@ -321,6 +470,8 @@ async def _background_turn(
                 return  # deleted before the task even started
             if first_turn:
                 await _generate_and_persist_title(db, session, bedrock, message)
+            builder_model, conversation_model = await _turn_models(bedrock, session)
+            files, attachment_context = await _turn_attachments(db, session_id, bedrock, aws)
             # Never carry an idle-in-transaction connection into the (minutes-long) graph run:
             # it would block any schema DDL (e.g. the checkpointer's CREATE INDEX CONCURRENTLY).
             await db.commit()
@@ -328,16 +479,19 @@ async def _background_turn(
                 run = start_session if first_turn else send_message
                 turn = await run(
                     str(session_id),
-                    message,
+                    att.compose_message(message, files),
                     bedrock,
-                    chat_model_id=providers.models_of(bedrock).chat,
+                    chat_model_id=builder_model,
                     db=db,
                     web_search_client=web_search,
                     turn_started_at=turn_started_at,
                     jev_client=jev,
+                    conversation_model_id=conversation_model,
+                    attachments=attachment_context,
                 )
             await _persist_turn_result(
-                db, session, turn, bedrock, user_message=message if persist_user_message else None
+                db, session, turn, bedrock, user_message=message if persist_user_message else None,
+                reply_model=_reply_model(turn, builder_model, conversation_model),
             )
             await _notify_turn(session, turn, turn_started_at)
     except asyncio.CancelledError:
@@ -372,6 +526,7 @@ async def _run_claimed_turn(
         client = await providers.active_client()
         web_search = web_search_mod.web_search_for(providers.provider_of(client))
         jev = deps.get_jev_client()
+        aws = deps.get_aws_jobs()
     except asyncio.CancelledError:
         await _record_cancelled_turn(session_id, turn_started_at)
         raise
@@ -383,7 +538,7 @@ async def _run_claimed_turn(
         return
     await _background_turn(
         session_id=session_id, message=message, first_turn=first_turn, persist_user_message=False,
-        turn_started_at=turn_started_at, bedrock=client, web_search=web_search, jev=jev,
+        turn_started_at=turn_started_at, bedrock=client, web_search=web_search, jev=jev, aws=aws,
     )
 
 
@@ -712,10 +867,13 @@ def _turn_to_response(session_id: uuid.UUID, turn: BuilderTurnResult) -> ChatTur
 
 
 async def _persist_message(
-    db: AsyncSession, session_id: uuid.UUID, role: ChatMessageRole, content: str, tool_calls=None
-) -> None:
-    db.add(ChatMessage(session_id=session_id, role=role, content=content, tool_calls=tool_calls))
+    db: AsyncSession, session_id: uuid.UUID, role: ChatMessageRole, content: str, tool_calls=None,
+    model: str | None = None,
+) -> ChatMessage:
+    message = ChatMessage(session_id=session_id, role=role, content=content, tool_calls=tool_calls, model=model)
+    db.add(message)
     await db.flush()
+    return message
 
 
 async def _maybe_materialize(
@@ -799,6 +957,30 @@ async def chart_states(
     return out
 
 
+@router.get("/config", response_model=ChatConfigRead)
+async def get_chat_config(current_user: User = Depends(get_current_user)) -> ChatConfigRead:
+    """What the chat composer offers: the model picker (OpenRouter only: the admin's enabled models and default)
+    and file attachments (OpenRouter only, and only when the S3 bucket for uploads is configured)."""
+    provider = await providers.active_provider()
+    openrouter = provider == "openrouter"
+    choice = await chat_models.current_choice()
+    settings = get_settings()
+    from app.ai.attachments import ATTACHMENT_EXTENSIONS
+
+    return ChatConfigRead(
+        provider=provider,
+        model_picker=openrouter and bool(choice.enabled),
+        models=[ChatModelOption(**chat_models.describe(m)) for m in choice.enabled] if openrouter else [],
+        default_model=choice.default if openrouter else None,
+        attachments=ChatAttachmentLimits(
+            enabled=openrouter and bool(settings.s3_bucket),
+            max_bytes=settings.chat_attachment_max_bytes,
+            max_files=settings.chat_attachment_max_files,
+            extensions=sorted(ATTACHMENT_EXTENSIONS),
+        ),
+    )
+
+
 @router.get("/sessions", response_model=list[ChatSessionRead])
 async def list_chat_sessions(
     skip: int = Query(default=0, ge=0),
@@ -827,7 +1009,7 @@ async def list_chat_sessions(
 @router.get("/sessions/{session_id}/messages", response_model=list[ChatMessageRead])
 async def list_chat_messages(
     session_id: uuid.UUID, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)
-) -> list[ChatMessage]:
+) -> list[ChatMessageRead]:
     """Additive (Wave 3 integration): real persisted chat history for a session, so the
     frontend can render a resumed conversation (`ChatTurnRead` only carries current
     LangGraph turn/draft state, not the message log)."""
@@ -837,7 +1019,23 @@ async def list_chat_messages(
         .where(ChatMessage.session_id == session_id)
         .order_by(ChatMessage.created_at)
     )
-    return list(result.scalars().all())
+    messages = list(result.scalars().all())
+    files = (
+        await db.execute(
+            select(ChatAttachment)
+            .where(ChatAttachment.session_id == session_id, ChatAttachment.message_id.is_not(None))
+            .order_by(ChatAttachment.created_at)
+        )
+    ).scalars().all()
+    by_message: dict[uuid.UUID, list[ChatAttachmentRead]] = {}
+    for f in files:
+        by_message.setdefault(f.message_id, []).append(ChatAttachmentRead.model_validate(f))
+    out: list[ChatMessageRead] = []
+    for m in messages:
+        item = ChatMessageRead.model_validate(m)
+        item.attachments = by_message.get(m.id, [])
+        out.append(item)
+    return out
 
 
 @router.post(
@@ -858,6 +1056,7 @@ async def start_chat_session(
     bedrock: BedrockClientProtocol = Depends(get_bedrock_client),
     web_search: WebSearchClientProtocol = Depends(get_web_search_client),
     jev: JevClientProtocol = Depends(get_jev_client),
+    aws: AwsJobsProtocol = Depends(get_aws_jobs),
 ) -> ChatTurnRead:
     message = payload.message.strip()
     if payload.target_scorecard_id is None and not message:
@@ -869,7 +1068,7 @@ async def start_chat_session(
     if payload.target_scorecard_id is not None:
         return await _start_refine_session(
             db, current_user, bedrock, web_search, jev, payload.target_scorecard_id, message,
-            response=response, inline=_use_inline_turns(wait),
+            response=response, inline=_use_inline_turns(wait), model=payload.model,
         )
 
     # Originally (see prior bug writeup): a brand-new "start fresh" session used to be
@@ -893,13 +1092,22 @@ async def start_chat_session(
     # this row gets, instead of a server-only id the client can't learn until this whole
     # (long-running) request returns.
     session_id = payload.session_id or uuid.uuid4()
-    session = ChatSession(id=session_id, user_id=current_user.id)
+    picked = await chat_models.resolve(providers.provider_of(bedrock), payload.model) if payload.model else None
+    session = ChatSession(id=session_id, user_id=current_user.id, chat_model=picked)
     db.add(session)
     try:
         await db.commit()
     except IntegrityError as exc:  # a client-chosen id that is already taken (by anyone): same answer for all
         await db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, detail="This session id is already in use.") from exc
+    try:
+        claimed = await _claim_attachments(db, current_user, payload.attachment_ids, session_id)
+        await db.commit()
+    except HTTPException:
+        await db.rollback()
+        await db.execute(delete(ChatSession).where(ChatSession.id == session_id))
+        await db.commit()
+        raise
     if not _use_inline_turns(wait):
         # Background mode: the title call and the whole graph run happen in the task (see
         # `_background_turn`); the client polls GET /chat/sessions/{id}. A failed first turn keeps the
@@ -907,11 +1115,12 @@ async def start_chat_session(
         # The user's message is persisted in the SAME transaction that marks the turn in progress
         # (`_mark_turn_in_progress` commits), so a reload / navigation right after the 202 — or a
         # failed/cancelled first turn — still sees it; the success path must not write it again.
-        await _persist_message(db, session_id, ChatMessageRole.USER, payload.message)
+        user_row = await _persist_message(db, session_id, ChatMessageRole.USER, payload.message)
+        await _bind_attachments(db, claimed, user_row)
         turn_started_at = await _mark_new_turn(db, session_id)
         await _launch_background_turn(
             session_id=session_id, message=payload.message, first_turn=True, persist_user_message=False,
-            turn_started_at=turn_started_at, bedrock=bedrock, web_search=web_search, jev=jev,
+            turn_started_at=turn_started_at, bedrock=bedrock, web_search=web_search, jev=jev, aws=aws,
         )
         response.status_code = status.HTTP_202_ACCEPTED
         return await _accepted_response(session)
@@ -923,17 +1132,21 @@ async def start_chat_session(
     # session row is deleted, the title is deleted right along with it — no orphaned
     # title left behind either.
     await _generate_and_persist_title(db, session, bedrock, payload.message)
+    builder_model, conversation_model = await _turn_models(bedrock, session)
+    files, attachment_context = await _turn_attachments(db, session_id, bedrock, aws)
     turn_started_at = await _mark_new_turn(db, session_id)
     try:
         turn = await start_session(
             str(session_id),
-            payload.message,
+            att.compose_message(payload.message, files),
             bedrock,
-            chat_model_id=providers.models_of(bedrock).chat,
+            chat_model_id=builder_model,
             db=db,
             web_search_client=web_search,
             turn_started_at=turn_started_at,
             jev_client=jev,
+            conversation_model_id=conversation_model,
+            attachments=attachment_context,
         )
     except BedrockUnavailableError as exc:
         await db.execute(
@@ -958,7 +1171,8 @@ async def start_chat_session(
     # raise" contract), but nothing downstream of the graph call did). Surface it as a
     # clean, expected 409 instead of leaking an internal DB error.
     try:
-        await _persist_message(db, session.id, ChatMessageRole.USER, payload.message)
+        user_row = await _persist_message(db, session.id, ChatMessageRole.USER, payload.message)
+        await _bind_attachments(db, claimed, user_row)
 
         tool_calls = None
         if turn.question:
@@ -966,7 +1180,8 @@ async def start_chat_session(
         elif turn.similar_suggestions:
             tool_calls = {"similar_suggestions": turn.similar_suggestions}
         await _persist_message(
-            db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls
+            db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls,
+            model=_reply_model(turn, builder_model, conversation_model),
         )
         scorecard_id, version_id = await _maybe_materialize(db, session, turn, bedrock)
         await _clear_turn_in_progress(db, session.id)
@@ -999,6 +1214,7 @@ async def _start_refine_session(
     *,
     response: Response,
     inline: bool,
+    model: str | None = None,
 ) -> ChatTurnRead:
     """"Refine with assistant": open a session whose draft is pre-populated from the
     scorecard's current version (see `draft_from_scorecard` / `seed_session`). Seeding
@@ -1039,6 +1255,7 @@ async def _start_refine_session(
         # Deterministic — no Bedrock call needed (or wanted: the scorecard being refined
         # already gives a perfectly specific title for free) — see Issue 1's task notes.
         title=f'Refining "{scorecard.name}"',
+        chat_model=await chat_models.resolve(providers.provider_of(bedrock), model) if model else None,
     )
     db.add(session)
     await db.flush()
@@ -1065,16 +1282,18 @@ async def _start_refine_session(
         await _persist_message(db, session.id, ChatMessageRole.USER, message)
         await db.commit()
         turn_started_at = await _mark_new_turn(db, session.id)
+        builder_model, conversation_model = await _turn_models(bedrock, session)
         try:
             turn = await send_message(
                 str(session.id),
                 message,
                 bedrock,
-                chat_model_id=providers.models_of(bedrock).chat,
+                chat_model_id=builder_model,
                 db=db,
                 web_search_client=web_search,
                 turn_started_at=turn_started_at,
                 jev_client=jev,
+                conversation_model_id=conversation_model,
             )
         except BedrockUnavailableError as exc:
             await _clear_turn_in_progress(db, session.id)
@@ -1087,7 +1306,8 @@ async def _start_refine_session(
         try:
             tool_calls = {"question": turn.question} if turn.question else None
             await _persist_message(
-                db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls
+                db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls,
+                model=_reply_model(turn, builder_model, conversation_model),
             )
             scorecard_out, version_out = await _maybe_materialize(db, session, turn, bedrock)
             await _clear_turn_in_progress(db, session.id)
@@ -1129,6 +1349,7 @@ async def send_chat_message(
     bedrock: BedrockClientProtocol = Depends(get_bedrock_client),
     web_search: WebSearchClientProtocol = Depends(get_web_search_client),
     jev: JevClientProtocol = Depends(get_jev_client),
+    aws: AwsJobsProtocol = Depends(get_aws_jobs),
     current_user: User = Depends(get_current_user),
 ) -> ChatTurnRead:
     session = await get_owned_chat_session(db, current_user, session_id)
@@ -1137,6 +1358,7 @@ async def send_chat_message(
         raise HTTPException(
             status.HTTP_409_CONFLICT, detail="The assistant is still working on your previous message."
         )
+    await _remember_chat_model(db, session, bedrock, payload.model)
 
     # "Try again" after a failed/cancelled turn re-sends the SAME text: the original user message is
     # already persisted (a first turn persists it up front), so don't write a duplicate.
@@ -1149,30 +1371,36 @@ async def send_chat_message(
         and last.role == ChatMessageRole.USER
         and last.content == payload.message
     )
+    claimed = await _claim_attachments(db, current_user, payload.attachment_ids, session.id)
     # Claim the session first (atomic; 409 if another request just started a turn), then record the message.
     turn_started_at = await _mark_turn_in_progress(db, session.id, require_idle=True)
     if not is_retry:
-        await _persist_message(db, session.id, ChatMessageRole.USER, payload.message)
+        user_row = await _persist_message(db, session.id, ChatMessageRole.USER, payload.message)
+        await _bind_attachments(db, claimed, user_row)
         await db.commit()
 
     if not _use_inline_turns(wait):
         await _launch_background_turn(
             session_id=session.id, message=payload.message, first_turn=False, persist_user_message=False,
-            turn_started_at=turn_started_at, bedrock=bedrock, web_search=web_search, jev=jev,
+            turn_started_at=turn_started_at, bedrock=bedrock, web_search=web_search, jev=jev, aws=aws,
         )
         response.status_code = status.HTTP_202_ACCEPTED
         return await _accepted_response(session)
 
+    builder_model, conversation_model = await _turn_models(bedrock, session)
+    files, attachment_context = await _turn_attachments(db, session.id, bedrock, aws)
     try:
         turn = await send_message(
             str(session.id),
-            payload.message,
+            att.compose_message(payload.message, files),
             bedrock,
-            chat_model_id=providers.models_of(bedrock).chat,
+            chat_model_id=builder_model,
             db=db,
             web_search_client=web_search,
             turn_started_at=turn_started_at,
             jev_client=jev,
+            conversation_model_id=conversation_model,
+            attachments=attachment_context,
         )
     except BedrockUnavailableError as exc:
         await _clear_turn_in_progress(db, session.id)
@@ -1194,7 +1422,8 @@ async def send_chat_message(
         elif turn.similar_suggestions:
             tool_calls = {"similar_suggestions": turn.similar_suggestions}
         await _persist_message(
-            db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls
+            db, session.id, ChatMessageRole.ASSISTANT, turn.assistant_note or "", tool_calls=tool_calls,
+            model=_reply_model(turn, builder_model, conversation_model),
         )
         scorecard_id, version_id = await _maybe_materialize(db, session, turn, bedrock)
         await _clear_turn_in_progress(db, session.id)
@@ -1262,6 +1491,7 @@ async def get_chat_session(
     response.turn_error = turn_error
     response.turn_error_code = turn_error_code
     response.title = session.title
+    response.chat_model = session.chat_model
     # Only report a materialized scorecard once something was actually saved: a
     # "Refine with assistant" session carries target_scorecard_id from the start, before
     # anything has been confirmed.

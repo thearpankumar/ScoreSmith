@@ -63,10 +63,13 @@ LAMBDA_MODELS: dict[str, dict[str, list[str]]] = {
         "vision": ["moonshotai.kimi-k2.5", "qwen.qwen3-vl-235b-a22b", "us.meta.llama4-maverick-17b-instruct-v1:0"],
         # Amazon Transcribe first: Bedrock's Voxtral rejects audio input since Oct 2026 (kept as the fallback)
         "transcription": ["amazon.transcribe", "mistral.voxtral-small-24b-2507", "mistral.voxtral-mini-3b-2507"],
+        # Video frames: keyframe contact sheets read by a cheap vision model (aws/lambdas/src/worker/frames.py)
+        "video": ["us.amazon.nova-2-lite-v1:0", "qwen.qwen3-vl-235b-a22b"],
     },
     "openrouter": {
         "vision": ["qwen/qwen3.7-flash", "qwen/qwen3-vl-235b-a22b-instruct"],
         "transcription": ["mistralai/voxtral-small-24b-2507", "mistralai/voxtral-mini-3b-2507"],
+        "video": ["qwen/qwen3.7-flash", "google/gemini-3.1-flash-lite"],
     },
 }
 
@@ -97,12 +100,18 @@ _CREDENTIAL_SOURCE_VARS = (
 
 @dataclass(frozen=True)
 class ModelSet:
-    """The backend's model ids for one provider (the Lambda's vision / transcription models are separate)."""
+    """The backend's model ids for one provider (the Lambda's vision / transcription models are separate).
+
+    `chat` / `judge` / `master` serve evaluations and the other non-chat callers; `builder` / `builder_judge` serve
+    the chat scorecard builder (its KPI research / drafting calls and its judge-tier helpers). On OpenRouter the
+    builder runs on its own model (`OPENROUTER_KPI_MODEL`) while evaluations keep `OPENROUTER_AGENT_MODEL`."""
 
     chat: str
     judge: str
     master: str
     embedding: str
+    builder: str
+    builder_judge: str
 
 
 class ProviderLocked(Exception):
@@ -188,13 +197,17 @@ def _normalize(p: Any) -> ProviderName:
 def models_for(p: str) -> ModelSet:
     s = get_settings()
     if p == "openrouter":
-        agent = s.openrouter_agent_model
-        return ModelSet(chat=agent, judge=agent, master=agent, embedding=s.openrouter_embed_model)
+        agent, kpi = s.openrouter_agent_model, s.openrouter_kpi_model
+        return ModelSet(
+            chat=agent, judge=agent, master=agent, embedding=s.openrouter_embed_model, builder=kpi, builder_judge=kpi
+        )
     return ModelSet(
         chat=s.bedrock_chat_model_id,
         judge=s.bedrock_judge_model_id,
         master=s.bedrock_master_model_id,
         embedding=s.bedrock_embedding_model_id,
+        builder=s.bedrock_chat_model_id,
+        builder_judge=s.bedrock_judge_model_id,
     )
 
 
@@ -217,6 +230,8 @@ def models_of(client: Any) -> ModelSet:
         judge=pick("judge_model_id", defaults.judge),
         master=pick("master_model_id", defaults.master),
         embedding=pick("embedding_model_id", defaults.embedding),
+        builder=pick("builder_model_id", defaults.builder),
+        builder_judge=pick("builder_judge_model_id", defaults.builder_judge),
     )
 
 

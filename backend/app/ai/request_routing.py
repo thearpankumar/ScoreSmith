@@ -16,8 +16,8 @@ main model, so this module can only ever REMOVE work, never change an answer):
      probability per option plus a confidence, in roughly 70-500 ms, which makes it a
      better fit for this job than for the instruction/answer scoring it was first used
      for. Only a CONFIDENT answer is used.
-   - the client's small judge-tier model (`models_of(bedrock).judge`: GLM-4.7-Flash on Bedrock,
-     gpt-5-mini on OpenRouter) with a forced single-tool enum answer, when Jev is
+   - the builder's judge-tier model (`models_of(bedrock).builder_judge`: GLM-4.7-Flash on Bedrock,
+     OPENROUTER_KPI_MODEL on OpenRouter) with a forced single-tool enum answer, when Jev is
      unconfigured, fails or is unsure.
 3. Only when the router answers `open_ended` with confidence does the caller skip the main
    model; `user_specified`, `hybrid`, `unsure`, any failure, and any strong structural
@@ -240,7 +240,7 @@ async def route_request(
                 system=_ROUTE_SYSTEM_PROMPT,
                 tools=[ROUTE_REQUEST_TOOL],
                 force_tool_use=True,
-                model_id=models_of(bedrock).judge,
+                model_id=models_of(bedrock).builder_judge,
             )
             if result.is_tool_use and result.tool_name == "route_request" and not result.truncated:
                 mode = str((result.tool_input or {}).get("mode") or "")

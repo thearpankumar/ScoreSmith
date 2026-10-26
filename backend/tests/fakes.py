@@ -39,6 +39,11 @@ class FakeBedrockClient:
       `asyncio.to_thread`) with no guaranteed ordering, so responses must be selected by
       inspecting the call's content instead of by position.
 
+    The chat assistant's call (app/ai/chat_agent.py — recognised by its `build_scorecard` tool) is
+    also handled out of band: answered by `agent_fn` (default: hand the message to the builder with
+    an empty brief, i.e. exactly the pre-assistant behaviour) and logged to `agent_calls`. Tests of
+    the assistant itself script `agent_fn`.
+
     The request-classification call (`classify_request` — see `research_kpis` in
     scorecard_builder.py) is handled OUT OF BAND: it is answered by `classify_fn` (default:
     "open_ended", i.e. the pre-existing behaviour) and logged to `classify_calls`, never to
@@ -57,7 +62,10 @@ class FakeBedrockClient:
         dedup_fn: ConverseFn | None = None,
         header_fn: ConverseFn | None = None,
         side_fn: ConverseFn | None = None,
+        agent_fn: ConverseFn | None = None,
     ) -> None:
+        self._agent_fn = agent_fn
+        self.agent_calls: list[dict[str, Any]] = []
         self._side_fn = side_fn
         self.side_calls: list[dict[str, Any]] = []
         self._header_fn = header_fn
@@ -83,7 +91,18 @@ class FakeBedrockClient:
         force_tool_use: bool = False,
         model_id: str | None = None,
         temperature: float | None = None,
+        **extra: Any,
     ) -> ConverseResult:
+        if tools and any(getattr(t, "name", None) == "build_scorecard" for t in tools):
+            with self._lock:
+                self.agent_calls.append(
+                    {"messages": messages, "system": system, "tools": tools, "model_id": model_id, **extra}
+                )
+            if self._agent_fn is not None:
+                return self._agent_fn(
+                    messages=messages, system=system, tools=tools, force_tool_use=force_tool_use, model_id=model_id
+                )
+            return tool_use_result("build_scorecard", {"brief": ""})
         # The lock only guards the shared `calls`/`script` list mutations, NOT the actual
         # `converse_fn` invocation. Concurrent callers (scorecard_builder.py's research
         # fan-out, judge.py's ensemble) each run `.converse()` inside `asyncio.to_thread`,
@@ -183,6 +202,8 @@ class FakeOpenRouterClient(FakeBedrockClient):
     judge_model_id = "openai/gpt-5-mini"
     master_model_id = "openai/gpt-5-mini"
     embedding_model_id = "fake-embed"
+    builder_model_id = "openai/gpt-5.6-luna"
+    builder_judge_model_id = "openai/gpt-5.6-luna"
 
 
 def tool_use_result(name: str, tool_input: dict[str, Any]) -> ConverseResult:
@@ -340,6 +361,8 @@ class FakeAwsJobs:
         # When set, start_execution records the run and then waits for the gate before returning its ARN: a test
         # can land a cancel between AWS starting the run and the dispatcher saving the ARN.
         self.start_gate: threading.Event | None = None
+        self.invocations: list[tuple[str, dict[str, Any]]] = []
+        self.invoke_fn: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None
         self._lock = threading.Lock()
 
     # --- S3 ---
@@ -411,6 +434,16 @@ class FakeAwsJobs:
         self.stopped.append(arn)
         if arn in self.executions:
             self.executions[arn]["status"] = "ABORTED"
+
+    # --- Lambda ---
+    def invoke_function(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Records the call; answers with `invoke_fn(name, payload)` when set, else a successful chat extraction."""
+        with self._lock:
+            self.invocations.append((name, payload))
+        if self.invoke_fn is not None:
+            return self.invoke_fn(name, payload)
+        return {"ok": True, "kind": payload.get("kind"), "text": "Extracted text.", "pages": 1, "chars": 15,
+                "truncated": False, "scanned_pages": [], "needs_native": False, "warnings": []}
 
     # --- test controls ---
     def finish(

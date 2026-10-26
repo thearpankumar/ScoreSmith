@@ -12,7 +12,8 @@ from app.models.base import Base, TimestampMixin, UUIDPKMixin
 class AppSetting(UUIDPKMixin, TimestampMixin, Base):
     """One product-wide setting an admin changes at runtime (migration 0018), keyed by `key`.
 
-    Today the only key is "ai_provider" (`{"provider": "bedrock" | "openrouter"}`, see app/ai/providers.py)."""
+    Keys: "ai_provider" (`{"provider": "bedrock" | "openrouter"}`, see app/ai/providers.py) and "chat_models"
+    (`{"enabled": [...], "default": ...}`, see app/ai/chat_models.py)."""
 
     __tablename__ = "app_settings"
     __table_args__ = (UniqueConstraint("key", name="uq_app_settings_key"),)

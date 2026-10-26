@@ -5,6 +5,7 @@ from app.models.app_setting import AppSetting
 from app.models.audit_log import AuditLog
 from app.models.auth import OAuthIdentity, PasswordResetToken, RefreshToken
 from app.models.base import Base
+from app.models.chat_attachment import ChatAttachment
 from app.models.chat_message import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.chat_turn_event import ChatTurnEvent
@@ -39,6 +40,7 @@ __all__ = [
     "ChatSession",
     "ChatMessage",
     "ChatTurnEvent",
+    "ChatAttachment",
     "AuditLog",
     "IdempotencyKey",
     "RefreshToken",

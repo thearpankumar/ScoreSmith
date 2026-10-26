@@ -12,10 +12,19 @@ Request shape (defaults verified live against openai/gpt-5-mini, 2026-10-23):
   `temperature=0` (repeatable judging) sends `seed` instead.
 - **Reasoning**: `{"effort": OPENROUTER_REASONING, "exclude": true}`; `max_tokens` = OPENROUTER_MAX_OUTPUT_TOKENS
   (reasoning tokens count against it).
-- **Routing**: `provider: {"require_parameters": true, "sort": OPENROUTER_PROVIDER_SORT}`.
+- **Routing**: `provider: {"require_parameters": true, "sort": OPENROUTER_PROVIDER_SORT, "ignore": [...]}`
+  (OPENROUTER_PROVIDER_IGNORE, default the 2x-priced `openai/fast` endpoint).
 - When OpenRouter rejects a parameter for a model (a 400/404/422 naming it, or "no endpoints"), the parameter is
   dropped, remembered for that model for the life of the process, and the call retried; each fallback fires at
   most once per call, so a call never loops.
+- **Claude 5.x** (`anthropic/claude-*-5*`) rejects a forced `tool_choice` and takes no sampling parameters: it is
+  always sent `"auto"` (plus a system-prompt instruction to answer with a tool when the caller asked to force one)
+  and never sent `temperature` / `seed`.
+- **Rich content** (the chat agent, `app/ai/chat_agent.py`): Converse-shaped `toolUse` / `toolResult` blocks become
+  assistant `tool_calls` / `role: "tool"` messages, `image` / `document` blocks become `image_url` / `file` parts,
+  and a `cachePoint` block puts `cache_control` on the part before it (prompt caching; only for providers that
+  honour it). Messages made of text blocks only are still sent as one plain string. A call made with
+  `keep_reasoning=True` returns the provider's `reasoning_details`, which the agent passes back on its next step.
 
 Errors are normalised to `BedrockUnavailableError` / `BedrockTimeoutError` (aliased as `LLMUnavailableError` /
 `LLMTimeoutError`) so every existing handler keeps working. A 429 is retried once (honouring Retry-After) and then
@@ -28,6 +37,7 @@ The API key is read at call time and never logged or put in an exception message
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
@@ -40,7 +50,7 @@ from typing import Any, NoReturn
 
 import httpx
 
-from app.ai.bedrock_client import BedrockTimeoutError, BedrockUnavailableError, ConverseResult, ToolSpec
+from app.ai.bedrock_client import BedrockTimeoutError, BedrockUnavailableError, ConverseResult, ToolCall, ToolSpec
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -50,8 +60,13 @@ EMBEDDING_DIMENSIONS = 1024
 DEFAULT_SEED = 7
 _MAX_RETRY_AFTER = 30.0
 
-# Models whose endpoints reject sampling parameters outright (OpenAI reasoning models).
-_NO_SAMPLING_MODEL = re.compile(r"^openai/(gpt-5|o\d)")
+# Models whose endpoints reject sampling parameters outright (OpenAI reasoning models, Claude 5.x).
+_NO_SAMPLING_MODEL = re.compile(r"^(openai/(gpt-5|gpt-6|o\d)|anthropic/claude-(opus|sonnet|haiku)-[5-9])")
+# Models that reject a forced tool_choice ("required" / a named function): only "auto" is ever sent to them.
+_AUTO_TOOL_CHOICE_ONLY = re.compile(r"^anthropic/claude-(opus|sonnet|haiku)-[5-9]")
+# Models whose providers honour `cache_control` on a content part (others would only be sent a field they ignore).
+_CACHE_CONTROL_MODEL = re.compile(r"^(anthropic/|openai/gpt-5\.6|google/gemini)")
+_FORCE_NOTE = "Respond by calling exactly one of the provided tools; never answer in plain text."
 # Optional parameters dropped (in this order) when OpenRouter finds no endpoint for the request.
 _SAMPLING_PARAMS = ("temperature", "top_p", "seed")
 # Parameters OpenRouter may name in a rejection; a named one is dropped and remembered for the model.
@@ -135,6 +150,96 @@ def _flatten_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
+_RICH_KEYS = ("toolUse", "toolResult", "image", "document", "cachePoint", "reasoningDetails")
+_IMAGE_MEDIA_TYPES = {
+    "png": "image/png", "jpeg": "image/jpeg", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp",
+}
+_DOCUMENT_MEDIA_TYPES = {"pdf": "application/pdf"}
+
+
+def _is_rich(content: Any) -> bool:
+    """Whether Converse-shaped `content` carries anything besides text blocks."""
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and any(key in block for key in _RICH_KEYS) for block in content
+    )
+
+
+def _data_url(media_type: str, data: Any) -> str:
+    if isinstance(data, str):
+        return data if data.startswith("data:") else f"data:{media_type};base64,{data}"
+    return f"data:{media_type};base64,{base64.b64encode(bytes(data)).decode('ascii')}"
+
+
+def _content_part(block: dict[str, Any]) -> dict[str, Any] | None:
+    """One Converse content block -> an OpenAI-style content part (None for blocks without one)."""
+    if isinstance(block.get("text"), str):
+        return {"type": "text", "text": block["text"]}
+    if isinstance(block.get("image"), dict):
+        image = block["image"]
+        fmt = str(image.get("format") or "png").lower()
+        url = _data_url(_IMAGE_MEDIA_TYPES.get(fmt, f"image/{fmt}"), (image.get("source") or {}).get("bytes", b""))
+        return {"type": "image_url", "image_url": {"url": url}}
+    if isinstance(block.get("document"), dict):
+        doc = block["document"]
+        fmt = str(doc.get("format") or "pdf").lower()
+        data = _data_url(
+            _DOCUMENT_MEDIA_TYPES.get(fmt, "application/octet-stream"), (doc.get("source") or {}).get("bytes", b"")
+        )
+        return {"type": "file", "file": {"filename": str(doc.get("name") or f"document.{fmt}"), "file_data": data}}
+    return None
+
+
+def _rich_messages(role: str, content: list[Any], cache_ok: bool) -> list[dict[str, Any]]:
+    """A Converse message with tool / image / document / cache blocks -> one or more chat-completions messages."""
+    if role == "assistant":
+        text = "\n".join(b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str))
+        message: dict[str, Any] = {"role": "assistant", "content": text or None}
+        uses = [b["toolUse"] for b in content if isinstance(b, dict) and isinstance(b.get("toolUse"), dict)]
+        calls = [
+            {
+                "id": str(use.get("toolUseId") or ""),
+                "type": "function",
+                "function": {"name": use.get("name"), "arguments": json.dumps(use.get("input") or {})},
+            }
+            for use in uses
+        ]
+        if calls:
+            message["tool_calls"] = calls
+        details = next(
+            (b["reasoningDetails"] for b in content if isinstance(b, dict) and b.get("reasoningDetails")), None
+        )
+        if details:
+            message["reasoning_details"] = details
+        return [message]
+    out: list[dict[str, Any]] = []
+    parts: list[dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append({"type": "text", "text": block})
+            continue
+        if not isinstance(block, dict):
+            continue
+        if isinstance(block.get("toolResult"), dict):
+            result = block["toolResult"]
+            # Tool results must directly follow the assistant message that made the calls.
+            out.append({
+                "role": "tool",
+                "tool_call_id": str(result.get("toolUseId") or ""),
+                "content": _flatten_text(result.get("content")) or "(no output)",
+            })
+            continue
+        if "cachePoint" in block:
+            if cache_ok and parts:
+                parts[-1]["cache_control"] = {"type": "ephemeral"}
+            continue
+        part = _content_part(block)
+        if part is not None:
+            parts.append(part)
+    if parts:
+        out.append({"role": role, "content": parts})
+    return out
+
+
 def _tool_to_openai(tool: ToolSpec) -> dict[str, Any]:
     return {
         "type": "function",
@@ -142,14 +247,19 @@ def _tool_to_openai(tool: ToolSpec) -> dict[str, Any]:
     }
 
 
-def _messages(messages: list[dict[str, Any]], system: str | None) -> list[dict[str, Any]]:
+def _messages(messages: list[dict[str, Any]], system: str | None, model: str = "") -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if system:
         out.append({"role": "system", "content": system})
+    cache_ok = bool(_CACHE_CONTROL_MODEL.match(model))
     for m in messages:
         role = m.get("role")
-        out.append({"role": role if role in ("user", "assistant", "system") else "user",
-                    "content": _flatten_text(m.get("content"))})
+        role = role if role in ("user", "assistant", "system") else "user"
+        content = m.get("content")
+        if _is_rich(content):
+            out.extend(_rich_messages(role, content, cache_ok))
+        else:
+            out.append({"role": role, "content": _flatten_text(content)})
     if out and out[-1]["role"] == "assistant":
         # Bedrock models continue a trailing assistant message (prefill); GPT models have no prefill.
         out.append({"role": "user", "content": "Continue."})
@@ -184,6 +294,20 @@ def parse_chat_response(data: dict[str, Any]) -> ConverseResult:
     tool_input: dict[str, Any] | None = None
     tool_use_id: str | None = None
     tool_calls = message.get("tool_calls") or []
+    all_calls: list[ToolCall] = []
+    if isinstance(tool_calls, list):
+        for i, extra in enumerate(tool_calls):
+            fn = (extra.get("function") or {}) if isinstance(extra, dict) else {}
+            name, args = fn.get("name"), fn.get("arguments")
+            if not name:
+                continue
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args) if args.strip() else {}
+                except ValueError:
+                    continue  # a cut-off call is never acted on
+            call_id = str(extra.get("id") or f"call_{i}")
+            all_calls.append(ToolCall(id=call_id, name=name, input=args if isinstance(args, dict) else {}))
     if isinstance(tool_calls, list) and tool_calls and isinstance(tool_calls[0], dict):
         call = tool_calls[0]
         fn = call.get("function") or {}
@@ -209,6 +333,8 @@ def parse_chat_response(data: dict[str, Any]) -> ConverseResult:
                 stop_reason = "max_tokens"
         if stop_reason not in ("max_tokens", "content_filtered"):
             stop_reason = "tool_use"
+    details = message.get("reasoning_details")
+    usage = data.get("usage")
     return ConverseResult(
         stop_reason=stop_reason,
         text=text or None,
@@ -216,6 +342,9 @@ def parse_chat_response(data: dict[str, Any]) -> ConverseResult:
         tool_input=tool_input,
         tool_use_id=tool_use_id,
         raw=data,
+        tool_calls=all_calls if tool_name is not None else [],
+        reasoning_details=details if isinstance(details, list) and details else None,
+        usage=usage if isinstance(usage, dict) else {},
     )
 
 
@@ -247,6 +376,9 @@ class OpenRouterClient:
         self.judge_model_id = judge_model_id or settings.openrouter_agent_model
         self.master_model_id = master_model_id or settings.openrouter_agent_model
         self.embedding_model_id = embedding_model_id or settings.openrouter_embed_model
+        # The chat scorecard builder's own tier (see providers.ModelSet).
+        self.builder_model_id = settings.openrouter_kpi_model
+        self.builder_judge_model_id = settings.openrouter_kpi_model
         self._transport = transport
         self._sleep = sleep
         self._client: httpx.Client | None = None
@@ -278,9 +410,12 @@ class OpenRouterClient:
         return self._client
 
     @staticmethod
-    def _headers(key: str) -> dict[str, str]:
+    def _headers(key: str, session_key: str | None = None) -> dict[str, str]:
         s = get_settings()
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        if session_key:
+            # Sticky provider routing for one conversation: repeated prefixes hit the same provider's prompt cache.
+            headers["x-session-id"] = session_key
         if s.openrouter_http_referer:
             headers["HTTP-Referer"] = s.openrouter_http_referer
         if s.openrouter_app_title:
@@ -318,11 +453,13 @@ class OpenRouterClient:
             return _HttpError(status, message.strip() or "error", limit_source=limit_source)
         return _HttpError(fallback_status, str(err))
 
-    def _post(self, path: str, payload: dict[str, Any], key: str) -> dict[str, Any]:
+    def _post(self, path: str, payload: dict[str, Any], key: str, session_key: str | None = None) -> dict[str, Any]:
         """One POST. Returns the parsed body; raises `_HttpError` (non-2xx, or a 200 carrying an error),
         `_TransportError`, or `BedrockTimeoutError`."""
         try:
-            response = self._get_client().post(self._url(path), json=payload, headers=self._headers(key))
+            response = self._get_client().post(
+                self._url(path), json=payload, headers=self._headers(key, session_key)
+            )
         except httpx.TimeoutException as exc:
             raise BedrockTimeoutError(f"OpenRouter {path} call timed out ({type(exc).__name__}).") from None
         except httpx.HTTPError as exc:
@@ -359,7 +496,7 @@ class OpenRouterClient:
         )
         return body
 
-    def _request(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _request(self, path: str, payload: dict[str, Any], session_key: str | None = None) -> dict[str, Any]:
         """POST with the retry policy: a 429 (or a 402 from the in-flight budget) once, honouring Retry-After;
         502/503 and connection errors up to OPENROUTER_MAX_ATTEMPTS with backoff. Raises `_HttpError` for anything
         else (the caller maps it), `BedrockTimeoutError` / `BedrockUnavailableError` for transport failures."""
@@ -370,7 +507,7 @@ class OpenRouterClient:
         throttled = failures = 0
         while True:
             try:
-                return self._post(path, payload, key)
+                return self._post(path, payload, key, session_key)
             except _HttpError as exc:
                 if exc.status == 429 or (exc.status == 402 and exc.limit_source == "openrouter_in_flight_budget"):
                     if throttled >= 1:
@@ -427,7 +564,7 @@ class OpenRouterClient:
 
     @staticmethod
     def _tool_choice(model: str, tools: list[ToolSpec], force_tool_use: bool) -> Any:
-        if force_tool_use and model not in _NO_FORCED_TOOL_CHOICE:
+        if force_tool_use and model not in _NO_FORCED_TOOL_CHOICE and not _AUTO_TOOL_CHOICE_ONLY.match(model):
             if len(tools) == 1 and model not in _NO_NAMED_TOOL_CHOICE:
                 return {"type": "function", "function": {"name": tools[0].name}}
             return "required"
@@ -441,13 +578,19 @@ class OpenRouterClient:
         tools: list[ToolSpec] | None,
         force_tool_use: bool,
         temperature: float | None,
+        reasoning_effort: str | None = None,
+        keep_reasoning: bool = False,
     ) -> dict[str, Any]:
         s = get_settings()
         dropped = _DROPPED_PARAMS.get(model, set())
-        payload: dict[str, Any] = {"model": model, "messages": _messages(messages, system)}
+        tool_choice = self._tool_choice(model, tools, force_tool_use) if tools else None
+        if tools and force_tool_use and tool_choice == "auto":
+            # The model cannot be forced: ask for a tool call in words (callers still handle a plain-text answer).
+            system = f"{system}\n\n{_FORCE_NOTE}" if system else _FORCE_NOTE
+        payload: dict[str, Any] = {"model": model, "messages": _messages(messages, system, model)}
         if tools:
             payload["tools"] = [_tool_to_openai(t) for t in tools]
-            payload["tool_choice"] = self._tool_choice(model, tools, force_tool_use)
+            payload["tool_choice"] = tool_choice
         if temperature is not None:
             if not _NO_SAMPLING_MODEL.match(model) and "temperature" not in dropped:
                 payload["temperature"] = temperature
@@ -455,15 +598,19 @@ class OpenRouterClient:
                 payload["seed"] = DEFAULT_SEED
         if s.openrouter_max_output_tokens > 0 and "max_tokens" not in dropped:
             payload["max_tokens"] = s.openrouter_max_output_tokens
-        effort = (s.openrouter_reasoning or "").strip().lower()
+        effort = (reasoning_effort if reasoning_effort is not None else s.openrouter_reasoning or "").strip().lower()
         if effort and effort not in ("none", "off") and "reasoning" not in dropped:
-            payload["reasoning"] = {"effort": effort, "exclude": True}
+            # keep_reasoning: the response carries `reasoning_details` for the caller to pass back in a tool loop.
+            payload["reasoning"] = {"effort": effort} if keep_reasoning else {"effort": effort, "exclude": True}
         routing: dict[str, Any] = {}
         if model not in _NO_REQUIRE_PARAMETERS:
             routing["require_parameters"] = True
         sort = (s.openrouter_provider_sort or "").strip()
         if sort:
             routing["sort"] = sort
+        ignore = [p.strip() for p in (s.openrouter_provider_ignore or "").split(",") if p.strip()]
+        if ignore:
+            routing["ignore"] = ignore
         if routing:
             payload["provider"] = routing
         return payload
@@ -533,13 +680,18 @@ class OpenRouterClient:
         force_tool_use: bool = False,
         model_id: str | None = None,
         temperature: float | None = None,
+        reasoning_effort: str | None = None,
+        keep_reasoning: bool = False,
+        session_key: str | None = None,
     ) -> ConverseResult:
         model = self._model(model_id)
-        payload = self._chat_payload(model, messages, system, tools, force_tool_use, temperature)
+        payload = self._chat_payload(
+            model, messages, system, tools, force_tool_use, temperature, reasoning_effort, keep_reasoning
+        )
         tried: set[str] = set()
         while True:
             try:
-                data = self._request("/chat/completions", payload)
+                data = self._request("/chat/completions", payload, session_key)
             except _HttpError as exc:
                 if self._apply_fallback(model, payload, exc, tried):
                     continue

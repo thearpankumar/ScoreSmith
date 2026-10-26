@@ -45,7 +45,8 @@ from tests.fakes import (
 )
 from tests.test_scaling_leases import _chat_row, _queued_turn
 
-OR_MODEL = "openai/gpt-5-mini"
+OR_MODEL = "openai/gpt-5-mini"  # evaluations (master / judge)
+OR_BUILDER_MODEL = "openai/gpt-5.6-luna"  # the chat scorecard builder and its session titles
 
 _CREATED: list[Dispatcher] = []
 
@@ -293,8 +294,8 @@ async def test_worker_claim_with_openrouter_active_runs_the_turn_on_openrouter_m
 
     await wait_until(finished)
     assert seen["search"] == "openrouter"
-    assert seen["title"] == (fake, OR_MODEL)
-    assert seen["turn"] == (fake, OR_MODEL)
+    assert seen["title"] == (fake, OR_BUILDER_MODEL)
+    assert seen["turn"] == (fake, OR_BUILDER_MODEL)
     row = await _chat_row(session.id)
     assert row.title == "OpenRouter title" and row.last_turn_error_code == "turn_failed"
 
@@ -343,7 +344,7 @@ def test_inline_chat_turns_use_the_injected_clients_models_end_to_end(
     client: TestClient, db_session: Session, seed_user_id: str, _chat_overrides, monkeypatch
 ) -> None:
     """With the request's client being OpenRouter, the title, routing, graph and the saved scorecard's embedding
-    all use OpenRouter ids (never a Bedrock default)."""
+    all use OpenRouter ids (never a Bedrock default): the builder's own model, never the evaluation model."""
     scheduled: list[str] = []
     monkeypatch.setattr(sb, "schedule_backfill", lambda c, *, reason: scheduled.append(reason) or False)
     fake = FakeOpenRouterClient(
@@ -380,7 +381,7 @@ def test_inline_chat_turns_use_the_injected_clients_models_end_to_end(
         for c in calls
     }
     used.discard(None)  # a call without an explicit id runs on the client's own default model
-    assert used == {OR_MODEL}
+    assert used == {OR_BUILDER_MODEL}
     assert scheduled == ["check_similarity"]
 
     models = db_session.execute(

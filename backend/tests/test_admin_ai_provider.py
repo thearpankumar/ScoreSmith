@@ -52,7 +52,8 @@ def test_get_shape_when_nothing_is_saved(client: TestClient, team: Team, keys) -
     assert r.status_code == 200, r.text
     body = r.json()
     assert set(body) == {
-        "provider", "effective_provider", "available", "models", "web_search", "updated_at", "updated_by",
+        "provider", "effective_provider", "available", "models", "web_search", "chat_models", "updated_at",
+        "updated_by",
     }
     assert body["provider"] is None and body["effective_provider"] == "bedrock"
     assert body["available"] == {"bedrock": True, "openrouter": True}
@@ -61,14 +62,24 @@ def test_get_shape_when_nothing_is_saved(client: TestClient, team: Team, keys) -
         "judge": "zai.glm-4.7-flash",
         "master": "us.meta.llama4-maverick-17b-instruct-v1:0",
         "embedding": "amazon.titan-embed-text-v2:0",
+        "builder": "zai.glm-5",
         "vision": ["moonshotai.kimi-k2.5", "qwen.qwen3-vl-235b-a22b", "us.meta.llama4-maverick-17b-instruct-v1:0"],
         "transcription": ["amazon.transcribe", "mistral.voxtral-small-24b-2507", "mistral.voxtral-mini-3b-2507"],
+        "video": ["us.amazon.nova-2-lite-v1:0", "qwen.qwen3-vl-235b-a22b"],
     }
     assert body["models"]["openrouter"] == {
         "chat": GPT, "judge": GPT, "master": GPT, "embedding": "openai/text-embedding-3-small",
+        "builder": "openai/gpt-5.6-luna",
         "vision": ["qwen/qwen3.7-flash", "qwen/qwen3-vl-235b-a22b-instruct"],
         "transcription": ["mistralai/voxtral-small-24b-2507", "mistralai/voxtral-mini-3b-2507"],
+        "video": ["qwen/qwen3.7-flash", "google/gemini-3.1-flash-lite"],
     }
+    chat = body["chat_models"]
+    assert [o["id"] for o in chat["options"]] == [
+        "openai/gpt-5-mini", "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5", "openai/gpt-5.6-luna",
+    ]
+    assert chat["options"][2] == {"id": "anthropic/claude-opus-5.5", "label": "Claude Opus 5.5", "vendor": "Anthropic"}
+    assert chat["enabled"] == [o["id"] for o in chat["options"]] and chat["default"] == "openai/gpt-5-mini"
     assert body["web_search"] == {"agentcore": False, "effective": "none"}
     assert body["updated_at"] is None and body["updated_by"] is None
 
@@ -178,3 +189,46 @@ def test_schedule_backfill_hook_calls_the_backfill_and_never_raises(monkeypatch,
     admin_settings._schedule_backfill("bedrock")  # logged, not raised
     monkeypatch.setitem(sys.modules, "app.ai.embedding_backfill", None)  # import fails
     admin_settings._schedule_backfill("bedrock")
+
+
+# --- chat models (app/ai/chat_models.py) -----------------------------------------------------------------------
+
+CHAT_MODELS_URL = "/api/v1/admin/settings/chat-models"
+
+
+def test_admin_narrows_the_chat_models_and_picks_the_default(
+    client: TestClient, team: Team, keys, db_session: Session  # noqa: F811
+) -> None:
+    r = client.put(
+        CHAT_MODELS_URL, headers=hdr(team.admin),
+        json={
+            "enabled": ["anthropic/claude-sonnet-5.5", "openai/gpt-5-mini"], "default": "anthropic/claude-sonnet-5.5",
+        },
+    )
+    assert r.status_code == 200, r.text
+    chat = r.json()["chat_models"]
+    assert chat["enabled"] == ["openai/gpt-5-mini", "anthropic/claude-sonnet-5.5"]  # the server's order
+    assert chat["default"] == "anthropic/claude-sonnet-5.5"
+    audit = _audits(db_session)[-1]
+    assert audit.diff["event"] == "chat_models_changed" and audit.diff["to"]["default"] == "anthropic/claude-sonnet-5.5"
+    assert client.get(URL, headers=hdr(team.admin)).json()["chat_models"]["default"] == "anthropic/claude-sonnet-5.5"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"enabled": ["openai/gpt-4o"], "default": "openai/gpt-4o"},  # not allowed by the server
+        {"enabled": ["openai/gpt-5-mini"], "default": "anthropic/claude-opus-5.5"},  # default not enabled
+        {"enabled": [], "default": "openai/gpt-5-mini"},
+    ],
+)
+def test_invalid_chat_model_choices_are_rejected(client: TestClient, team: Team, keys, payload) -> None:  # noqa: F811
+    assert client.put(CHAT_MODELS_URL, headers=hdr(team.admin), json=payload).status_code == 422
+
+
+def test_only_admins_change_chat_models(client: TestClient, team: Team, keys) -> None:  # noqa: F811
+    r = client.put(
+        CHAT_MODELS_URL, headers=hdr(team.owner),
+        json={"enabled": ["openai/gpt-5-mini"], "default": "openai/gpt-5-mini"},
+    )
+    assert r.status_code == 403

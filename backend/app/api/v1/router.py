@@ -7,6 +7,7 @@ from app.api.v1 import (
     admin_users,
     auth,
     chat,
+    chat_attachments,
     chat_shares,
     evaluations,
     evaluations_ai,
@@ -40,4 +41,5 @@ api_router.include_router(evaluations_export.router)
 api_router.include_router(evaluations_page.router)
 api_router.include_router(evaluations.router)
 api_router.include_router(chat_shares.router)
+api_router.include_router(chat_attachments.router)
 api_router.include_router(chat.router)

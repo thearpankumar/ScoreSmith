@@ -163,11 +163,16 @@ background backfill embeds the existing scorecards with the new model (the Titan
 |---|---|---|---|
 | `OPENROUTER_API_KEY` | for OpenRouter | empty | OpenRouter key for the AI provider. **Separate from `OPENROUTER_JEV_API`**: Jev never uses it and it never falls back to the Jev key. `aws/bootstrap` and `aws/deploy-lambdas` copy it to SSM Parameter Store, where the extraction Lambda reads it |
 | `BEDROCK_AVAILABLE` | no | unset (detect) | `true` / `false` overrides the Bedrock credential detection above |
-| `OPENROUTER_AGENT_MODEL` | no | `openai/gpt-5-mini` | Chat, scorecard builder, judge-tier and evaluation-master calls |
+| `OPENROUTER_AGENT_MODEL` | no | `openai/gpt-5-mini` | Evaluations: judge-tier and evaluation-master calls |
+| `OPENROUTER_KPI_MODEL` | no | `openai/gpt-5.6-luna` | Every scorecard-builder call (KPI research, drafting, rubrics), its judge-tier helpers (routing, dedupe, header), session titles, chat-image descriptions and the web-search sub-call. Pin a dated id, never the `~openai/gpt-luna-latest` alias |
+| `OPENROUTER_CHAT_MODELS` | no | `openai/gpt-5-mini,anthropic/claude-sonnet-5.5,anthropic/claude-opus-5.5,openai/gpt-5.6-luna` | Models the chat assistant may run on (comma-separated). An admin narrows the list and picks the default in Settings; users pick per message |
+| `OPENROUTER_CHAT_DEFAULT_MODEL` | no | `openai/gpt-5-mini` | Default chat model until an admin picks one |
+| `OPENROUTER_CHAT_REASONING` | no | `medium` | Reasoning effort of the chat assistant only (its reasoning state is kept between tool steps) |
 | `OPENROUTER_EMBED_MODEL` | no | `openai/text-embedding-3-small` | Embeddings, requested with `dimensions=1024` (the same width as Titan) |
 | `OPENROUTER_REASONING` | no | `low` | Reasoning effort, sent as `{"effort": ..., "exclude": true}` (`minimal` / `low` / `medium` / `high`; empty = model default) |
 | `OPENROUTER_MAX_OUTPUT_TOKENS` | no | `32000` | `max_tokens` per call; reasoning tokens count against it (`0` omits it) |
 | `OPENROUTER_PROVIDER_SORT` | no | `latency` | `provider.sort` for routing. `latency` keeps chat off the slower, capacity-limited `openai/flex` endpoint; empty = OpenRouter's default cheapest-first routing (flex's 50% discount, but slower) |
+| `OPENROUTER_PROVIDER_IGNORE` | no | `openai/fast` | `provider.ignore` (comma-separated provider slugs / endpoint tags). The default skips OpenAI's priority endpoint, billed at twice the standard price, which latency sorting would otherwise prefer |
 | `OPENROUTER_MAX_CONCURRENCY` | no | `8` | Max simultaneous OpenRouter calls from the research fan-out per process (a separate pool from Bedrock's) |
 | `OPENROUTER_GLOBAL_CONCURRENCY` | no | `0` | Cluster-wide cap (Redis); `0` = `OPENROUTER_MAX_CONCURRENCY` |
 | `OPENROUTER_READ_TIMEOUT_SECONDS` / `OPENROUTER_CONNECT_TIMEOUT_SECONDS` | no | `240` / `10` | httpx client timeouts |
@@ -185,12 +190,15 @@ Request details for `openai/gpt-5-mini`: `temperature` / `top_p` are never sent 
 
 | Task | Bedrock | OpenRouter |
 |---|---|---|
-| Chat agent and scorecard builder | `zai.glm-5` (`BEDROCK_CHAT_MODEL_ID`) | `openai/gpt-5-mini` (`OPENROUTER_AGENT_MODEL`) |
-| Judge-tier calls (routing, dedupe, header, session title, judge ensemble, Jev fallback) | `zai.glm-4.7-flash` (`BEDROCK_JUDGE_MODEL_ID`) | `openai/gpt-5-mini` |
+| Chat assistant (answers, tool calls, web search queries, edits) | `zai.glm-5` (`BEDROCK_CHAT_MODEL_ID`) | the model the user picked (`OPENROUTER_CHAT_MODELS`, admin-enabled; default `openai/gpt-5-mini`) |
+| Scorecard builder (research fan-out, drafting, rubrics) | `zai.glm-5` (`BEDROCK_CHAT_MODEL_ID`) | `openai/gpt-5.6-luna` (`OPENROUTER_KPI_MODEL`) |
+| Builder judge-tier calls (routing, dedupe, header) and session titles | `zai.glm-4.7-flash` (`BEDROCK_JUDGE_MODEL_ID`) | `openai/gpt-5.6-luna` |
+| Evaluation judge ensemble and Jev fallback | `zai.glm-4.7-flash` (`BEDROCK_JUDGE_MODEL_ID`) | `openai/gpt-5-mini` (`OPENROUTER_AGENT_MODEL`) |
 | Evaluation master and batch column mapping | `us.meta.llama4-maverick-17b-instruct-v1:0` (`BEDROCK_MASTER_MODEL_ID`) | `openai/gpt-5-mini` |
 | Embeddings (1024 dims) | `amazon.titan-embed-text-v2:0` (`BEDROCK_EMBEDDING_MODEL_ID`) | `openai/text-embedding-3-small` (`OPENROUTER_EMBED_MODEL`) |
 | Lambda image analysis | Kimi K2.5, then Qwen3-VL-235B, then Llama 4 Maverick | `qwen/qwen3.7-flash`, then `qwen/qwen3-vl-235b-a22b-instruct` |
 | Lambda audio transcription | Amazon Transcribe, then Voxtral Small 24B / Mini 3B (Bedrock's Voxtral rejects audio since Oct 2026) | `mistralai/voxtral-small-24b-2507` (chat `input_audio`), then `mistralai/voxtral-mini-3b-2507` (`/audio/transcriptions`) |
+| Lambda video frames (contact sheets) | `us.amazon.nova-2-lite-v1:0`, then Qwen3-VL-235B | `qwen/qwen3.7-flash`, then `google/gemini-3.1-flash-lite` (`OPENROUTER_VIDEO_MODELS` on the Lambda) |
 | `web_search` tool | AgentCore (if configured) | AgentCore if configured, else the `openrouter:web_search` server tool |
 | Jev quality gate | `OPENROUTER_JEV_API`, unchanged | same |
 
@@ -206,6 +214,9 @@ warning at startup naming any that are still set (names only, never values). Rem
 | Name | Default | Purpose |
 |---|---|---|
 | `CHAT_TURN_TIMEOUT_SECONDS` | `900` | Wall-clock limit of one background turn |
+| `CHAT_AGENT` | `true` | The chat assistant in front of the scorecard builder (`app/ai/chat_agent.py`). `false`: every message goes straight into the builder (the old wiring) |
+| `CHAT_ATTACHMENT_MAX_BYTES` / `CHAT_ATTACHMENT_MAX_FILES` | 20 MiB / `5` | Chat attachments (OpenRouter only): per file / per message |
+| `CHAT_EXTRACT_FUNCTION` | `qs-eval-extract-doc` | The extraction Lambda invoked synchronously (`chat_extract` mode) to read chat PDF / DOCX attachments. The backend AWS user needs `lambda:InvokeFunction` on it (`aws/policies/backend-user-policy.json`) |
 | `CHAT_TURNS_INLINE` | `false` | Test-only: run turns inside the request |
 | `USER_KPIS_PER_FILL_CALL` | `5` | KPIs per guideline-writing call (user-specified mode) |
 | `USER_RESEARCH_TIMEOUT_SECONDS` | `45` | Budget of the bounded research over the user's KPIs |
@@ -227,6 +238,8 @@ warning at startup naming any that are still set (names only, never values). Rem
 | `AI_EVAL_SCORING_RETRY_DELAYS` | no | `20,60` seconds | Waits between those retries (JSON list in env, e.g. `[20,60]`) |
 | `AI_EVAL_INLINE` | no | `false` | Test-only: no background dispatcher loop |
 | `UPLOAD_MAX_BYTES` / `UPLOAD_MAX_FILES` | no | 2 GiB / `10` | Per file / per submission |
+| `AI_EVAL_VIDEO_VISUAL_MODE` | no | empty | Per-run override of the Lambda's `VIDEO_VISUAL_MODE` (`frames` / `off`); empty = the Lambda's default (`frames`) |
+| `AI_EVAL_VIDEO_KNOBS` | no | `{}` | JSON object of per-run frame-sampling overrides sent to the Lambda (the Lambda env var names in lower case, e.g. `{"frame_max_gap_s": 30, "grid": "2x2"}`; see [ai-eval-contract.md](ai-eval-contract.md)) |
 | `UPLOAD_PART_SIZE` / `UPLOAD_URL_TTL_SECONDS` | no | 32 MiB / `900` | Multipart part size and presigned URL lifetime |
 | `UPLOAD_USER_DAILY_BYTES` | no | 20 GiB | Per-user rolling 24 h upload quota |
 

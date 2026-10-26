@@ -380,8 +380,9 @@ def _scrub(text: str, key: str) -> str:
 
 class OpenRouterWebSearchClient:
     """`WebSearchClientProtocol` over OpenRouter's `openrouter:web_search` server tool: one chat completion on the
-    agent model whose `url_citation` annotations are the results. `search()` never raises and returns [] on any
-    failure (missing key, HTTP error, timeout, malformed body). The API key is never logged."""
+    scorecard builder's model (OPENROUTER_KPI_MODEL) whose `url_citation` annotations are the results. `search()`
+    never raises and returns [] on any failure (missing key, HTTP error, timeout, malformed body). The API key is
+    never logged."""
 
     def __init__(
         self,
@@ -432,7 +433,7 @@ class OpenRouterWebSearchClient:
             f"authoritative findings, citing your sources.\n\nQuery: {query}"
         )
         return {
-            "model": self._model_id or settings.openrouter_agent_model,
+            "model": self._model_id or settings.openrouter_kpi_model,
             "messages": [{"role": "user", "content": prompt}],
             "tools": [{"type": "openrouter:web_search", "parameters": parameters}],
             "reasoning": {"effort": "low", "exclude": True},

@@ -60,7 +60,7 @@ def _client(rec, **kw) -> OpenRouterWebSearchClient:
 @pytest.fixture(autouse=True)
 def _settings(monkeypatch):
     s = get_settings()
-    monkeypatch.setattr(s, "openrouter_agent_model", "openai/gpt-5-mini")
+    monkeypatch.setattr(s, "openrouter_kpi_model", "openai/gpt-5.6-luna")
     monkeypatch.setattr(s, "openrouter_search_engine", "")
     monkeypatch.setattr(s, "openrouter_api_base", "https://openrouter.ai/api/v1")
     monkeypatch.setattr(s, "openrouter_api_key", "")
@@ -126,7 +126,7 @@ async def test_search_request_uses_the_server_tool(monkeypatch) -> None:
     assert [r.url for r in results] == [f"https://example.com/{i}" for i in range(3)]
     body = rec.bodies[0]
     assert rec.urls[0] == "https://openrouter.ai/api/v1/chat/completions"
-    assert body["model"] == "openai/gpt-5-mini"
+    assert body["model"] == "openai/gpt-5.6-luna"
     assert body["tools"] == [
         {"type": "openrouter:web_search", "parameters": {"max_results": 5, "search_context_size": "low"}}
     ]

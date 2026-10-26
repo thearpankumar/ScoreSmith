@@ -68,6 +68,7 @@ def _defaults(monkeypatch):
         "openrouter_reasoning": "low",
         "openrouter_max_output_tokens": 32000,
         "openrouter_provider_sort": "latency",
+        "openrouter_provider_ignore": "",
         "openrouter_max_attempts": 2,
         "openrouter_app_title": "ScoreSmith",
         "openrouter_http_referer": "https://scoresmith.local",
@@ -476,3 +477,117 @@ def test_embed_rejects_wrong_dimensions_zero_vectors_and_errors() -> None:
     c4, _ = _client(Recorder(httpx.Response(200, json={"data": []})))
     with pytest.raises(BedrockUnavailableError, match="embedding"):
         c4.embed("x")
+
+
+# --- chat agent: Claude 5.x quirks, rich content, several tool calls, reasoning passback --------------------------
+
+CLAUDE = "anthropic/claude-sonnet-5.5"
+
+
+def test_claude_5_is_never_forced_and_never_sent_sampling_params() -> None:
+    rec = Recorder(httpx.Response(200, json=_chat()))
+    c, _ = _client(rec)
+    c.converse(messages=MSGS, system="sys", tools=[TOOL], force_tool_use=True, model_id=CLAUDE, temperature=0)
+    body = rec.bodies[0]
+    assert body["model"] == CLAUDE and body["tool_choice"] == "auto"
+    assert "temperature" not in body
+    # Forcing is asked for in words instead, after the caller's own system prompt.
+    system = body["messages"][0]
+    assert system["role"] == "system"
+    assert system["content"].startswith("sys\n\n") and "calling exactly one" in system["content"]
+    assert len(rec.bodies) == 1  # no wasted rejected call
+
+
+def test_rich_messages_translate_tool_round_trips_files_and_cache_points() -> None:
+    rec = Recorder(httpx.Response(200, json=_text("done")))
+    c, _ = _client(rec)
+    messages = [
+        {"role": "user", "content": [
+            {"text": "files:"},
+            {"document": {"format": "pdf", "name": "sop.pdf", "source": {"bytes": b"%PDF-1"}}},
+            {"image": {"format": "png", "source": {"bytes": b"\x89PNG"}}},
+            {"cachePoint": {"type": "default"}},
+        ]},
+        {"role": "assistant", "content": [
+            {"text": "Let me look."},
+            {"toolUse": {"toolUseId": "t1", "name": "web_search", "input": {"query": "csat"}}},
+            {"toolUse": {"toolUseId": "t2", "name": "view_kpis", "input": {"names": ["A"]}}},
+            {"reasoningDetails": [{"type": "reasoning.encrypted", "data": "abc"}]},
+        ]},
+        {"role": "user", "content": [
+            {"toolResult": {"toolUseId": "t1", "content": [{"text": "results"}]}},
+            {"toolResult": {"toolUseId": "t2", "content": [{"text": "kpis"}]}},
+        ]},
+    ]
+    c.converse(messages=messages, tools=[TOOL], model_id=CLAUDE)
+    sent = rec.bodies[0]["messages"]
+    user = sent[0]
+    assert user["role"] == "user" and user["content"][0] == {"type": "text", "text": "files:"}
+    assert user["content"][1] == {
+        "type": "file", "file": {"filename": "sop.pdf", "file_data": "data:application/pdf;base64,JVBERi0x"},
+    }
+    assert user["content"][2]["type"] == "image_url"
+    assert user["content"][2]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert user["content"][2]["cache_control"] == {"type": "ephemeral"}  # the part before the cache point
+    assistant = sent[1]
+    assert assistant["content"] == "Let me look."
+    assert [tc["id"] for tc in assistant["tool_calls"]] == ["t1", "t2"]
+    assert json.loads(assistant["tool_calls"][0]["function"]["arguments"]) == {"query": "csat"}
+    assert assistant["reasoning_details"] == [{"type": "reasoning.encrypted", "data": "abc"}]
+    assert sent[2] == {"role": "tool", "tool_call_id": "t1", "content": "results"}
+    assert sent[3] == {"role": "tool", "tool_call_id": "t2", "content": "kpis"}
+    assert len(sent) == 4  # tool results only: no trailing "Continue." and no empty user message
+
+
+def test_cache_points_are_dropped_for_models_that_ignore_cache_control() -> None:
+    rec = Recorder(httpx.Response(200, json=_text("done")))
+    c, _ = _client(rec)
+    c.converse(messages=[{"role": "user", "content": [{"text": "a"}, {"cachePoint": {"type": "default"}}]}])
+    assert rec.bodies[0]["messages"] == [{"role": "user", "content": [{"type": "text", "text": "a"}]}]
+
+
+def test_several_tool_calls_reasoning_details_and_usage_are_returned() -> None:
+    body = _chat('{"query": "a"}', name="web_search")
+    message = body["choices"][0]["message"]
+    message["tool_calls"].append(
+        {"id": "call_2", "type": "function", "function": {"name": "view_kpis", "arguments": '{"names": ["X"]}'}}
+    )
+    message["tool_calls"].append({"id": "call_3", "type": "function", "function": {"name": "cut", "arguments": "{"}})
+    message["reasoning_details"] = [{"type": "reasoning.text", "text": "thinking"}]
+    body["usage"] = {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0012}
+    rec = Recorder(httpx.Response(200, json=body))
+    c, _ = _client(rec)
+    res = c.converse(messages=MSGS, tools=[TOOL, OTHER], model_id=CLAUDE)
+    assert res.tool_name == "web_search" and res.tool_input == {"query": "a"}
+    assert [(t.id, t.name, t.input) for t in res.tool_calls] == [
+        ("call_1", "web_search", {"query": "a"}), ("call_2", "view_kpis", {"names": ["X"]}),
+    ]  # the cut-off third call is never acted on
+    assert res.reasoning_details == [{"type": "reasoning.text", "text": "thinking"}]
+    assert res.usage["cost"] == 0.0012
+
+
+def test_keep_reasoning_effort_override_and_session_header() -> None:
+    rec = Recorder(httpx.Response(200, json=_text()))
+    c, _ = _client(rec)
+    c.converse(messages=MSGS, model_id=CLAUDE, reasoning_effort="medium", keep_reasoning=True, session_key="s-1")
+    assert rec.bodies[0]["reasoning"] == {"effort": "medium"}
+    assert rec.requests[0].headers["x-session-id"] == "s-1"
+    c.converse(messages=MSGS)
+    assert rec.bodies[1]["reasoning"] == {"effort": "low", "exclude": True}
+    assert "x-session-id" not in rec.requests[1].headers
+
+
+def test_builder_tier_attributes_use_the_kpi_model(monkeypatch) -> None:
+    monkeypatch.setattr(get_settings(), "openrouter_kpi_model", "openai/gpt-5.6-luna")
+    c = OpenRouterClient(api_key=KEY)
+    assert c.builder_model_id == c.builder_judge_model_id == "openai/gpt-5.6-luna"
+    assert c.judge_model_id == c.master_model_id == GPT  # evaluations keep the agent model
+
+
+def test_ignored_endpoints_are_sent_with_the_routing(monkeypatch) -> None:
+    monkeypatch.setattr(get_settings(), "openrouter_provider_ignore", "openai/fast, azure ")
+    rec = Recorder(httpx.Response(200, json=_text()))
+    c, _ = _client(rec)
+    c.converse(messages=MSGS, model_id="openai/gpt-5.6-luna")
+    routing = rec.bodies[0]["provider"]
+    assert routing == {"require_parameters": True, "sort": "latency", "ignore": ["openai/fast", "azure"]}
