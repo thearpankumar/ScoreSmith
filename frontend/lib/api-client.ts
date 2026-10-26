@@ -3,8 +3,10 @@ import * as React from "react";
 import type {
   AiBatch,
   AiCompleteFile,
+  AiCompletedPart,
   AiCompleteResult,
   AiUploadFileRequest,
+  AiUploadPart,
   AiUploadPlan,
   AiUploadPurpose,
   BatchSheetParse,
@@ -12,6 +14,7 @@ import type {
   CreateAiJobsResult,
   EvaluationProgress,
   ProgressFileState,
+  ChatAttachment,
   ChatMessage,
   ChatRole,
   ChatSession,
@@ -433,6 +436,8 @@ interface BeChatSession {
   last_activity_at: string;
   /** True while a background turn runs for this session (sidebar "working" badge). */
   turn_in_progress?: boolean;
+  /** The chat model last picked in this chat (OpenRouter). */
+  chat_model?: string | null;
 }
 
 interface BeChatMessage {
@@ -442,6 +447,32 @@ interface BeChatMessage {
   content: string;
   tool_calls: unknown;
   created_at: string;
+  model?: string | null;
+  attachments?: BeChatAttachment[];
+}
+
+interface BeChatAttachment {
+  id: string;
+  filename: string;
+  kind: string;
+  size_bytes: number;
+  status: ChatAttachment["status"];
+  error?: string | null;
+  outline?: Record<string, unknown> | null;
+  token_estimate?: number | null;
+}
+
+function mapChatAttachment(be: BeChatAttachment): ChatAttachment {
+  return {
+    id: be.id,
+    filename: be.filename,
+    kind: be.kind,
+    sizeBytes: be.size_bytes,
+    status: be.status,
+    error: be.error ?? null,
+    outline: be.outline ?? null,
+    tokenEstimate: be.token_estimate ?? null,
+  };
 }
 
 interface BeChatTurnEvent {
@@ -1632,6 +1663,7 @@ function mapChatSession(be: BeChatSession): ChatSession {
     createdAt: be.created_at,
     lastActivityAt: be.last_activity_at,
     turnInProgress: !!be.turn_in_progress,
+    chatModel: be.chat_model ?? null,
   };
 }
 
@@ -1656,6 +1688,8 @@ function mapChatMessages(sessionId: string, rows: BeChatMessage[]): ChatMessage[
       content: m.content,
       createdAt: m.created_at,
       clarifyingQuestion: mapClarifyingQuestion(`${m.id}-cq`, toolCalls?.question ?? null),
+      model: m.model ?? null,
+      attachments: (m.attachments ?? []).map(mapChatAttachment),
     };
   });
 }
@@ -1919,19 +1953,68 @@ export async function startChatTurn(params: {
   /** For `sessionId === "new"`: a client-generated UUID the backend adopts verbatim
    * (ChatSessionStart.session_id), so the sidebar/URL/polling can use the real id at once. */
   clientSessionId?: string;
+  /** The chat model picked in the composer (OpenRouter only; the server checks it against the admin's list). */
+  model?: string | null;
+  /** Ready chat attachments to send with this message (`POST /chat/attachments` first). */
+  attachmentIds?: string[];
 }): Promise<ChatTurnSnapshot> {
   const { sessionId, message, clientSessionId } = params;
+  const extra: Record<string, unknown> = {};
+  if (params.model) extra.model = params.model;
+  if (params.attachmentIds?.length) extra.attachment_ids = params.attachmentIds;
   const turn =
     sessionId === "new"
       ? await apiFetch<BeChatTurn>("/api/v1/chat/sessions", {
           method: "POST",
-          body: { message, session_id: clientSessionId },
+          body: { message, session_id: clientSessionId, ...extra },
         })
       : await apiFetch<BeChatTurn>(`/api/v1/chat/sessions/${sessionId}/messages`, {
           method: "POST",
-          body: { message },
+          body: { message, ...extra },
         });
   return snapshotOf(turn);
+}
+
+/** `POST /chat/attachments`: creates the attachment and its presigned multipart upload. */
+export async function initChatAttachment(
+  file: { name: string; size: number; contentType: string },
+  signal?: AbortSignal,
+): Promise<{ attachment: ChatAttachment; uploadId: string; partSize: number; parts: AiUploadPart[] }> {
+  const be = await apiFetch<{
+    attachment: BeChatAttachment;
+    upload_id: string;
+    part_size: number;
+    parts: Array<{ part_number: number; url: string }>;
+  }>("/api/v1/chat/attachments", {
+    method: "POST",
+    signal,
+    body: { filename: file.name, size: file.size, content_type: file.contentType },
+  });
+  return {
+    attachment: mapChatAttachment(be.attachment),
+    uploadId: be.upload_id,
+    partSize: be.part_size,
+    parts: be.parts.map((p) => ({ partNumber: p.part_number, url: p.url })),
+  };
+}
+
+/** `POST /chat/attachments/{id}/complete`: finishes the upload; the server extracts the text and answers
+ * `ready` (or `failed` with a reason). */
+export async function completeChatAttachment(
+  attachmentId: string,
+  uploadId: string,
+  parts: AiCompletedPart[],
+): Promise<ChatAttachment> {
+  const be = await apiFetch<BeChatAttachment>(`/api/v1/chat/attachments/${attachmentId}/complete`, {
+    method: "POST",
+    body: { upload_id: uploadId, parts: parts.map((p) => ({ part_number: p.partNumber, etag: p.etag })) },
+  });
+  return mapChatAttachment(be);
+}
+
+/** `DELETE /chat/attachments/{id}`: removes a file that was not sent yet. */
+export async function deleteChatAttachment(attachmentId: string): Promise<void> {
+  await apiFetch(`/api/v1/chat/attachments/${attachmentId}`, { method: "DELETE" });
 }
 
 /** `POST /chat/sessions/{id}/cancel` — stops the running background turn (a no-op if none runs).

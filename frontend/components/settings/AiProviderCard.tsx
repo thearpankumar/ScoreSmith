@@ -27,6 +27,7 @@ import {
   type ProviderName,
 } from "@/lib/settings-client";
 import { timeAgo } from "@/lib/time";
+import { ChatModelsEditor } from "./ChatModelsEditor";
 import { cn, formatDateTime } from "@/lib/utils";
 
 const PROVIDER_ICONS: Record<ProviderName, typeof Cloud> = { bedrock: Cloud, openrouter: Waypoints };
@@ -147,6 +148,7 @@ export function AiProviderCard() {
           optionRefs={optionRefs}
           onChoose={(p) => void choose(p)}
           onKeyDown={onOptionKeyDown}
+          onSettings={setSettings}
         />
       )}
     </section>
@@ -161,6 +163,7 @@ function ProviderBody({
   optionRefs,
   onChoose,
   onKeyDown,
+  onSettings,
 }: {
   settings: AiProviderSettings;
   saving: boolean;
@@ -169,6 +172,7 @@ function ProviderBody({
   optionRefs: RefObject<Partial<Record<ProviderName, HTMLButtonElement | null>>>;
   onChoose: (p: ProviderName) => void;
   onKeyDown: (e: KeyboardEvent<HTMLButtonElement>, p: ProviderName) => void;
+  onSettings: (settings: AiProviderSettings) => void;
 }) {
   const status = describeStatus(settings);
   const availability = describeAvailability(settings);
@@ -279,6 +283,10 @@ function ProviderBody({
           />
           <span className="min-w-0 break-words">{status.message}</span>
         </p>
+      )}
+
+      {effective === "openrouter" && settings.chatModels.options.length > 0 && (
+        <ChatModelsEditor value={settings.chatModels} onSaved={onSettings} />
       )}
 
       {effective && rows.length > 0 && (
