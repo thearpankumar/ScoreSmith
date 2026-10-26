@@ -22,6 +22,8 @@ import { ClarifyingQuestionCard } from "./ClarifyingQuestionCard";
 import { SimilarScorecardSuggestion } from "./SimilarScorecardSuggestion";
 import { LivePreviewPanel } from "./LivePreviewPanel";
 import { TurnTraceCard } from "./TurnTraceCard";
+import { ComposerAttachmentChips, ComposerToolbar } from "./ComposerTools";
+import { useChatModel, useComposerAttachments } from "./useChatComposerTools";
 import { ChartStateNotice } from "./ChartStateNotice";
 import { UnsavedChangesDialog } from "./UnsavedChangesDialog";
 import { GlassCard } from "@/components/design-system/GlassCard";
@@ -50,10 +52,13 @@ import {
   stripTrailingQuestion,
   turnFailureMessage,
 } from "@/lib/chat-turn-state";
+import { attachmentsPending, readyAttachmentIds } from "@/lib/chat-attachments";
+import { modelLabel } from "@/lib/chat-models";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { useUnsavedChangesGuard } from "@/lib/useUnsavedChangesGuard";
 import { cn } from "@/lib/utils";
 import type {
+  ChatAttachment,
   ChatMessage,
   ChatSession,
   ChatTurnEvent,
@@ -148,6 +153,10 @@ export function ChatWorkspace({
   const [lastFailedText, setLastFailedText] = useState<string | null>(() => unansweredUserText(initialMessages, initialTurnError));
   const [pending, setPending] = useState(false);
   const [composer, setComposer] = useState("");
+  // The chat model picker and file attachments (OpenRouter only; both hidden otherwise — see GET /chat/config).
+  const { config: chatConfig, model: chatModel, setModel: setChatModel } = useChatModel(session.chatModel);
+  const composerFiles = useComposerAttachments(chatConfig);
+  const filesPending = attachmentsPending(composerFiles.items);
   const [pendingSuggestion, setPendingSuggestion] = useState<Suggestion | null>(null);
   const [chatError, setChatError] = useState<string | null>(() =>
     initialTurnError && !initialTurnInProgress && !lastIsAssistant(initialMessages)
@@ -509,7 +518,7 @@ export function ChatWorkspace({
   // it renders) offers, via next/link's `onNavigate` — see lib/useUnsavedChangesGuard.ts.
   const navGuard = useUnsavedChangesGuard(dirty);
 
-  async function runAssistantTurn(text: string) {
+  async function runAssistantTurn(text: string, attachmentIds: string[] = []) {
     // Double-submit guard (the composer/buttons are disabled too, but retry links, chips and the
     // initial-prompt effect all call in here): one turn at a time per session, enforced
     // synchronously via a ref since state updates are async.
@@ -559,6 +568,8 @@ export function ChatWorkspace({
         sessionId: isFirstTurnOfNewSession ? "new" : activeSessionId,
         clientSessionId,
         message: outgoing,
+        model: chatModel,
+        attachmentIds,
       });
       upsertSessionTitle(started.sessionId, started.title);
       if (isFirstTurnOfNewSession) {
@@ -638,8 +649,16 @@ export function ChatWorkspace({
     }
   }
 
-  async function handleSend(text: string) {
-    if (!text.trim() || pending || turnInProgress) return;
+  async function handleSend(rawText: string) {
+    const attachmentIds = readyAttachmentIds(composerFiles.items);
+    if ((!rawText.trim() && attachmentIds.length === 0) || pending || turnInProgress || filesPending) return;
+    const text = rawText.trim() ? rawText : "Please look at the attached file(s).";
+    const sentFiles: ChatAttachment[] = composerFiles.items
+      .filter((i) => i.status === "ready" && i.serverId)
+      .map((i) => ({
+        id: i.serverId as string, filename: i.name, kind: "", sizeBytes: i.size, status: "ready", error: null,
+        outline: i.outline, tokenEstimate: null,
+      }));
 
     const userMessage: ChatMessage = {
       id: `m-${activeSessionId}-u-${Date.now()}`,
@@ -647,12 +666,14 @@ export function ChatWorkspace({
       role: "user",
       content: text,
       createdAt: new Date().toISOString(),
+      attachments: sentFiles,
     };
     setMessages((prev) => [...prev, userMessage]);
     setComposer("");
     setChatError(null);
+    composerFiles.clear();
 
-    await runAssistantTurn(text);
+    await runAssistantTurn(text, attachmentIds);
   }
 
   async function handleSuggestionChoice(action: "use" | "adapt" | "fresh", suggestion: Suggestion) {
@@ -827,6 +848,7 @@ export function ChatWorkspace({
                     ? { ...message, content: stripTrailingQuestion(message.content, message.clarifyingQuestion.question) }
                     : message
                 }
+                modelLabel={chatConfig.modelPicker ? modelLabel(chatConfig, message.model) : null}
               />
               {message.savedScorecard && (
                 <SavedScorecardBanner saved={message.savedScorecard} variant="inline" linkProps={navGuard.linkProps} />
@@ -943,42 +965,67 @@ export function ChatWorkspace({
             </a>
           </p>
         )}
-        <form
-          className="flex items-end gap-2 border-t border-hairline p-3"
-          onSubmit={(e) => {
-            e.preventDefault();
-            handleSend(composer);
-          }}
-        >
-          <Textarea
-            value={composer}
-            onChange={(e) => setComposer(e.target.value)}
-            placeholder={
-              turnInProgress
-                ? "Waiting for the assistant to finish your last message…"
-                : awaitingClarification
-                  ? "Or type your own answer…"
-                  : "Type a message…"
-            }
-            className="max-h-32 min-h-10 flex-1 resize-none"
-            disabled={pending || turnInProgress || !!pendingSuggestion || otherChatBusy}
-            aria-label="Message the scorecard assistant"
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                handleSend(composer);
-              }
-            }}
+        <div className="border-t border-hairline">
+          <ComposerAttachmentChips
+            items={composerFiles.items}
+            rejections={composerFiles.rejections}
+            onRemove={composerFiles.remove}
+            onDismissRejections={composerFiles.dismissRejections}
           />
-          <Button
-            type="submit"
-            size="icon"
-            disabled={pending || turnInProgress || !composer.trim() || !!pendingSuggestion || otherChatBusy}
-            aria-label="Send"
+          <ComposerToolbar
+            config={chatConfig}
+            model={chatModel}
+            onModelChange={setChatModel}
+            onFiles={composerFiles.addFiles}
+            disabled={pending || turnInProgress || otherChatBusy}
+          />
+          <form
+            className={cn(
+              "flex items-end gap-2 p-3",
+              (chatConfig.attachments.enabled || chatConfig.modelPicker || composerFiles.items.length > 0) && "pt-2",
+            )}
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSend(composer);
+            }}
           >
-            <Send className="size-4" />
-          </Button>
-        </form>
+            <Textarea
+              value={composer}
+              onChange={(e) => setComposer(e.target.value)}
+              placeholder={
+                turnInProgress
+                  ? "Waiting for the assistant to finish your last message…"
+                  : awaitingClarification
+                    ? "Or type your own answer…"
+                    : "Type a message…"
+              }
+              className="max-h-32 min-h-10 flex-1 resize-none"
+              disabled={pending || turnInProgress || !!pendingSuggestion || otherChatBusy}
+              aria-label="Message the scorecard assistant"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSend(composer);
+                }
+              }}
+            />
+            <Button
+              type="submit"
+              size="icon"
+              disabled={
+                pending ||
+                turnInProgress ||
+                filesPending ||
+                (!composer.trim() && readyAttachmentIds(composerFiles.items).length === 0) ||
+                !!pendingSuggestion ||
+                otherChatBusy
+              }
+              aria-label="Send"
+            >
+              <Send className="size-4" />
+            </Button>
+          </form>
+        </div>
       </GlassCard>
   );
 

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, Text, func
+from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -29,6 +29,8 @@ class ChatMessage(UUIDPKMixin, Base):
     role: Mapped[ChatMessageRole] = mapped_column(chat_message_role_enum, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     tool_calls: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)
+    # The model that wrote an assistant reply (migration 0019); NULL for user messages and older replies.
+    model: Mapped[str | None] = mapped_column(String(200), nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { register } from "node:module";
 
 import {
+  chatModelsDraftError,
+  sameChatModels,
   LOCK_REASONS,
   PROVIDER_LABELS,
   UNAVAILABLE_MESSAGE,
@@ -52,17 +54,30 @@ const MODELS = {
     judge: "zai.glm-4.7-flash",
     master: "us.meta.llama4-maverick-17b-instruct-v1:0",
     embedding: "amazon.titan-embed-text-v2:0",
+    builder: "zai.glm-5",
     vision: ["moonshotai.kimi-k2.5", "qwen.qwen3-vl-235b-a22b"],
     transcription: ["amazon.transcribe", "mistral.voxtral-small-24b-2507", "mistral.voxtral-mini-3b-2507"],
+    video: ["us.amazon.nova-2-lite-v1:0", "qwen.qwen3-vl-235b-a22b"],
   },
   openrouter: {
     chat: "openai/gpt-5-mini",
     judge: "openai/gpt-5-mini",
     master: "openai/gpt-5-mini",
     embedding: "openai/text-embedding-3-small",
+    builder: "openai/gpt-5.6-luna",
     vision: ["qwen/qwen3.7-flash", "qwen/qwen3-vl-235b-a22b-instruct"],
     transcription: ["mistralai/voxtral-small-24b-2507", "mistralai/voxtral-mini-3b-2507"],
+    video: ["qwen/qwen3.7-flash", "google/gemini-3.1-flash-lite"],
   },
+};
+
+const CHAT_MODELS = {
+  options: [
+    { id: "openai/gpt-5-mini", label: "GPT-5 mini", vendor: "OpenAI" },
+    { id: "anthropic/claude-opus-5.5", label: "Claude Opus 5.5", vendor: "Anthropic" },
+  ],
+  enabled: ["openai/gpt-5-mini", "anthropic/claude-opus-5.5"],
+  default: "openai/gpt-5-mini",
 };
 
 /** App-shape settings (camelCase), as `getAiProvider()` returns them. */
@@ -72,6 +87,7 @@ const settings = (over = {}) => ({
   available: { bedrock: true, openrouter: true },
   models: MODELS,
   webSearch: { agentcore: true, effective: "agentcore" },
+  chatModels: CHAT_MODELS,
   updatedAt: "2026-10-23T12:00:00Z",
   updatedBy: { id: "u1", name: "Jane" },
   ...over,
@@ -189,16 +205,18 @@ test("model rows: fixed order, role labels, fallback chains, empty roles left ou
   assert.deepEqual(
     rows.map((r) => r.label),
     [
-      "Chat & scorecard builder",
-      "Judge & routing",
+      "Scorecard builder (KPI research)",
+      "Evaluation judge",
       "Evaluation scoring",
       "Embeddings",
       "Image analysis",
       "Audio transcription",
+      "Video frames",
     ],
   );
-  assert.deepEqual(rows[0], { role: "chat", label: "Chat & scorecard builder", models: ["zai.glm-5"] });
+  assert.deepEqual(rows[0], { role: "builder", label: "Scorecard builder (KPI research)", models: ["zai.glm-5"] });
   assert.deepEqual(rows[4].models, ["moonshotai.kimi-k2.5", "qwen.qwen3-vl-235b-a22b"]);
+  assert.deepEqual(modelRows(MODELS.openrouter)[0].models, ["openai/gpt-5.6-luna"]);
   assert.deepEqual(modelRows(MODELS.openrouter)[5].models, [
     "mistralai/voxtral-small-24b-2507",
     "mistralai/voxtral-mini-3b-2507",
@@ -206,20 +224,31 @@ test("model rows: fixed order, role labels, fallback chains, empty roles left ou
 
   const sparse = modelRows({
     chat: "openai/gpt-5-mini",
+    builder: "b",
     judge: " ",
     master: "",
     embedding: "e",
     vision: [],
     transcription: [" ", "t"],
+    video: [],
   });
   assert.deepEqual(
     sparse.map((r) => [r.role, r.models]),
     [
-      ["chat", ["openai/gpt-5-mini"]],
+      ["builder", ["b"]],
       ["embedding", ["e"]],
       ["transcription", ["t"]],
     ],
   );
+});
+
+test("chat models draft: needs an enabled default; comparison ignores order", () => {
+  assert.equal(chatModelsDraftError(CHAT_MODELS), null);
+  assert.match(chatModelsDraftError({ ...CHAT_MODELS, enabled: [] }), /at least one/);
+  assert.match(chatModelsDraftError({ ...CHAT_MODELS, default: "x/y" }), /default/);
+  assert.equal(sameChatModels(CHAT_MODELS, { ...CHAT_MODELS, enabled: [...CHAT_MODELS.enabled].reverse() }), true);
+  assert.equal(sameChatModels(CHAT_MODELS, { ...CHAT_MODELS, default: "anthropic/claude-opus-5.5" }), false);
+  assert.equal(sameChatModels(CHAT_MODELS, { ...CHAT_MODELS, enabled: ["openai/gpt-5-mini"] }), false);
 });
 
 test("radio keyboard navigation wraps, skips locked options and honours Home / End", () => {
@@ -269,6 +298,7 @@ const WIRE = {
   available: { bedrock: true, openrouter: true },
   models: MODELS,
   web_search: { agentcore: true, effective: "agentcore" },
+  chat_models: CHAT_MODELS,
   updated_at: "2026-10-23T12:00:00Z",
   updated_by: { id: "u1", name: "Jane" },
 };
@@ -293,9 +323,12 @@ test("mapping tolerates missing blocks and unknown values", () => {
     judge: "",
     master: "",
     embedding: "",
+    builder: "",
     vision: [],
     transcription: [],
+    video: [],
   });
+  assert.deepEqual(s.chatModels, { options: [], enabled: [], default: null });
   assert.deepEqual(s.webSearch, { agentcore: false, effective: "none" });
   assert.equal(s.updatedAt, null);
   assert.equal(s.updatedBy, null);
@@ -344,4 +377,14 @@ test("setAiProvider: other errors pass through unchanged", async () => {
     assert.equal(err.message, "Administrators only.");
     return true;
   });
+});
+
+test("setChatModels: PUT the enabled list and default, answer mapped", async () => {
+  calls.length = 0;
+  handler = () => resp(200, WIRE);
+  const s = await client.setChatModels(["openai/gpt-5-mini"], "openai/gpt-5-mini");
+  assert.equal(calls[0].url, "/api/v1/admin/settings/chat-models");
+  assert.equal(calls[0].init.method, "PUT");
+  assert.deepEqual(JSON.parse(calls[0].init.body), { enabled: ["openai/gpt-5-mini"], default: "openai/gpt-5-mini" });
+  assert.deepEqual(s.chatModels, CHAT_MODELS);
 });

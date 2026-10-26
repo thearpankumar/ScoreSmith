@@ -105,6 +105,7 @@ APP_TABLES = [
     "password_reset_tokens",
     "oauth_identities",
     "idempotency_keys",
+    "chat_attachments",
     "chat_messages",
     "chat_turn_events",
     "chat_sessions",
@@ -230,13 +231,15 @@ def _auth_test_client_class():
 def _reset_ai_provider_state():
     """The stored-provider cache and the per-provider client singletons are process state: start every test fresh
     (a test that saved "openrouter" must not leak it into the next one through the 5 s cache)."""
-    from app.ai import providers
+    from app.ai import chat_models, providers
 
     providers.invalidate_cache()
+    chat_models.invalidate_cache()
     providers.reset_clients()
     providers.shared_aws_credentials.cache_clear()
     yield
     providers.invalidate_cache()
+    chat_models.invalidate_cache()
     providers.reset_clients()
     providers.shared_aws_credentials.cache_clear()
 

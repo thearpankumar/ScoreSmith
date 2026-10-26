@@ -9,14 +9,31 @@ import { ApiError, authApiFetch } from "./api-client";
 export type ProviderName = "bedrock" | "openrouter";
 export type WebSearchBackend = "agentcore" | "openrouter" | "none";
 
-/** Model ids one provider uses. `vision` and `transcription` are fallback chains, first choice first. */
+/** Model ids one provider uses. `builder` is the chat scorecard builder's (KPI research and drafting);
+ * `vision`, `transcription` and `video` are fallback chains, first choice first. */
 export interface ProviderModels {
   chat: string;
   judge: string;
   master: string;
   embedding: string;
+  builder: string;
   vision: string[];
   transcription: string[];
+  video: string[];
+}
+
+export interface ChatModelOption {
+  id: string;
+  label: string;
+  vendor: string;
+}
+
+/** The chat assistant's models (OpenRouter only): every model the server allows, the ones users may pick and the
+ * default (backend app/ai/chat_models.py). */
+export interface ChatModelsSetting {
+  options: ChatModelOption[];
+  enabled: string[];
+  default: string | null;
 }
 
 export interface AiProviderSettings {
@@ -28,6 +45,7 @@ export interface AiProviderSettings {
   available: Record<ProviderName, boolean>;
   models: Record<ProviderName, ProviderModels>;
   webSearch: { agentcore: boolean; effective: WebSearchBackend };
+  chatModels: ChatModelsSetting;
   updatedAt: string | null;
   updatedBy: { id: string; name: string } | null;
 }
@@ -37,8 +55,10 @@ interface BeProviderModels {
   judge?: string | null;
   master?: string | null;
   embedding?: string | null;
+  builder?: string | null;
   vision?: string[] | string | null;
   transcription?: string[] | string | null;
+  video?: string[] | string | null;
 }
 
 interface BeAiProviderSettings {
@@ -47,6 +67,11 @@ interface BeAiProviderSettings {
   available?: Partial<Record<ProviderName, boolean>> | null;
   models?: Partial<Record<ProviderName, BeProviderModels | null>> | null;
   web_search?: { agentcore?: boolean; effective?: WebSearchBackend | null } | null;
+  chat_models?: {
+    options?: { id?: string; label?: string; vendor?: string }[] | null;
+    enabled?: string[] | null;
+    default?: string | null;
+  } | null;
   updated_at?: string | null;
   updated_by?: { id: string; name: string } | null;
 }
@@ -69,9 +94,18 @@ function mapModels(m: BeProviderModels | null | undefined): ProviderModels {
     judge: m?.judge ?? "",
     master: m?.master ?? "",
     embedding: m?.embedding ?? "",
+    builder: m?.builder ?? "",
     vision: asList(m?.vision),
     transcription: asList(m?.transcription),
+    video: asList(m?.video),
   };
+}
+
+function mapChatModels(be: BeAiProviderSettings["chat_models"]): ChatModelsSetting {
+  const options = (be?.options ?? [])
+    .filter((o): o is { id: string; label?: string; vendor?: string } => typeof o?.id === "string" && o.id !== "")
+    .map((o) => ({ id: o.id, label: o.label || o.id, vendor: o.vendor || "" }));
+  return { options, enabled: asList(be?.enabled), default: be?.default ?? null };
 }
 
 /** Wire -> app shape. Tolerant of missing optional blocks so a partial answer still renders. */
@@ -86,6 +120,7 @@ export function mapAiProviderSettings(be: BeAiProviderSettings): AiProviderSetti
       agentcore: be.web_search?.agentcore === true,
       effective: effective === "agentcore" || effective === "openrouter" ? effective : "none",
     },
+    chatModels: mapChatModels(be.chat_models),
     updatedAt: be.updated_at ?? null,
     updatedBy: be.updated_by ?? null,
   };
@@ -115,4 +150,14 @@ export async function setAiProvider(provider: ProviderName): Promise<AiProviderS
     }
     throw err;
   }
+}
+
+/** Saves which chat models users may pick and the default (`PUT /admin/settings/chat-models`); answer mapped. */
+export async function setChatModels(enabled: string[], defaultModel: string): Promise<AiProviderSettings> {
+  return mapAiProviderSettings(
+    await authApiFetch<BeAiProviderSettings>("/api/v1/admin/settings/chat-models", {
+      method: "PUT",
+      body: { enabled, default: defaultModel },
+    }),
+  );
 }

@@ -3,7 +3,13 @@
  * locked and why, the status line, the "Models used" rows and the web-search / last-change lines.
  * Pure and dependency-free (type-only imports) so `node --test` can import it directly.
  */
-import type { AiProviderSettings, ProviderModels, ProviderName, WebSearchBackend } from "./settings-client";
+import type {
+  AiProviderSettings,
+  ChatModelsSetting,
+  ProviderModels,
+  ProviderName,
+  WebSearchBackend,
+} from "./settings-client";
 
 export const PROVIDERS: readonly ProviderName[] = ["bedrock", "openrouter"];
 
@@ -100,15 +106,20 @@ export function radioKeyTarget(key: string, from: ProviderName, settings: AiProv
 export type ModelRole = keyof ProviderModels;
 
 export const ROLE_LABELS: Record<ModelRole, string> = {
-  chat: "Chat & scorecard builder",
-  judge: "Judge & routing",
+  chat: "Chat (default)",
+  builder: "Scorecard builder (KPI research)",
+  judge: "Evaluation judge",
   master: "Evaluation scoring",
   embedding: "Embeddings",
   vision: "Image analysis",
   transcription: "Audio transcription",
+  video: "Video frames",
 };
 
-const ROLE_ORDER: readonly ModelRole[] = ["chat", "judge", "master", "embedding", "vision", "transcription"];
+// `chat` is not listed: the chat assistant's models are their own section (chat models), the builder has its row.
+const ROLE_ORDER: readonly ModelRole[] = [
+  "builder", "judge", "master", "embedding", "vision", "transcription", "video",
+];
 
 export interface ModelRow {
   role: ModelRole;
@@ -145,4 +156,17 @@ export function describeLastChange(settings: AiProviderSettings, formatTime: (is
   const who = settings.updatedBy?.name?.trim();
   const tail = when ? `, ${when}` : "";
   return who ? `Last changed by ${who}${tail}` : `Last changed${when ? ` ${when}` : ""}`;
+}
+
+/** Why a chat-models draft cannot be saved (null when it can). */
+export function chatModelsDraftError(draft: ChatModelsSetting): string | null {
+  if (draft.enabled.length === 0) return "Enable at least one chat model.";
+  if (!draft.default || !draft.enabled.includes(draft.default)) return "Pick a default among the enabled models.";
+  return null;
+}
+
+/** Same enabled set (order-insensitive) and same default. */
+export function sameChatModels(a: ChatModelsSetting, b: ChatModelsSetting): boolean {
+  const setA = new Set(a.enabled);
+  return a.default === b.default && setA.size === new Set(b.enabled).size && b.enabled.every((m) => setA.has(m));
 }

@@ -65,6 +65,8 @@ All `Admin`, rate limited (`RATE_LIMIT_ADMIN`), audit logged. Rules: never yours
 | POST | `/admin/users/{user_id}/deactivate` | Block sign-in, revoke sessions, cancel running jobs |
 | POST | `/admin/users/{user_id}/reactivate` | Allow sign-in again |
 | DELETE | `/admin/users/{user_id}` | Anonymise: tombstone row, private data removed, shared charts transferred |
+| GET / PUT | `/admin/settings/ai-provider` | The AI provider (Bedrock / OpenRouter), its models per task and the chat models (`chat_models`: options, enabled, default) |
+| PUT | `/admin/settings/chat-models` | `{enabled, default}`: which allowed OpenRouter chat models users may pick, and the default (422 for a model the server does not allow or a default that is not enabled) |
 
 ## Scorecards, versions, KPIs
 
@@ -136,11 +138,15 @@ Contract (bodies, S3 layout, error codes): [ai-eval-contract.md](ai-eval-contrac
 
 | Method | Path | Access | Purpose |
 |---|---|---|---|
+| GET | `/chat/config` | User | What the composer offers: `model_picker` + `models` + `default_model` (OpenRouter only, the admin's enabled chat models) and `attachments` limits |
 | GET | `/chat/sessions` | User | Your sessions |
 | POST | `/chat/sessions` | User (`RATE_LIMIT_CHAT`) | Create a session and queue the first turn (202; `409 user_chat_active`) |
 | GET / DELETE | `/chat/sessions/{session_id}` | Owner of the session | State incl. interim draft and `turn_in_progress` / delete (cancels a running turn) |
 | GET | `/chat/sessions/{session_id}/messages` | Owner | Persisted history |
-| POST | `/chat/sessions/{session_id}/messages` | Owner | Follow-up turn (202; `409 turn_in_progress`, `user_chat_active`). `?wait=true` runs inline |
+| POST | `/chat/sessions/{session_id}/messages` | Owner | Follow-up turn (202; `409 turn_in_progress`, `user_chat_active`). `?wait=true` runs inline. Body `{message, model?, attachment_ids?}` (also accepted by `POST /chat/sessions`): `model` is checked against the admin's enabled chat models (else the default) and remembered on the session; `attachment_ids` are your own ready, unsent attachments (422 otherwise) |
+| POST | `/chat/attachments` | User, OpenRouter only (`409` otherwise; `RATE_LIMIT_UPLOADS`) | `{filename, size, content_type?}` -> the attachment (`pending`) + presigned multipart part URLs for `chat/{user}/{id}.{ext}`. PDF, DOCX, XLSX, CSV, TXT, MD, PNG, JPG, WEBP; `CHAT_ATTACHMENT_MAX_BYTES` |
+| POST | `/chat/attachments/{attachment_id}/complete` | Owner of the attachment | `{upload_id, parts}`: completes the upload, checks size and signature, extracts the text once; answers the attachment as `ready` (with `outline`) or `failed` (with `error`) |
+| DELETE | `/chat/attachments/{attachment_id}` | Owner | Removes a file not sent yet (`409` once sent) |
 | POST | `/chat/sessions/{session_id}/cancel` | Owner | Stop the running turn (204; `turn_error_code=cancelled`) |
 | GET | `/chat/sessions/{session_id}/turn-events` | Owner | Live agent trace |
 | POST | `/chat/sessions/{session_id}/shares` | Owner or recipient | Share read-only by handle; `with_chart` also sends a chart invitation |

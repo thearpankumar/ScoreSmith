@@ -157,6 +157,10 @@ class Settings(BaseSettings):
     # jev | small_model = only that step; off = always run the full extraction.
     request_router: str = "auto"
 
+    # The chat assistant (app/ai/chat_agent.py) that answers every message first and hands off to the scorecard
+    # builder only when a scorecard has to be drafted. false = the builder handles every message (old wiring).
+    chat_agent: bool = True
+
     # --- Background chat turns (app/api/v1/chat.py) ---
     # Hard wall-clock limit for one background LangGraph turn; on expiry the turn is
     # cancelled, marked failed and the "turn in progress" marker cleared.
@@ -202,11 +206,22 @@ class Settings(BaseSettings):
     # above: the Jev quality gate never falls back to it, and it never falls back to the Jev key.
     openrouter_api_key: str = ""
     openrouter_api_base: str = "https://openrouter.ai/api/v1"
-    # One model for chat, judge-tier and evaluation-master calls; embeddings at 1024 dims (same width as Titan).
+    # Judge-tier and evaluation-master model (evaluations stay on it); embeddings at 1024 dims (same width as Titan).
     openrouter_agent_model: str = "openai/gpt-5-mini"
     openrouter_embed_model: str = "openai/text-embedding-3-small"
+    # Every call of the scorecard builder (the KPI research / drafting pipeline), its judge-tier helpers, session
+    # titles and the web-search sub-call. Pinned (never the "~openai/gpt-luna-latest" alias).
+    openrouter_kpi_model: str = "openai/gpt-5.6-luna"
+    # Models a user may pick for the chat assistant (comma-separated OpenRouter ids; an admin narrows this list and
+    # picks the default in Settings) and the default when nothing was picked.
+    openrouter_chat_models: str = (
+        "openai/gpt-5-mini,anthropic/claude-sonnet-5.5,anthropic/claude-opus-5.5,openai/gpt-5.6-luna"
+    )
+    openrouter_chat_default_model: str = "openai/gpt-5-mini"
     # Reasoning effort sent as {"effort": ..., "exclude": true} (minimal | low | medium | high; empty = omit).
     openrouter_reasoning: str = "low"
+    # Reasoning effort of the chat assistant (the conversation agent in front of the builder) only.
+    openrouter_chat_reasoning: str = "medium"
     # max_tokens per call. Reasoning tokens count against it, so it is larger than Bedrock's ceiling. 0 = omit.
     openrouter_max_output_tokens: int = 32000
     # Per-process / cluster-wide (Redis) caps on concurrent OpenRouter calls from the research fan-out
@@ -220,6 +235,9 @@ class Settings(BaseSettings):
     # provider.sort for routing: "latency" keeps chat off the slower, capacity-limited flex endpoint;
     # empty = OpenRouter's default (cheapest-first) routing.
     openrouter_provider_sort: str = "latency"
+    # provider.ignore (comma-separated provider slugs / endpoint tags). Default: OpenAI's priority "fast" endpoint,
+    # billed at twice the standard price, which "latency" sorting would otherwise prefer (e.g. for GPT-5.6 Luna).
+    openrouter_provider_ignore: str = "openai/fast"
     # The `openrouter:web_search` server tool, used only when AgentCore web search is not configured.
     # Engine empty = OpenRouter's default (native where the provider has one, else Exa).
     openrouter_search_engine: str = ""
@@ -261,6 +279,12 @@ class Settings(BaseSettings):
     # beyond the call-level retries). Scoring is idempotent, so a re-run is safe; waits grow between tries.
     ai_eval_scoring_retries: int = 2
     ai_eval_scoring_retry_delays: tuple[float, ...] = (20.0, 60.0)
+    # Video visual analysis on AWS (sampled frames -> contact sheets -> a cheap vision model), sent per run in the
+    # execution input's `video` object. Empty mode = the Lambda's default (VIDEO_VISUAL_MODE, "frames"); "off" skips
+    # it. AI_EVAL_VIDEO_KNOBS is a JSON object of the other knobs, keys as the Lambda env vars in lower case, e.g.
+    # {"frame_max_gap_s": 30, "grid": "2x2"}; the Lambda validates and clamps every value (docs/ai-eval-contract.md).
+    ai_eval_video_visual_mode: str = ""
+    ai_eval_video_knobs: dict[str, str | int | float] = Field(default_factory=dict)
     # Upload limits (browser -> S3 multipart). 2 GiB per file, 10 files per submission.
     upload_max_bytes: int = 2 * 1024**3
     upload_max_files: int = 10
@@ -269,6 +293,12 @@ class Settings(BaseSettings):
 
     # Per-user cap on bytes uploaded for new evaluations in a rolling 24 h (checked when upload URLs are issued).
     upload_user_daily_bytes: int = 20 * 1024**3
+
+    # Chat attachments (app/api/v1/chat_attachments.py, OpenRouter only): per-file size, files per message, and the
+    # extraction Lambda (its `chat_extract` mode) that turns PDF / DOCX into text — invoked synchronously.
+    chat_attachment_max_bytes: int = 20 * 1024 * 1024
+    chat_attachment_max_files: int = 5
+    chat_extract_function: str = "qs-eval-extract-doc"
 
     # --- Authentication (app/auth/*) ---
     # HS256 signing key for the 15-minute access JWT. No default: production refuses to start without a strong one;

@@ -39,15 +39,16 @@ logger = logging.getLogger(__name__)
 # against a model that ignores the instruction and rambles.
 MAX_TITLE_LENGTH = 80
 
-_TITLE_SYSTEM_PROMPT = """You generate a short, descriptive title for a chat session where \
-a user is describing a quality scorecard they want to build (KPIs, weights, guidelines).
+_TITLE_SYSTEM_PROMPT = """You generate a short, descriptive title for a chat session in a \
+quality-scorecard app. The user's first message is usually a scorecard they want to build \
+(KPIs, weights, guidelines), but may be a question or anything else.
 
 Reply with ONLY the title itself — 3 to 6 words, title case, no quotation marks, no \
 trailing punctuation, no preamble like "Title:" or "Here is a title". Base it on the \
-SPECIFIC subject matter the user described (e.g. "Vendor Compliance Review Scorecard", \
-"Support Ticket Response Quality", "Vendor Security Audit KPIs") — never a generic phrase \
-like "New Scorecard" or "Quality Scorecard" unless the user's message truly gives you \
-nothing more specific to go on."""
+SPECIFIC subject matter of the message (e.g. "Vendor Compliance Review Scorecard", \
+"Support Ticket Response Quality", "Call Handle Time Benchmarks") — never a generic phrase \
+like "New Scorecard" or "New Chat" unless the message truly gives you nothing more \
+specific to go on (a bare greeting may be titled "Getting Started")."""
 
 
 def _clean_title(raw: str) -> str | None:

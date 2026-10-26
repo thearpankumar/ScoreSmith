@@ -193,6 +193,8 @@ export interface ChatSession {
   lastActivityAt: string;
   /** A turn is running server-side right now (backend ChatSessionRead.turn_in_progress). */
   turnInProgress?: boolean;
+  /** The chat model the user last picked in this chat (OpenRouter; backend ChatSessionRead.chat_model). */
+  chatModel?: string | null;
 }
 
 /**
@@ -236,6 +238,23 @@ export interface ChatMessage {
   similarScorecardSuggestion?: SimilarScorecardSuggestion;
   /** Present on the assistant turn that saved (materialized) the draft as a real scorecard. */
   savedScorecard?: SavedScorecardRef;
+  /** The model that wrote an assistant reply (backend ChatMessageRead.model). */
+  model?: string | null;
+  /** Files sent with a user message. */
+  attachments?: ChatAttachment[];
+}
+
+/** A file attached to a chat message (backend ChatAttachmentRead, app/api/v1/chat_attachments.py). */
+export interface ChatAttachment {
+  id: string;
+  filename: string;
+  kind: string;
+  sizeBytes: number;
+  status: "pending" | "processing" | "ready" | "failed";
+  error: string | null;
+  /** What was extracted: pages / sheets / rows / truncated. */
+  outline: Record<string, unknown> | null;
+  tokenEstimate: number | null;
 }
 
 export interface SavedScorecardRef {

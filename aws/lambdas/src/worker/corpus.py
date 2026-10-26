@@ -1,5 +1,6 @@
-"""Assemble: stitch extracted text, image analyses and transcripts into corpus.json / corpus.md.
-Also hosts merge_video (per-video transcript merge) and the failure handler that writes status.json."""
+"""Assemble: stitch extracted text, image analyses and video timelines into corpus.json / corpus.md.
+Also hosts the failure handler that writes status.json. A video's sections, and the MergeVideo step (merge_video,
+re-exported here), are in video_corpus.py."""
 from __future__ import annotations
 
 import re
@@ -7,6 +8,8 @@ import re
 from .errors import PipelineError, code_from_error
 from .progress import Progress, merge_progress, now_iso
 from .store import derived
+from .timeline import fmt_ts  # noqa: F401  (re-exported: corpus.fmt_ts)
+from .video_corpus import merge_video, video_sections, visual_stats  # noqa: F401  (merge_video: the MergeVideo step)
 
 MAX_SECTION_CHARS = 6000
 MAX_CORPUS_CHARS = 12_000_000
@@ -14,13 +17,6 @@ MIN_CORPUS_WORDS = 30  # below this there is nothing meaningful to score
 _PAGE_RE = re.compile(r"^## Page (\d+)\s*$")
 _IMG_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]*)\)\s*$")
 _HDR_RE = re.compile(r"^<!--.*?-->\s*", re.S)
-
-
-def fmt_ts(sec: float) -> str:
-    sec = int(round(sec))
-    h, rem = divmod(sec, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 def words(text: str) -> int:
@@ -121,63 +117,6 @@ def doc_sections(store, eid: str, f: dict) -> tuple[list[dict], list[str]]:
     return secs, warnings
 
 
-# --------------------------------------------------------------------------- video
-def merge_video(store, eid: str, sid: str, name: str = "") -> dict:
-    """Merge chunk transcripts into video/{sid}/transcript.txt + transcript.json. Returns the transcript.json doc."""
-    prefix = derived(eid, "video", sid)
-    plan = store.get_json(f"{prefix}/plan.json")
-    parts, meta, missing = [], [], []
-    for c in plan.get("chunks", []):
-        i = c["index"]
-        try:
-            text = store.get_text(f"{prefix}/chunks/c{i}.txt").strip()
-        except Exception:
-            missing.append(i)
-            continue
-        parts.append(text)
-        info = {}
-        try:
-            info = store.get_json(f"{prefix}/chunks/c{i}.json")
-        except Exception:
-            pass
-        meta.append({"chunk": i, "start": c.get("start"), "end": c.get("end"), "model": info.get("model"),
-                     "chars": len(text)})
-    transcript = "\n\n".join(p for p in parts if p).strip()
-    store.put_text(f"{prefix}/transcript.txt", transcript + "\n")
-    doc = {"source": name or plan.get("source", ""), "duration_sec": plan.get("duration_sec"), "chunks": meta,
-           "missing_chunks": missing, "created": now_iso()}
-    store.put_json(f"{prefix}/transcript.json", doc)
-    return doc
-
-
-def video_sections(store, eid: str, f: dict) -> tuple[list[dict], list[str]]:
-    sid, name = f["source_id"], f["original_name"]
-    prefix = derived(eid, "video", sid)
-    try:
-        plan = store.get_json(f"{prefix}/plan.json")
-    except Exception:
-        return [], [f"{name}: video could not be processed"]
-    if plan.get("error"):
-        return [], [f"{name}: {plan['error']}"]
-    if not plan.get("has_audio", True) or not plan.get("chunks"):
-        return [], [f"{name}: no audio track, nothing to transcribe"]
-    doc = merge_video(store, eid, sid, name)
-    secs: list[dict] = []
-    for c in plan["chunks"]:
-        i = c["index"]
-        if i in doc["missing_chunks"]:
-            continue
-        text = store.get_text(f"{prefix}/chunks/c{i}.txt").strip()
-        if not text:
-            continue
-        secs.append({"source_id": sid, "source_name": name, "kind": "video",
-                     "label": f"VIDEO {name} {fmt_ts(c['start'])}-{fmt_ts(c['end'])}", "text": text})
-    warns = []
-    if doc["missing_chunks"]:
-        warns.append(f"{name}: {len(doc['missing_chunks'])} of {len(plan['chunks'])} audio chunk(s) could not be transcribed.")
-    return secs, warns
-
-
 # --------------------------------------------------------------------------- assemble
 def run_assemble(event: dict, store) -> dict:
     eid = event["evaluation_id"]
@@ -190,6 +129,7 @@ def run_assemble(event: dict, store) -> dict:
     sections: list[dict] = []
     file_states: dict[str, tuple[str, str]] = {}
     n_docs = n_videos = 0
+    visuals: list[dict] = []
     for f in manifest.get("files", []):
         sid = f["source_id"]
         if f["status"] != "ok":
@@ -197,7 +137,8 @@ def run_assemble(event: dict, store) -> dict:
             file_states[sid] = ("skipped" if f["status"] == "skipped" else "failed", "; ".join(f.get("warnings", []))[:200])
             continue
         if f["kind"] == "video":
-            secs, warns = video_sections(store, eid, f)
+            secs, warns, visual = video_sections(store, eid, f)
+            visuals.append(visual)
         else:
             secs, warns = doc_sections(store, eid, f)
         warnings.extend(warns)
@@ -232,9 +173,13 @@ def run_assemble(event: dict, store) -> dict:
     # keep contract key order: id first
     sections = [{"id": s["id"], "source_id": s["source_id"], "source_name": s["source_name"], "kind": s["kind"],
                  "label": s["label"], "text": s["text"]} for s in sections]
+    stats: dict = {"docs": n_docs, "videos": n_videos, "images": sum(s["kind"] == "image" for s in sections),
+                   "words": n_words}
+    visual = visual_stats(visuals)
+    if visual:  # {frames, sheets, requests, tokens_in, tokens_out, cost_usd}, only when some video was sampled
+        stats["visual"] = visual
     corpus = {
-        "evaluation_id": eid, "built_at": now_iso(),
-        "stats": {"docs": n_docs, "videos": n_videos, "images": sum(s["kind"] == "image" for s in sections), "words": n_words},
+        "evaluation_id": eid, "built_at": now_iso(), "stats": stats,
         "warnings": list(dict.fromkeys(warnings)), "sections": sections,
     }
     md = "\n\n".join(f"## [{s['label']}]\n\n{s['text']}" for s in sections) + "\n"

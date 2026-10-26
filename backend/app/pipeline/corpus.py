@@ -29,19 +29,31 @@ class Corpus:
     stats: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     # Videos of the submission and what could be analysed of them: [{"name", "duration_sec", "has_audio",
-    # "transcribed"}]. Read from the extraction step's own files (plan.json), not from the sections.
+    # "transcribed"}, plus "visual" ("ok" | "failed" | "off"), "frames" and "mean_gap_s" when the AWS stage analysed
+    # the video's frames]. Read from the extraction step's own files (plan.json, visual.json) and the sections.
     media: list[dict[str, Any]] = field(default_factory=list)
 
+    @staticmethod
+    def _unanalysed(m: dict[str, Any]) -> bool:
+        if m.get("visual") == "ok":
+            return False  # what it shows was analysed from its frames
+        if m.get("visual") == "failed":
+            return True  # the frame analysis was attempted and failed: what it shows is unknown
+        # No frame analysis (an older run, or switched off): as before, a transcript counts as analysed.
+        return not m.get("transcribed")
+
     def has_unanalysed_video(self) -> bool:
-        """A video whose audio could not be transcribed (silent or failed): what it shows or says is unknown."""
-        return any(not m.get("transcribed") for m in self.media)
+        """A video whose content is unknown: its frames were not analysed (failed, or never attempted and its audio
+        not transcribed either)."""
+        return any(self._unanalysed(m) for m in self.media)
 
     def media_note(self) -> str:
         """A short plain-text description of the submission's videos for the prompts ('' when there are none), so
-        the model knows a video's length and that it could not be analysed instead of guessing from the text."""
+        the model knows a video's length and what of it was analysed instead of guessing from the text."""
         if not self.media:
             return ""
         lines = []
+        weak = False
         for m in self.media:
             seconds = m.get("duration_sec")
             if isinstance(seconds, int | float):
@@ -49,13 +61,35 @@ class Corpus:
             else:
                 length = "unknown length"
             if m.get("transcribed"):
+                said = "its audio was transcribed"
+            elif m.get("has_audio") is False:
+                said = "it has no audio track (silent)"
+            else:
+                said = "its audio could not be transcribed"
+            if m.get("visual") == "ok":
+                weak = True
+                frames, gap = m.get("frames"), m.get("mean_gap_s")
+                sample = f"{frames} sampled frames" if isinstance(frames, int) and frames else "sampled frames"
+                if isinstance(gap, int | float) and gap > 0:
+                    sample += f" (about one every {gap:g} s)"
+                how = f"{said}, and what it shows on screen was analysed from {sample}"
+            elif m.get("visual") == "failed":
+                how = f"{said}, but the analysis of what it shows on screen failed, so its on-screen content is unknown"
+            elif m.get("transcribed"):
                 how = "its audio was transcribed, but what it shows on screen was NOT analysed"
             elif m.get("has_audio") is False:
                 how = "it has no audio track (silent), so neither what it says nor what it shows could be analysed"
             else:
                 how = "it could not be transcribed or analysed"
             lines.append(f"- {m.get('name') or 'video'}: video, {length}; {how}.")
-        return "Submission media:\n" + "\n".join(lines)
+        note = "Submission media:\n" + "\n".join(lines)
+        if weak:
+            note += (
+                "\nIts VIDEO sections hold `[mm:ss] SAID:` (transcript) and `[mm:ss] SHOWN:` (what a sampled frame"
+                " shows) lines, plus a steps and a quality section. SHOWN lines are evidence of what the video shows;"
+                " the absence of a step in sampled frames is weak evidence that it did not happen."
+            )
+        return note
 
     @property
     def total_chars(self) -> int:
@@ -104,9 +138,12 @@ def load_corpus(aws: AwsJobsProtocol, evaluation_id: str) -> Corpus | None:
     return corpus
 
 
+_SAID = "] SAID: "  # a transcript line of the AWS stage's video timeline ("[mm:ss] SAID: ...")
+
+
 def read_media(aws: AwsJobsProtocol, evaluation_id: str, corpus: Corpus) -> list[dict[str, Any]]:
-    """Video facts (length, silent or not, transcribed or not) from the manifest and each video's plan.json.
-    Best effort: anything missing just means less context, never a failure."""
+    """Video facts (length, silent or not, transcribed or not, frames analysed or not) from the manifest and each
+    video's plan.json and visual.json. Best effort: anything missing just means less context, never a failure."""
     try:
         manifest = aws.read_json(derived_key(evaluation_id, "manifest.json")) or {}
         media: list[dict[str, Any]] = []
@@ -115,15 +152,24 @@ def read_media(aws: AwsJobsProtocol, evaluation_id: str, corpus: Corpus) -> list
                 continue
             sid = str(f.get("source_id") or "")
             plan = aws.read_json(derived_key(evaluation_id, f"video/{sid}/plan.json")) or {}
-            transcribed = any(s.kind == "video" and s.source_id == sid for s in corpus.sections)
-            media.append(
-                {
-                    "name": f.get("original_name") or plan.get("source") or "video",
-                    "duration_sec": plan.get("duration_sec"),
-                    "has_audio": plan.get("has_audio"),
-                    "transcribed": transcribed,
-                }
-            )
+            visual = aws.read_json(derived_key(evaluation_id, f"video/{sid}/visual.json"))
+            own = [s for s in corpus.sections if s.kind == "video" and s.source_id == sid]
+            # With frame analysis, a video's sections may hold only SHOWN lines: transcribed means SAID lines.
+            transcribed = any(_SAID in s.text for s in own) if visual is not None else bool(own)
+            entry: dict[str, Any] = {
+                "name": f.get("original_name") or plan.get("source") or "video",
+                "duration_sec": plan.get("duration_sec"),
+                "has_audio": plan.get("has_audio"),
+                "transcribed": transcribed,
+            }
+            if isinstance(visual, dict) and visual.get("status") in ("ok", "failed", "off"):
+                entry["visual"] = visual["status"]
+                entry["frames"] = visual.get("frames") if isinstance(visual.get("frames"), int) else None
+                gap = visual.get("mean_gap_s")
+                entry["mean_gap_s"] = gap if isinstance(gap, int | float) else None
+                if entry["duration_sec"] is None:
+                    entry["duration_sec"] = visual.get("duration_sec")
+            media.append(entry)
         return media
     except Exception:  # noqa: BLE001 - media facts are optional context
         return []

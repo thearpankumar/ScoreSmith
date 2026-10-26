@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.models.enums import ChatMessageRole, ChatSessionStatus
 from app.schemas.common import ORMBase
@@ -36,10 +36,32 @@ class ChatSessionStart(BaseModel):
     # ignored (a server-generated id is used instead) for any other caller that doesn't
     # send one.
     session_id: uuid.UUID | None = None
+    # The chat model the user picked (OpenRouter only; validated against the admin's enabled list, else the
+    # default is used — see app/ai/chat_models.py) and files uploaded for this message (app/api/v1/chat_attachments.py).
+    model: str | None = Field(default=None, max_length=200)
+    attachment_ids: list[uuid.UUID] = Field(default_factory=list, max_length=5)
 
 
 class ChatMessageCreate(BaseModel):
     message: str
+    model: str | None = Field(default=None, max_length=200)
+    attachment_ids: list[uuid.UUID] = Field(default_factory=list, max_length=5)
+
+
+class ChatAttachmentRead(ORMBase):
+    """A file attached to a chat message (or uploaded for the next one). `outline` summarises what was extracted:
+    pages / sheets / rows / whether the text was cut to fit (see app/ai/attachments.py)."""
+
+    id: uuid.UUID
+    filename: str
+    kind: str
+    size_bytes: int
+    status: str
+    error: str | None = None
+    outline: dict | None = None
+    token_estimate: int | None = None
+    message_id: uuid.UUID | None = None
+    created_at: datetime
 
 
 class ChatClarificationQuestion(BaseModel):
@@ -97,6 +119,8 @@ class ChatTurnRead(BaseModel):
     # turn_in_progress=true; clients poll GET /chat/sessions/{id} until it clears.
     turn_error: str | None = None
     turn_error_code: str | None = None
+    # The OpenRouter model the user last picked in this chat (None = the admin's default / Bedrock).
+    chat_model: str | None = None
 
 
 class ChatSessionRead(ORMBase):
@@ -118,6 +142,7 @@ class ChatSessionRead(ORMBase):
     turn_in_progress: bool = False
     chart_state: ChartState = "none"
     chart_can_restore: bool = False
+    chat_model: str | None = None
 
 
 class ChatMessageRead(ORMBase):
@@ -132,6 +157,33 @@ class ChatMessageRead(ORMBase):
     content: str
     tool_calls: dict | list | None
     created_at: datetime
+    # The model that wrote an assistant reply (None for user messages / older replies).
+    model: str | None = None
+    attachments: list[ChatAttachmentRead] = []
+
+
+class ChatModelOption(BaseModel):
+    id: str
+    label: str
+    vendor: str
+
+
+class ChatAttachmentLimits(BaseModel):
+    enabled: bool
+    max_bytes: int
+    max_files: int
+    extensions: list[str]
+
+
+class ChatConfigRead(BaseModel):
+    """What the chat composer offers the current user (`GET /chat/config`): the model picker (OpenRouter only, the
+    admin's enabled models and default) and file attachments (OpenRouter only)."""
+
+    provider: Literal["bedrock", "openrouter"]
+    model_picker: bool
+    models: list[ChatModelOption]
+    default_model: str | None
+    attachments: ChatAttachmentLimits
 
 
 class ChatTurnEventRead(ORMBase):

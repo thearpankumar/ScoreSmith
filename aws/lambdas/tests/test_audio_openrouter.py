@@ -87,7 +87,7 @@ def test_transcribe_falls_back_to_voxtral_mini_on_the_stt_endpoint():
     c, s = make_client({TM[0]: chat_err(400, "audio unsupported"), TM[1]: stt_ok(" hello there ")})
     text, model, usage = orp.transcribe(c, TM, b"mp3-bytes")
     assert (text, model) == ("hello there", "mistralai/voxtral-mini-3b-2507")
-    assert usage == {"tokens_in": 0, "tokens_out": 0}
+    assert usage == {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.001}  # usage.cost is kept when reported
     stt = s.calls[1]
     assert stt["url"] == "https://or.test/api/v1/audio/transcriptions"
     assert stt["json"] == {"model": TM[1], "input_audio": {"data": base64.b64encode(b"mp3-bytes").decode(),

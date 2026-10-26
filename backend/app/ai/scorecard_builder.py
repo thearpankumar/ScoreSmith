@@ -62,6 +62,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
+from app.ai.attachments import collapse_old_blocks
 from app.ai.bedrock_client import (
     BedrockClientProtocol,
     BedrockTimeoutError,
@@ -1652,7 +1653,7 @@ async def _judge_duplicate_pairs(
                 system="You decide whether two KPI names are the same measurement concept. Call the tool once.",
                 tools=[JUDGE_DUPLICATE_KPIS_TOOL],
                 force_tool_use=True,
-                model_id=models_of(bedrock).judge,
+                model_id=models_of(bedrock).builder_judge,
             )
             if not result.is_tool_use or result.tool_name != "judge_duplicate_kpis" or result.truncated:
                 return
@@ -4400,7 +4401,7 @@ def _header_call(bedrock: BedrockClientProtocol, message: str, kpi_names: list[s
         ),
         tools=[SET_SCORECARD_HEADER_TOOL],
         force_tool_use=True,
-        model_id=models_of(bedrock).judge,
+        model_id=models_of(bedrock).builder_judge,
     )
     if result.is_tool_use and result.tool_name == "set_scorecard_header":
         return _clean_header(result.tool_input or {})
@@ -4582,8 +4583,14 @@ async def _research_kpis_impl(
 
     draft = ScorecardDraft.model_validate(state["draft"])
     conversation_context = _conversation_context_text(state.get("messages") or [])
+    brief = str(state.get("build_brief") or "").strip()
+    if brief:
+        # The chat assistant's summary of the request (it may span several earlier messages).
+        conversation_context = f"{conversation_context}\nRequest summary: {brief}"
     # A requested KPI count ("give me 35 KPIs") — deterministic extraction, zero model calls.
-    requested_count = extract_kpi_target(_last_user_message(state.get("messages") or []))
+    requested_count = extract_kpi_target(_last_user_message(state.get("messages") or [])) or (
+        extract_kpi_target(brief) if brief else None
+    )
     if meta is not None and requested_count:
         meta["kpi_target"] = {"requested": requested_count, "delivered": None, "note": None}
 
@@ -5419,6 +5426,13 @@ class BuilderState(TypedDict):
     # else {requested, delivered (None until research ran), note (shortfall/prune explanation)} —
     # see `_format_kpi_target_for_prompt`.
     kpi_target: dict[str, Any] | None
+    # The chat assistant in front of the builder (app/ai/chat_agent.py): its decision for the current message
+    # ("answer" | "build" | "edit" | "save" | "ask"), the brief it handed the builder, the clarifying question the
+    # user just answered ({question, options, from}) and who asked the pending one (None = the builder).
+    agent_route: str | None
+    build_brief: str | None
+    answered_question: dict[str, Any] | None
+    question_from: str | None
 
 
 def initial_state(session_id: str, first_user_message: str) -> BuilderState:
@@ -5448,9 +5462,10 @@ def initial_state(session_id: str, first_user_message: str) -> BuilderState:
 def gather_info(state: BuilderState) -> dict[str, Any]:
     """Entry node — runs only at the start of a genuine new human turn (a brand-new
     session, or `send_message` appending a fresh message with no pending interrupt; the
-    resume-from-interrupt path goes ask_clarification -> propose_kpis directly and never
-    passes through here). Ensures the draft is present/valid, and resets the per-human-turn
-    LLM call budget (see MAX_LLM_TURNS_PER_HUMAN_TURN)."""
+    resume-from-interrupt path goes ask_clarification -> converse (or, without the chat
+    assistant, -> ingest_user_kpis) directly and never passes through here). Ensures the
+    draft is present/valid, and resets the per-human-turn LLM call budget (see
+    MAX_LLM_TURNS_PER_HUMAN_TURN)."""
     draft = state.get("draft") or ScorecardDraft().model_dump(mode="json")
     ScorecardDraft.model_validate(draft)  # fail fast on corrupt checkpoint state
     return {"draft": draft, "llm_turn_count": 0}
@@ -5507,7 +5522,8 @@ async def check_similarity(state: BuilderState, config: RunnableConfig) -> dict[
     configurable = config.get("configurable", {})
     db = configurable.get("db_session")
     bedrock = configurable.get("bedrock_client")
-    query_text = _last_user_message(state["messages"])
+    # The chat assistant's brief says what is being built when the request spans several messages.
+    query_text = state.get("build_brief") or _last_user_message(state["messages"])
 
     if db is None or bedrock is None or not query_text.strip():
         return {"similarity_checked": True}
@@ -5575,7 +5591,8 @@ def suggest_similar(state: BuilderState) -> dict[str, Any]:
 
 def _messages_to_converse(messages: list[ChatTurn]) -> list[dict[str, Any]]:
     converse_messages: list[dict[str, Any]] = []
-    for turn in messages:
+    # Files attached to older messages are reduced to a one-line stub (see app/ai/attachments.py).
+    for turn in collapse_old_blocks(messages):
         role = "assistant" if turn["role"] in ("assistant", "tool") else "user"
         # Converse alternates user/assistant; a "tool" turn (our own validation-error
         # notes) is folded in as an assistant-authored note rather than a real toolResult
@@ -5601,6 +5618,41 @@ def _format_search_results(query: str, results: list[SearchResult]) -> str:
         date_suffix = f" [{r.published_date}]" if r.published_date else ""
         lines.append(f"- {r.title} ({r.url}){date_suffix}: {r.snippet}")
     return "\n".join(lines)
+
+
+async def _write_edit_rubrics(
+    tool_input: dict[str, Any],
+    draft: ScorecardDraft,
+    bedrock: BedrockClientProtocol,
+    model_id: str | None,
+    context_text: str,
+    session_id: Any,
+    turn_started_at: datetime | None,
+    actor: str,
+) -> dict[str, Any]:
+    """Guidelines for the KPIs an `edit_kpis` call adds or regenerates are written HERE by the compact-rubric
+    machinery (small parallel calls on the builder's model), so the editing model's own output stays O(ops). Returns
+    `tool_input` with the generated rubrics under `_generated` (unchanged when no op needs one). Shared by
+    `propose_kpis` and the chat assistant (app/ai/chat_agent.py)."""
+    gen_items: list[dict[str, Any]] = []
+    for op in tool_input.get("ops") or []:
+        if isinstance(op, dict) and op.get("op") in ("add", "set_guidelines") and op.get("name"):
+            parent = op.get("parent_name")
+            if op["op"] == "set_guidelines":
+                old = next((k for k in draft.kpis if k.name == op["name"]), None)
+                parent = old.parent_name if old is not None else None
+            gen_items.append(
+                {"name": str(op["name"]), "parent_name": parent, "guidance": str(op.get("rationale") or "")}
+            )
+    if not gen_items:
+        return tool_input
+    await emit_turn_event(
+        session_id, turn_started_at, actor, "guidelines", f"Writing guidelines for {len(gen_items)} KPI(s)…"
+    )
+    generated, fb = await _fill_missing_guidelines(gen_items, bedrock, model_id, context_text, None)
+    if fb:
+        logger.warning("edit_kpis: %d KPI(s) got the marked fallback rubric: %s", len(fb), fb)
+    return {**tool_input, "_generated": generated}
 
 
 def _final_answer_gate_text(tool_name: str | None, tool_input: dict[str, Any], assistant_note: str) -> str:
@@ -6196,30 +6248,11 @@ async def propose_kpis(state: BuilderState, config: RunnableConfig) -> dict[str,
             }
             pending_tool = {"name": result.tool_name, "input": tool_input}
             if result.tool_name == "edit_kpis":
-                # Guidelines for added / regenerated KPIs are written HERE by the compact-rubric
-                # machinery (small parallel calls), so the main model's output stays O(ops).
-                gen_items: list[dict[str, Any]] = []
-                for op in tool_input.get("ops") or []:
-                    if isinstance(op, dict) and op.get("op") in ("add", "set_guidelines") and op.get("name"):
-                        parent = op.get("parent_name")
-                        if op["op"] == "set_guidelines":
-                            old = next((k for k in draft.kpis if k.name == op["name"]), None)
-                            parent = old.parent_name if old is not None else None
-                        gen_items.append(
-                            {"name": str(op["name"]), "parent_name": parent, "guidance": str(op.get("rationale") or "")}
-                        )
-                if gen_items:
-                    await emit_turn_event(
-                        session_id, turn_started_at, "master", "guidelines",
-                        f"Writing guidelines for {len(gen_items)} KPI(s)…",
-                    )
-                    generated, fb = await _fill_missing_guidelines(
-                        gen_items, bedrock, model_id, _conversation_context_text(local_messages), None
-                    )
-                    if fb:
-                        logger.warning("edit_kpis: %d KPI(s) got the marked fallback rubric: %s", len(fb), fb)
-                    tool_input = {**tool_input, "_generated": generated}
-                    pending_tool = {"name": result.tool_name, "input": tool_input}
+                tool_input = await _write_edit_rubrics(
+                    tool_input, draft, bedrock, model_id, _conversation_context_text(local_messages),
+                    session_id, turn_started_at, "master",
+                )
+                pending_tool = {"name": result.tool_name, "input": tool_input}
             if result.tool_name == "ask_clarification":
                 assistant_note = str(tool_input.get("question") or "").strip() or (
                     "Could you tell me more about what this scorecard should measure?"
@@ -6412,6 +6445,14 @@ def ask_clarification(state: BuilderState) -> dict[str, Any]:
         # The human just answered — give the model a fresh LLM-turn budget for whatever
         # comes next (see MAX_LLM_TURNS_PER_HUMAN_TURN).
         "llm_turn_count": 0,
+        # For the chat assistant (app/ai/chat_agent.py): a chip answer to the builder's own question goes straight
+        # back to the builder; any other answer is read with the question in view.
+        "answered_question": {
+            "question": question_payload.get("question"),
+            "options": list(question_payload.get("options") or []),
+            "from": state.get("question_from") or "builder",
+        },
+        "question_from": None,
     }
 
 
@@ -7349,7 +7390,12 @@ def confirm(state: BuilderState) -> dict[str, Any]:
 # --- Graph assembly ----------------------------------------------------------------------
 
 
-def build_graph_definition() -> StateGraph:
+def build_graph_definition(chat_agent: bool | None = None) -> StateGraph:
+    """The builder graph. With the chat assistant (`CHAT_AGENT`, default on) every human message goes
+    gather_info -> converse first, and converse decides whether the builder runs at all (see
+    app/ai/chat_agent.py); without it every message goes straight into the builder (the original wiring)."""
+    if chat_agent is None:
+        chat_agent = get_settings().chat_agent
     graph = StateGraph(BuilderState)
     graph.add_node("gather_info", gather_info)
     graph.add_node("check_similarity", check_similarity)
@@ -7364,7 +7410,23 @@ def build_graph_definition() -> StateGraph:
     graph.add_node("confirm", confirm)
 
     graph.add_edge(START, "gather_info")
-    graph.add_edge("gather_info", "check_similarity")
+    if chat_agent:
+        from app.ai import chat_agent as agent  # imports this module: resolved lazily, at graph-build time
+
+        graph.add_node("converse", agent.converse)
+        graph.add_edge("gather_info", "converse")
+        graph.add_conditional_edges(
+            "converse",
+            agent.route_after_converse,
+            {
+                "check_similarity": "check_similarity",
+                "update_draft": "update_draft",
+                "ask_clarification": "ask_clarification",
+                "respond_conversationally": "respond_conversationally",
+            },
+        )
+    else:
+        graph.add_edge("gather_info", "check_similarity")
     graph.add_conditional_edges(
         "check_similarity",
         _route_after_similarity,
@@ -7391,11 +7453,13 @@ def build_graph_definition() -> StateGraph:
             "respond_conversationally": "respond_conversationally",
         },
     )
-    graph.add_edge("ask_clarification", "ingest_user_kpis")
     # respond_conversationally mirrors ask_clarification's own edge exactly (see its
-    # docstring): it pauses via interrupt(), then resumes straight back into propose_kpis
-    # once the user's next real message arrives — never routes anywhere else.
-    graph.add_edge("respond_conversationally", "ingest_user_kpis")
+    # docstring): it pauses via interrupt(), then resumes with the user's next real message —
+    # into the chat assistant (which hands back to the builder when the builder should go on),
+    # or, without the assistant, straight back into the builder.
+    resume_into = "converse" if chat_agent else "ingest_user_kpis"
+    graph.add_edge("ask_clarification", resume_into)
+    graph.add_edge("respond_conversationally", resume_into)
     graph.add_conditional_edges(
         "update_draft",
         _route_after_update,
@@ -7519,6 +7583,9 @@ class BuilderTurnResult:
     # Populated only when status == "awaiting_similar_choice" (see check_similarity /
     # suggest_similar above) — reuse-suggestion cards for the frontend to render.
     similar_suggestions: list[dict[str, Any]] | None = None
+    # The chat assistant's decision for this message (app/ai/chat_agent.py): "answer" | "ask" | "edit" | "save" when
+    # the assistant handled it, "build" when the builder did; None without the assistant.
+    agent_route: str | None = None
 
 
 _GENERIC_NOTES = frozenset(
@@ -7718,6 +7785,7 @@ def _to_turn_result(state: dict[str, Any]) -> BuilderTurnResult:
         question=question,
         assistant_note=assistant_note,
         similar_suggestions=similar_suggestions,
+        agent_route=state.get("agent_route"),
     )
 
 
@@ -7729,12 +7797,19 @@ def _config_for(
     web_search_client: WebSearchClientProtocol | None = None,
     turn_started_at: datetime | None = None,
     jev_client: JevClientProtocol | None = None,
+    conversation_model_id: str | None = None,
+    attachments: Any | None = None,
 ) -> dict[str, Any]:
     return {
         "configurable": {
+            # The chat's files for the chat assistant (app/ai/attachments.AttachmentContext); None = none.
+            "attachments": attachments,
             "thread_id": session_id,
             "bedrock_client": bedrock,
+            # The builder's model (every KPI research / drafting call) ...
             "chat_model_id": chat_model_id,
+            # ... and the chat assistant's (the model the user picked; None = the builder's).
+            "conversation_model_id": conversation_model_id,
             # Wired in so check_similarity can run a real pgvector search — optional
             # (None is a valid, silently-skipped configuration; see check_similarity).
             "db_session": db,
@@ -7765,6 +7840,8 @@ async def start_session(
     web_search_client: WebSearchClientProtocol | None = None,
     turn_started_at: datetime | None = None,
     jev_client: JevClientProtocol | None = None,
+    conversation_model_id: str | None = None,
+    attachments: Any | None = None,
 ) -> BuilderTurnResult:
     """Kick off a brand-new scorecard-builder session (`POST /chat/sessions`). Pass `db`
     (an `AsyncSession`) to enable the reuse-suggestion similarity check on the initial
@@ -7779,7 +7856,10 @@ async def start_session(
     other path into the graph), so it's the one that matters most for that feature."""
     manager = get_graph_manager()
     compiled = await manager.get_compiled_graph()
-    config = _config_for(session_id, bedrock, chat_model_id, db, web_search_client, turn_started_at, jev_client)
+    config = _config_for(
+        session_id, bedrock, chat_model_id, db, web_search_client, turn_started_at, jev_client, conversation_model_id,
+        attachments,
+    )
     result_state = await compiled.ainvoke(initial_state(session_id, first_message), config=config)
     return _to_turn_result(result_state)
 
@@ -7833,6 +7913,8 @@ async def send_message(
     web_search_client: WebSearchClientProtocol | None = None,
     turn_started_at: datetime | None = None,
     jev_client: JevClientProtocol | None = None,
+    conversation_model_id: str | None = None,
+    attachments: Any | None = None,
 ) -> BuilderTurnResult:
     """Resume an existing session with a new user message
     (`POST /chat/sessions/{id}/messages`). If the graph is currently paused at
@@ -7846,7 +7928,10 @@ async def send_message(
     checkpoints (see `start_session`'s own docstring)."""
     manager = get_graph_manager()
     compiled = await manager.get_compiled_graph()
-    config = _config_for(session_id, bedrock, chat_model_id, db, web_search_client, turn_started_at, jev_client)
+    config = _config_for(
+        session_id, bedrock, chat_model_id, db, web_search_client, turn_started_at, jev_client, conversation_model_id,
+        attachments,
+    )
 
     snapshot = await compiled.aget_state(config)
     if not snapshot.values:

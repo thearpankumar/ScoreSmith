@@ -92,6 +92,30 @@ def analyse_with_shrink(analyse: Callable[[bytes, str], tuple[str, str, dict]], 
     raise RuntimeError("image still too large after 3 shrink attempts")
 
 
+def analyse_many_with_shrink(analyse: Callable[[list[tuple[bytes, str]]], tuple[str, str, dict]],
+                             raws: list[bytes], ext: str = "jpg") -> tuple[str, str, dict]:
+    """analyse_with_shrink for one request carrying several images (video contact sheets): the body budget is shared
+    between them, and shrunk by 15% while the service still says the body is too big."""
+    budget = MAX_BYTES // max(1, len(raws))
+    for _ in range(4):
+        prepared = [prepare(raw, ext, budget) for raw in raws]
+        try:
+            return analyse(prepared)
+        except TooLarge:
+            biggest = max(len(data) for data, _fmt in prepared)
+            budget = int(min(budget, biggest) * 0.85)
+            print(f"    body too large ({sum(len(d) for d, _f in prepared) / 1e6:.2f} MB); "
+                  f"retrying at <= {budget / 1e6:.2f} MB per image")
+    raise RuntimeError("images still too large after 3 shrink attempts")
+
+
 def analysis_key(image_key: str) -> str:
     stem = image_key.rsplit(".", 1)[0]
     return stem + ".analysis.md"
+
+
+def usage_key(image_key: str) -> str:
+    """Sidecar of an analysis: {"model","tokens_in","tokens_out","cost_usd"} (cost null unless the provider reports
+    it)."""
+    stem = image_key.rsplit(".", 1)[0]
+    return stem + ".analysis.json"

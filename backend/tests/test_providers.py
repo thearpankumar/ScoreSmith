@@ -22,6 +22,8 @@ BEDROCK_IDS = providers.ModelSet(
     judge="zai.glm-4.7-flash",
     master="us.meta.llama4-maverick-17b-instruct-v1:0",
     embedding="amazon.titan-embed-text-v2:0",
+    builder="zai.glm-5",
+    builder_judge="zai.glm-4.7-flash",
 )
 
 
@@ -177,8 +179,11 @@ async def test_provider_for_job_keeps_the_jobs_provider_while_available(monkeypa
 
 def test_models_for_each_provider() -> None:
     assert providers.models_for("bedrock") == BEDROCK_IDS
-    gpt = "openai/gpt-5-mini"
-    assert providers.models_for("openrouter") == providers.ModelSet(gpt, gpt, gpt, "openai/text-embedding-3-small")
+    gpt, luna = "openai/gpt-5-mini", "openai/gpt-5.6-luna"
+    # Evaluations (chat / judge / master tiers) stay on gpt-5-mini; the chat scorecard builder runs on GPT-5.6 Luna.
+    assert providers.models_for("openrouter") == providers.ModelSet(
+        gpt, gpt, gpt, "openai/text-embedding-3-small", luna, luna
+    )
 
 
 def test_models_of_falls_back_per_field() -> None:
@@ -188,7 +193,8 @@ def test_models_of_falls_back_per_field() -> None:
     fake_or = FakeOpenRouterClient()
     assert providers.provider_of(fake_or) == "openrouter"
     assert providers.models_of(fake_or) == providers.ModelSet(
-        "openai/gpt-5-mini", "openai/gpt-5-mini", "openai/gpt-5-mini", "fake-embed"
+        "openai/gpt-5-mini", "openai/gpt-5-mini", "openai/gpt-5-mini", "fake-embed",
+        "openai/gpt-5.6-luna", "openai/gpt-5.6-luna",
     )
     assert providers.embedding_model_of(fake_or) == "fake-embed"
 

@@ -1,4 +1,4 @@
-"""OpenRouter calls: Voxtral transcription and vision analysis with model fallbacks.
+"""OpenRouter calls: Voxtral transcription, image analysis and video frame-sheet analysis with model fallbacks.
 
 Plain HTTPS with `requests` to {OPENROUTER_API_BASE}/chat/completions, and to /audio/transcriptions for the
 speech-to-text models that chat does not serve. The API key is not in the Lambda environment: it is read once per
@@ -15,7 +15,7 @@ import re
 import time
 
 from .errors import PipelineError, TransientError
-from .images import TooLarge, analyse_with_shrink, is_size_error
+from .images import TooLarge, analyse_many_with_shrink, analyse_with_shrink, is_size_error
 from .prompts import IMAGE_MAX_TOKENS, IMAGE_PROMPT, TRANSCRIBE_PROMPT
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
@@ -23,6 +23,9 @@ DEFAULT_REFERER = "https://scoresmith.app"
 APP_TITLE = "ScoreSmith"
 TRANSCRIBE_MODELS = ["mistralai/voxtral-small-24b-2507", "mistralai/voxtral-mini-3b-2507"]
 VISION_MODELS = ["qwen/qwen3.7-flash", "qwen/qwen3-vl-235b-a22b-instruct"]
+# Video contact sheets (several images per request): cheap vision models. qwen3.7-flash's cheap tier is for prompts
+# under 32K tokens; four 1344 px sheets and the prompt stay far below that.
+VIDEO_MODELS = ["qwen/qwen3.7-flash", "google/gemini-3.1-flash-lite"]
 # Speech-to-text models are called on /audio/transcriptions (Voxtral Mini is not offered on chat). An id from the
 # OPENROUTER_TRANSCRIBE_MODELS override that contains "transcribe" or "whisper" is sent there too.
 STT_MODELS = frozenset({"mistralai/voxtral-mini-3b-2507"})
@@ -56,6 +59,10 @@ def transcribe_models() -> list[str]:
 
 def vision_models() -> list[str]:
     return _env_models("OPENROUTER_VISION_MODELS", VISION_MODELS)
+
+
+def video_models() -> list[str]:
+    return _env_models("OPENROUTER_VIDEO_MODELS", VIDEO_MODELS)
 
 
 def is_stt_model(model: str) -> bool:
@@ -315,7 +322,7 @@ def openrouter_client() -> OpenRouterClient:
     return _client
 
 
-# the interface media.py dispatches on (bedrock_ops has the same three)
+# the interface media.py dispatches on (bedrock_ops has the same functions)
 default_client = openrouter_client
 
 
@@ -328,10 +335,15 @@ def _text_of(resp: dict) -> str:
 
 
 def _usage(resp: dict) -> dict:
+    """Tokens, plus `cost_usd` when OpenRouter reports the request's cost (usage.cost, in USD credits)."""
     u = resp.get("usage")
     u = u if isinstance(u, dict) else {}
-    return {"tokens_in": _int(u.get("prompt_tokens") or u.get("input_tokens")),
-            "tokens_out": _int(u.get("completion_tokens") or u.get("output_tokens"))}
+    out: dict = {"tokens_in": _int(u.get("prompt_tokens") or u.get("input_tokens")),
+                 "tokens_out": _int(u.get("completion_tokens") or u.get("output_tokens"))}
+    cost = u.get("cost")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+        out["cost_usd"] = float(cost)
+    return out
 
 
 # --------------------------------------------------------------------------- transcription
@@ -393,3 +405,37 @@ def analyse_image(client, models: list[str], raw: bytes, ext: str,
                   prompt: str = IMAGE_PROMPT) -> tuple[str, str, dict]:
     """prepare + analyse, shrinking the image while OpenRouter says the request body is too big."""
     return analyse_with_shrink(lambda data, fmt: analyse(client, models, data, fmt, prompt), raw, ext)
+
+
+# --------------------------------------------------------------------------- video contact sheets
+def _sheets_once(client, models: list[str], images: list[tuple[bytes, str]], prompt: str,
+                 max_tokens: int) -> tuple[str, str, dict]:
+    parts: list[dict] = [{"type": "text", "text": prompt}]
+    for data, fmt in images:
+        parts.append({"type": "image_url",
+                      "image_url": {"url": f"data:image/{fmt};base64," + base64.b64encode(data).decode("ascii")}})
+    last: Exception | None = None
+    for model in models:
+        payload = {"model": model, "messages": [{"role": "user", "content": parts}], "temperature": 0,
+                   "max_tokens": max_tokens}
+        if not _vision_reasoning_on():
+            payload["reasoning"] = {"enabled": False}
+        try:
+            r = client.chat(payload)
+            text = _text_of(r)
+            if not text:
+                raise ModelError("empty response")
+            return text, model, _usage(r)
+        except TooLarge:
+            raise
+        except (ModelError, TransientError) as e:
+            last = e
+            print(f"    {model}: {type(e).__name__}: {scrub(e, 120)}; trying next model")
+    raise TransientError(f"all video models failed (last: {scrub(last)})")
+
+
+def analyse_sheets(client, models: list[str], raws: list[bytes], prompt: str,
+                   max_tokens: int) -> tuple[str, str, dict]:
+    """One request with several contact sheets (JPEG), the prompt first; shrinks the sheets while OpenRouter says
+    the body is too big."""
+    return analyse_many_with_shrink(lambda images: _sheets_once(client, models, images, prompt, max_tokens), raws)

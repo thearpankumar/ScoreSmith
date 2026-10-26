@@ -49,6 +49,7 @@ from app.models.enums import ACTIVE_EVALUATION_STATUSES, EvaluationStatus
 from app.models.evaluation import Evaluation
 from app.models.evaluation_batch import EvaluationBatch
 from app.models.evaluation_source import EvaluationSource
+from app.models.kpi_node import KpiNode
 from app.models.scorecard import Scorecard
 from app.models.scorecard_version import ScorecardVersion
 from app.pipeline.aws_jobs import (
@@ -118,6 +119,53 @@ def roll_up_source_states(files: list[dict[str, Any]], source_ids: set[str]) -> 
             if g.get("state") in {"skipped", "failed"} and str(g.get("detail") or "").strip()
         ]
         out[owner] = (status, list(dict.fromkeys(warnings)))
+    return out
+
+
+# The AWS video-frame prompt names the scorecard's leaf KPIs (the Lambda clips them again: 60 names, 120 chars each).
+MAX_CONTEXT_KPIS = 60
+MAX_KPI_NAME_CHARS = 120
+# Knobs of the AWS frame analysis the execution input's `video` object may override (the Lambda env var names in
+# lower case; the Lambda validates and clamps the values).
+VIDEO_KNOBS = frozenset(
+    {
+        "video_visual_mode", "frame_min_gap_s", "frame_max_gap_s", "frame_change_threshold",
+        "max_frames_per_video", "grid", "sheets_per_request", "visual_max_output_tokens",
+    }
+)
+
+
+def leaf_kpi_names(rows: list[Any]) -> list[str]:
+    """Names of the leaf KPIs in tree order (siblings by display order), whitespace-collapsed and clipped. `rows`
+    have `id`, `parent_id`, `name`, `display_order` (KpiNode rows or a column select of them)."""
+    children: dict[Any, list[Any]] = {}
+    for r in rows:
+        children.setdefault(r.parent_id, []).append(r)
+    names: list[str] = []
+    stack = sorted(children.get(None, []), key=lambda r: (r.display_order, r.name), reverse=True)
+    while stack and len(names) < MAX_CONTEXT_KPIS:
+        node = stack.pop()
+        kids = children.get(node.id)
+        if kids:
+            stack.extend(sorted(kids, key=lambda r: (r.display_order, r.name), reverse=True))
+            continue
+        name = " ".join(str(node.name or "").split())[:MAX_KPI_NAME_CHARS]
+        if name:
+            names.append(name)
+    return names
+
+
+def video_overrides(settings: Any) -> dict[str, Any]:
+    """The execution input's `video` object: AI_EVAL_VIDEO_VISUAL_MODE and the known AI_EVAL_VIDEO_KNOBS ({} = the
+    Lambda defaults)."""
+    knobs = dict(settings.ai_eval_video_knobs or {})
+    unknown = sorted(k for k in knobs if k not in VIDEO_KNOBS)
+    if unknown:
+        logger.warning("AI_EVAL_VIDEO_KNOBS: ignoring unknown key(s) %s", ", ".join(unknown))
+    out: dict[str, Any] = {k: v for k, v in knobs.items() if k in VIDEO_KNOBS}
+    mode = (settings.ai_eval_video_visual_mode or "").strip().lower()
+    if mode:
+        out["video_visual_mode"] = mode
     return out
 
 
@@ -502,16 +550,30 @@ class Dispatcher:
                     for s in sources
                 ],
             }
-            # What the scorecard is about, for the image-description step (saved by ingest as context.json).
+            # What the scorecard is about, for the image and video-frame steps (saved by ingest as context.json), with
+            # the names of the KPIs it grades so the frame descriptions look for those steps.
             version = await db.get(ScorecardVersion, ev.scorecard_version_id)
             scorecard = await db.get(Scorecard, version.scorecard_id) if version else None
             if scorecard is not None:
                 payload["context"] = ScorecardContext.of(scorecard).payload()
+                rows = (
+                    await db.execute(
+                        select(KpiNode.id, KpiNode.parent_id, KpiNode.name, KpiNode.display_order).where(
+                            KpiNode.scorecard_version_id == ev.scorecard_version_id
+                        )
+                    )
+                ).all()
+                kpis = leaf_kpi_names(rows)
+                if kpis:
+                    payload["context"]["kpis"] = kpis
         # Which AI provider the Lambdas (image analysis, transcription) and later the scoring use for this run.
         provider = (
             providers.provider_of(self.bedrock) if self.bedrock is not None else await providers.active_provider()
         )
         payload["provider"] = provider
+        video = video_overrides(settings)
+        if video:  # per-run knobs of the AWS frame analysis; without them the Lambda defaults apply
+            payload["video"] = video
         name = execution_name(str(ev.id), ev.attempt)
         start = asyncio.ensure_future(asyncio.to_thread(self.aws.start_execution, name, payload))
         try:

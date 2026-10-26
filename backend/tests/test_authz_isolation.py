@@ -17,6 +17,7 @@ from sqlalchemy_utils import Ltree
 
 from app.deps import get_aws_jobs
 from app.main import app
+from app.models.chat_attachment import ChatAttachment
 from app.models.chat_message import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.evaluation import Evaluation
@@ -76,6 +77,11 @@ class World:
         db.add(self.chat)
         db.flush()
         db.add(ChatMessage(session_id=self.chat.id, role="user", content="bob's secret message"))
+        self.attachment = ChatAttachment(
+            user_id=self.b.id, session_id=self.chat.id, filename="secret.pdf", kind="pdf", size_bytes=10,
+            s3_key=f"chat/{self.b.id}/{uuid.uuid4()}.pdf", status="pending",
+        )
+        db.add(self.attachment)
         db.commit()
         self.b_key = f"uploads/{self.b.id}/{uuid.uuid4()}/{uuid.uuid4()}.pdf"
         self.b_batch_key = f"batches/{self.b.id}/{uuid.uuid4()}/{uuid.uuid4()}.xlsx"
@@ -176,6 +182,12 @@ def _cases(w: World) -> list[tuple[str, str, dict | None]]:
         ("POST", f"/api/v1/chat/sessions/{chat}/shares", {"identifier": "a@example.com"}),
         ("GET", f"/api/v1/chat/sessions/{chat}/shares", None),
         ("DELETE", f"/api/v1/chat/sessions/{chat}/shares/{uuid.uuid4()}", None),
+        # chat attachments are the uploader's own
+        (
+            "POST", f"/api/v1/chat/attachments/{w.attachment.id}/complete",
+            {"upload_id": "u", "parts": [{"part_number": 1, "etag": "e"}]},
+        ),
+        ("DELETE", f"/api/v1/chat/attachments/{w.attachment.id}", None),
     ]
 
 

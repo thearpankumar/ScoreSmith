@@ -139,7 +139,8 @@ async def test_research_fanout_writes_distinct_actor_events(async_db_session, se
     assert rows, "expected chat_turn_events rows to have been written"
 
     actors = {r.actor for r in rows}
-    assert actors == {"master", "research_agent_1", "research_agent_2"}, actors
+    # "assistant": the chat assistant that handed the message to the builder (app/ai/chat_agent.py).
+    assert actors == {"assistant", "master", "research_agent_1", "research_agent_2"}, actors
 
     # Every event's `turn_started_at` is correlated to THIS turn attempt.
     assert all(r.turn_started_at == turn_started_at for r in rows)
@@ -355,7 +356,7 @@ def test_events_visible_mid_flight_via_api(client: TestClient, seed_user_id: str
     assert events_r.status_code == 200, events_r.text
     events = events_r.json()
     actors = {e["actor"] for e in events}
-    assert actors == {"master", "research_agent_1", "research_agent_2"}
+    assert actors == {"assistant", "master", "research_agent_1", "research_agent_2"}
     # Ordered by created_at, ascending.
     timestamps = [e["created_at"] for e in events]
     assert timestamps == sorted(timestamps)

@@ -52,6 +52,9 @@ NO_FOREIGN_ID = {
     ("POST", "/api/v1/evaluations/ai/uploads/abort"),
     ("POST", "/api/v1/evaluations/ai/batches/parse"),
     ("POST", "/api/v1/chat/sessions"),  # creates a session for the caller (+ foreign target covered in the matrix)
+    # a new attachment of the caller (test_another_users_attachment_cannot_be_sent: foreign ids are refused on send)
+    ("POST", "/api/v1/chat/attachments"),
+    ("GET", "/api/v1/chat/config"),  # product-wide chat options, no per-user data
     # --- sharing / notifications / RBAC (tests/test_sharing.py, test_notifications.py, test_eval_page.py,
     # test_admin_users.py, test_user_slots.py): scoped to the caller, or admin-only (403) ---
     ("GET", "/api/v1/invitations"),  # the caller's own pending invitations
@@ -78,6 +81,7 @@ NO_FOREIGN_ID = {
     ("DELETE", "/api/v1/admin/users/{user_id}"),
     # product-wide AI provider setting: admin-only, no per-user data (tests/test_admin_ai_provider.py)
     ("GET", "/api/v1/admin/settings/ai-provider"),
+    ("PUT", "/api/v1/admin/settings/chat-models"),  # admin-only (test_only_admins_change_chat_models)
     ("PUT", "/api/v1/admin/settings/ai-provider"),
 }
 

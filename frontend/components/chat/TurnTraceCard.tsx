@@ -148,10 +148,13 @@ function RoundTrace({
   active: boolean;
   showHeader: boolean;
 }) {
+  // "assistant": the chat assistant that reads every message first (backend app/ai/chat_agent.py);
+  // "master": the scorecard builder; "research_agent_{n}": the builder's research workers.
+  const assistantEvents = events.filter((e) => e.actor === "assistant");
   const masterEvents = events.filter((e) => e.actor === "master");
-  const agentActors = Array.from(new Set(events.map((e) => e.actor).filter((a) => a !== "master"))).sort(
-    (a, b) => agentIndex(a) - agentIndex(b),
-  );
+  const agentActors = Array.from(
+    new Set(events.map((e) => e.actor).filter((a) => a !== "master" && a !== "assistant")),
+  ).sort((a, b) => agentIndex(a) - agentIndex(b));
 
   return (
     <div className="space-y-2.5">
@@ -160,6 +163,8 @@ function RoundTrace({
           Round {round}
         </div>
       )}
+
+      {assistantEvents.length > 0 && <ActorTrace label="Assistant" events={assistantEvents} active={active} />}
 
       {masterEvents.length > 0 && (
         <ActorTrace label="Master" events={masterEvents} active={active} />

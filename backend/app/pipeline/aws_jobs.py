@@ -72,6 +72,8 @@ class AwsJobsProtocol(Protocol):
     def start_execution(self, name: str, payload: dict[str, Any]) -> str: ...
     def describe_execution(self, arn: str) -> ExecutionInfo: ...
     def stop_execution(self, arn: str, cause: str) -> None: ...
+    # --- Lambda (synchronous; the chat-attachment extraction) ---
+    def invoke_function(self, name: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
 def read_progress(aws: AwsJobsProtocol, evaluation_id: str) -> dict[str, Any] | None:
@@ -96,6 +98,7 @@ class Boto3AwsJobs:
     def __init__(self) -> None:
         self._s3: Any = None
         self._sfn: Any = None
+        self._lambda: Any = None
         self._lock = threading.Lock()
 
     def _session_kwargs(self) -> dict[str, Any]:
@@ -134,6 +137,18 @@ class Boto3AwsJobs:
 
                 self._sfn = boto3.client("stepfunctions", **self._session_kwargs())
             return self._sfn
+
+    def _lambda_client(self) -> Any:
+        with self._lock:
+            if self._lambda is None:
+                import boto3
+                from botocore.config import Config
+
+                # A chat attachment's extraction can take a while on a big PDF; never retried here (the user retries).
+                self._lambda = boto3.client(
+                    "lambda", config=Config(read_timeout=180, retries={"max_attempts": 1}), **self._session_kwargs()
+                )
+            return self._lambda
 
     @staticmethod
     def _wrap(op: str, exc: Exception) -> AwsJobsError:
@@ -284,3 +299,24 @@ class Boto3AwsJobs:
             raise
         except Exception as exc:  # noqa: BLE001
             raise self._wrap("StopExecution", exc) from exc
+
+    # --- Lambda ---
+    def invoke_function(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Synchronous invoke (RequestResponse) -> the function's JSON result. A function error (an unhandled
+        exception in the handler) raises AwsJobsError like any other failure."""
+        try:
+            r = self._lambda_client().invoke(
+                FunctionName=name, InvocationType="RequestResponse", Payload=json.dumps(payload).encode("utf-8")
+            )
+            body = r["Payload"].read()
+        except AwsNotConfiguredError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise self._wrap("Invoke", exc) from exc
+        if r.get("FunctionError"):
+            raise AwsJobsError(f"AWS Invoke failed: {r['FunctionError']}: {body[:300]!r}")
+        try:
+            result = json.loads(body or b"{}")
+        except ValueError as exc:
+            raise AwsJobsError("AWS Invoke returned a non-JSON result.") from exc
+        return result if isinstance(result, dict) else {"result": result}
