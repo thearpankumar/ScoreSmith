@@ -713,6 +713,8 @@ def create_jobs(ctx: Ctx, folders: list[str]) -> list[str]:
     for f in folders:
         s = st_map[f]
         body_items.append({
+            # no e-mail (team folders): the folder name is the evaluation name, e.g. "Straw Hats"
+            **({} if s.email else {"name": s.folder}),
             "subject_email": s.email, "subject_name": s.name,
             "sources": [
                 {"kind": "upload", "s3_key": u["s3_key"], "original_name": u["original_name"], "size": u["size"]}

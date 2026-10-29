@@ -5,6 +5,9 @@
 # ///
 """Download each student's public Google Drive submission into GdriveDownload/<email-id>/.
 
+If the sheet has a "Team Name" column, submissions are keyed by team instead:
+GdriveDownload/<Team Name>/ (e.g. a two-column "Team Name | Drive Link" sheet).
+
 No Google API key / OAuth is needed: links are public, and `gdown` scrapes the
 public folder page (listing) and the public download endpoint (files).
 
@@ -13,6 +16,8 @@ Usage (uv installs the dependencies automatically):
     uv run scripts/gdrive_download.py --replace             # also overwrite files that changed
     uv run scripts/gdrive_download.py --force               # re-download everything
     uv run scripts/gdrive_download.py --only am8131 --dry-run
+    uv run scripts/gdrive_download.py --recursive --xlsx "Team Drive Links.xlsx" --out GdriveDownload
+                                                            # every file at any depth, folder structure kept
     uv run scripts/gdrive_download.py --clean               # wipe the whole GdriveDownload folder
     uv run scripts/gdrive_download.py --subfolders --xlsx "scripts/SampleFiles/Failed Evaluations.xlsx" \
         --out scripts/FailedGDriveDownload                  # students who nested their files in subfolders
@@ -99,11 +104,34 @@ def find_col(header: list, *needles: str) -> int:
     raise SystemExit(f"Could not find a column matching {needles} in header {header}")
 
 
+def read_teams(rows: list, c_team: int) -> dict[str, dict]:
+    """Team name -> {url, email, name}; first non-empty link per team wins."""
+    header = [c.value for c in rows[0]]
+    c_url = find_col(header, "drive", "url", "link")
+    teams: dict[str, dict] = {}
+    for n, row in enumerate(rows[1:], start=2):
+        team = str(row[c_team].value or "").strip()
+        cell = row[c_url]
+        url = str(cell.value or "").strip()
+        if not url.startswith("http") and cell.hyperlink:
+            url = cell.hyperlink.target or ""
+        if not team or team in teams:
+            continue
+        if not url.startswith("http"):
+            log(f"[warn] row {n}: team {team!r} has no usable URL ({url!r})")
+            continue
+        teams[safe_name(team)] = dict(url=url, email="", name=team)
+    return teams
+
+
 def read_submissions(xlsx: Path) -> dict[str, dict]:
-    """email-id -> {url, email, name} from the latest submission."""
+    """email-id -> {url, email, name} from the latest submission (or team name -> ... for team sheets)."""
     ws = openpyxl.load_workbook(xlsx).active
     rows = list(ws.iter_rows())
     header = [c.value for c in rows[0]]
+    c_team = next((i for i, h in enumerate(header) if h and "team name" in str(h).lower()), None)
+    if c_team is not None:
+        return read_teams(rows, c_team)
     c_email, c_url = find_col(header, "email"), find_col(header, "drive", "url", "link")
     c_ts = next((i for i, h in enumerate(header) if h and "timestamp" in str(h).lower()), None)
 
@@ -233,10 +261,12 @@ def doc_title(kind: str, doc_id: str) -> str:
 
 
 # --------------------------------------------------------------------------- core
-def list_remote(kind: str, rid: str, tries: int, subfolders: bool = False) -> tuple[list[tuple[str, str]], int]:
+def list_remote(kind: str, rid: str, tries: int, subfolders: bool = False,
+                recursive: bool = False) -> tuple[list[tuple[str, str]], int]:
     """Return ([(drive_id, filename)] of top-level files, number of files hidden in subfolders).
 
     With subfolders=True, pdf/docx/mp4 files at any depth are returned (flattened to their base name).
+    With recursive=True, every file at any depth is returned with its relative path.
     """
     if kind in ("folder", "open"):
         try:
@@ -249,6 +279,8 @@ def list_remote(kind: str, rid: str, tries: int, subfolders: bool = False) -> tu
                 raise
             files = None  # open?id= pointing at a single file
         if files is not None:
+            if recursive:
+                return [(f.id, f.path) for f in files], 0
             if subfolders:
                 keep = [(f.id, re.split(r"[\/]", f.path)[-1]) for f in files if f.path.lower().endswith(WANTED)]
                 return keep, len(files) - len(keep)
@@ -274,7 +306,7 @@ def process(sid: str, url: str, out: Path, args) -> dict:
         if kind in EXPORTS:
             remote, nested = [(rid, safe_name(doc_title(kind, rid)))], 0
         else:
-            remote, nested = list_remote(kind, rid, args.retries, args.subfolders)
+            remote, nested = list_remote(kind, rid, args.retries, args.subfolders, args.recursive)
     except Exception as e:
         log(f"[{sid}] FAIL listing: {short_err(e)}")
         stats["inaccessible"].append(short_err(e))
@@ -313,7 +345,10 @@ def process(sid: str, url: str, out: Path, args) -> dict:
             stats["aborted"] = True
             log(f"[{sid}] stopped before remaining files")
             break
-        name = safe_name(raw) if raw else ""
+        if raw and args.recursive:  # keep the relative path, sanitising each component
+            name = "/".join(safe_name(p) for p in re.split(r"[\\/]", raw) if p)
+        else:
+            name = safe_name(raw) if raw else ""
         # --- single-file link: learn the name by downloading into a scratch dir
         if not name:
             known = manifest.get(fid)
@@ -371,6 +406,8 @@ def process(sid: str, url: str, out: Path, args) -> dict:
             name = f"{stem} ({fid[:6]}){ext}"
         used_names.add(name)
         target = sdir / name
+        if not args.dry_run:
+            target.parent.mkdir(parents=True, exist_ok=True)
         known = manifest.get(fid)
         on_disk = target.exists() and target.stat().st_size > 0
 
@@ -446,7 +483,7 @@ def summary_entry(info: dict, st: dict) -> dict | None:
     if not (st["issue"] or st["inaccessible"]):
         return None
     return dict(
-        label=f"{info['email']} - {info['name'] or '(no name)'}",
+        label=f"{info['email']} - {info['name'] or '(no name)'}" if info["email"] else info["name"],
         url=info["url"], empty=st["issue"], inaccessible=st["inaccessible"],
     )
 
@@ -518,6 +555,7 @@ def main() -> int:
     ap.add_argument("--only", nargs="+", metavar="ID", help="only these email ids (e.g. am8131) ")
     ap.add_argument("--ext", nargs="+", metavar="EXT", type=str.lower, help="only download files with these extensions (e.g. pdf docx)")
     ap.add_argument("--subfolders", action="store_true", help="also look inside subfolders, but only fetch pdf/docx/mp4 (flattened into <id>/)")
+    ap.add_argument("--recursive", action="store_true", help="download every file at any depth, keeping the folder structure")
     ap.add_argument("--clean", action="store_true", help="delete the entire output folder (all downloads, manifests, summary) and exit")
     ap.add_argument("--yes", action="store_true", help="with --clean: skip the confirmation prompt")
     ap.add_argument("--dry-run", action="store_true", help="show what would happen, download nothing")
@@ -535,8 +573,8 @@ def main() -> int:
     subs = read_submissions(xlsx)
     if args.only:
         want = {s.lower().split("@")[0] for s in args.only}
-        subs = {k: v for k, v in subs.items() if k in want}
-    log(f"{len(subs)} students from {xlsx.name} -> {args.out}"
+        subs = {k: v for k, v in subs.items() if k.lower() in want}
+    log(f"{len(subs)} submissions from {xlsx.name} -> {args.out}"
         f"{'  [dry-run]' if args.dry_run else ''}{'  [replace]' if args.replace else ''}{'  [force]' if args.force else ''}")
 
     total = dict(new=0, replaced=0, skipped=0, failed=0)
@@ -596,7 +634,7 @@ def main() -> int:
             log("Forced quit.")
     # a hard quit can leave half-written downloads; they are never promoted, just remove them
     if interrupted and not args.dry_run:
-        for part in args.out.glob("*/*.part"):
+        for part in args.out.glob("*/**/*.part"):
             part.unlink(missing_ok=True)
         for tmp in args.out.glob("*/.tmp_*"):
             shutil.rmtree(tmp, ignore_errors=True)

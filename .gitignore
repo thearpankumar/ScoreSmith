@@ -43,3 +43,11 @@ scripts/GdriveDownload/
 scripts/FailedGDriveDownload/
 scripts/SampleFiles/
 creds.txt
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# Postgres dumps / backups: contain user accounts and evaluation data, never committed.
+*.dump
+*.dump.gz
+*.backup
