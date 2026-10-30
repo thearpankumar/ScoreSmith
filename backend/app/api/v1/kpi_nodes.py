@@ -249,11 +249,12 @@ async def update_kpi_node(
     for field, value in changes.items():
         setattr(node, field, value)
     weight_only = set(changes) == {"weight"}
-    summary = (
-        f"Changed the weight of {node.name} to {float(node.weight):g}"
-        if weight_only
-        else f"Edited KPI {old_name} ({', '.join(sorted(changes))})"
-    )
+    if weight_only and node.weight is None:  # a category's weight cleared (categories carry none)
+        summary = f"Cleared the weight of {node.name}"
+    elif weight_only:
+        summary = f"Changed the weight of {node.name} to {float(node.weight):g}"
+    else:
+        summary = f"Edited KPI {old_name} ({', '.join(sorted(changes))})"
     await log_edit(
         db, await _scorecard_of_node(db, node), current_user,
         "weights_changed" if weight_only else "kpi_updated", summary,

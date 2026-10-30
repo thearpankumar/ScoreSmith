@@ -136,7 +136,6 @@ def _cases(w: World) -> list[tuple[str, str, dict | None]]:
         ("GET", f"/api/v1/evaluations/{ev}", None),
         ("PATCH", f"/api/v1/evaluations/{ev}", {"name": "hijacked"}),
         ("DELETE", f"/api/v1/evaluations/{ev}", None),
-        ("POST", f"/api/v1/evaluations/{ev}/run", {"input_text": "x"}),
         ("POST", f"/api/v1/evaluations/{ev}/finalize", None),
         ("GET", f"/api/v1/evaluations/{ev}/results", None),
         ("POST", f"/api/v1/evaluations/{ev}/results", {"kpi_node_id": node, "score": 5}),

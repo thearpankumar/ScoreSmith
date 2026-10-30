@@ -9,6 +9,8 @@ results) and a small step budget. Per message it either:
 - **edits** the current draft's KPIs (`edit_kpis`: applied by the builder's `update_draft` node, rubrics for new KPIs
   written on the builder's model), sets its scoring formula (applied here), **saves** it, or **asks** one chip
   question;
+- **fixes rubrics** of one KPI, a set or a whole category (`review_rubrics`, `research_kpis`, `rewrite_guidelines`,
+  `set_kpi_guidelines` in app/ai/kpi_rubric_tools.py): applied here, step by step, so it can check and go on;
 - **hands off** to the scorecard builder (`build_scorecard`): the research + drafting pipeline, which runs on the
   builder's own model (OPENROUTER_KPI_MODEL on OpenRouter).
 
@@ -28,6 +30,7 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
+from app.ai import kpi_rubric_tools as rubric
 from app.ai import scorecard_builder as sb
 from app.ai.attachments import AttachmentContext
 from app.ai.bedrock_client import BedrockClientProtocol, ConverseResult, ToolCall, ToolSpec
@@ -43,8 +46,11 @@ logger = logging.getLogger(__name__)
 ACTOR = "assistant"
 # Model calls per message (lookups + the final answer), and web searches per message (the session-wide cap is the
 # builder's own MAX_WEB_SEARCH_CALLS_PER_SESSION, shared with it).
-MAX_AGENT_STEPS = 6
+MAX_AGENT_STEPS = 12
 MAX_AGENT_SEARCHES = 3
+# research_kpis searches: per message, and per session (its own budget, separate from the builder's).
+MAX_RUBRIC_SEARCHES = 16
+MAX_RUBRIC_SEARCHES_PER_SESSION = 60
 # How much of the conversation the assistant re-reads each message.
 HISTORY_TURNS = 30
 # Draft outline lines in the system prompt (a 200-KPI scorecard is summarised, never truncated silently).
@@ -98,8 +104,8 @@ VIEW_KPIS_TOOL = ToolSpec(
     name="view_kpis",
     description=(
         "Show the full details of KPIs in the current draft: weight, level, parent, scoring flag and the 0-10 "
-        "guideline text. The system prompt only lists names and weights, so call this before explaining or "
-        "rewriting a KPI's rubric."
+        "guideline text with each level's threshold. The system prompt only lists names and weights, so call this "
+        "before explaining or rewriting a KPI's rubric."
     ),
     input_schema={
         "type": "object",
@@ -115,10 +121,11 @@ EDIT_KPIS_TOOL = ToolSpec(
     name="edit_kpis",
     description=(
         "Change the current draft's existing KPIs with a SMALL list of operations: change a weight, rename, remove, "
-        "add a few KPIs, move one to another category, include/exclude from scoring, regenerate one rubric. The "
+        "add a few KPIs, move one to another category, include/exclude from scoring. The "
         "server applies them, rebalances every leaf weight to exactly 100 and writes the guidelines of added or "
-        "regenerated KPIs itself, then shows the user a before/after summary. Copy KPI names exactly. For a "
-        "wholesale restructuring or a brand-new scorecard use build_scorecard instead."
+        "regenerated KPIs itself, then shows the user a before/after summary. Copy KPI names exactly. To improve "
+        "guidelines use rewrite_guidelines / set_kpi_guidelines instead. For a wholesale restructuring or a "
+        "brand-new scorecard use build_scorecard instead."
     ),
     input_schema=sb.EDIT_KPIS_TOOL.input_schema,
 )
@@ -195,7 +202,14 @@ Answer the user's LATEST message. Decide what it needs:
 - A question, explanation, comparison, opinion or small talk -> answer it directly in plain text (Markdown is \
 fine). Use web_search first when current or checkable facts matter, and cite sources as Markdown links.
 - A small change to the current draft's existing KPIs (weights, names, removing or adding a few KPIs, moving, \
-include/exclude, rewriting one rubric) -> edit_kpis. How the score is computed -> update_scoring_formula.
+include/exclude) -> edit_kpis. How the score is computed -> update_scoring_formula.
+- Improving guidelines / rubrics / "the scoring is unsure or wrong" for one KPI, several, a category or all of them \
+-> work on the rubrics directly, in as many steps as it takes: review_rubrics first (it shows how sure the \
+evaluation scorer was on this chart's past evaluations, and the problems in each rubric), research_kpis when real \
+benchmarks would help, then rewrite_guidelines (whole rubrics, a category or a list at a time) or \
+set_kpi_guidelines (exact levels you write yourself, e.g. only levels 4-7), then review_rubrics again on what you \
+changed. Good levels state an observable condition with the count / percentage / time that separates each level \
+from its neighbours. Rubric changes apply to the draft; tell the user to save it to update the chart.
 - "Save it" / "looks good, save" -> save_scorecard.
 - A new scorecard, a scorecard built from an attached file, a large restructuring, or regenerating the draft -> \
 build_scorecard with a clear brief. The builder does the research and drafting; do not draft KPIs yourself in text.
@@ -289,7 +303,7 @@ def _view_kpis(draft: ScorecardDraft, names: Any) -> str:
                 "weight": kpi.weight,
                 "included_in_scoring": kpi.included_in_scoring,
                 "guidelines": {
-                    level: g.qualitative_text
+                    level: rubric.view_line(g)
                     for level, g in sorted(kpi.guidelines.items(), key=lambda item: int(item[0]))
                 },
             }
@@ -401,6 +415,10 @@ async def converse(state: sb.BuilderState, config: RunnableConfig) -> dict[str, 
     tools: list[ToolSpec] = [BUILD_SCORECARD_TOOL, ASK_USER_TOOL]
     if has_kpis:
         tools += [VIEW_KPIS_TOOL, EDIT_KPIS_TOOL, UPDATE_SCORING_FORMULA_TOOL, SAVE_SCORECARD_TOOL]
+        tools += [t for t in rubric.TOOLS if t.name != "research_kpis" or web_search_client is not None]
+    rubric_session = rubric.RubricSession()
+    rubric_searches_before = int(state.get("rubric_searches_used") or 0)
+    rubric_searches = 0
     if web_search_client is not None:
         tools.append(WEB_SEARCH_TOOL)
     if attachments is not None and attachments.files:
@@ -438,13 +456,15 @@ async def converse(state: sb.BuilderState, config: RunnableConfig) -> dict[str, 
             break
         if not calls:
             await emit_turn_event(session_id, turn_started_at, ACTOR, "completed", "Answered.")
-            return {**base, **_answer(result.text, draft, state, searches_before + searches)}
+            return {**base, **_answer(result.text, draft, state, searches_before + searches),
+                    "rubric_searches_used": rubric_searches_before + rubric_searches}
 
         terminal = next((c for c in calls if c.name in _TERMINAL_TOOLS), None)
         if terminal is not None:
             update = await _terminal(terminal, result, draft, state, client, builder_model_id, configurable)
             return {**base, "draft": draft.model_dump(mode="json"),
-                    "web_search_calls_used": searches_before + searches, **update}
+                    "web_search_calls_used": searches_before + searches,
+                    "rubric_searches_used": rubric_searches_before + rubric_searches, **update}
         if last_step:
             break
 
@@ -477,6 +497,16 @@ async def converse(state: sb.BuilderState, config: RunnableConfig) -> dict[str, 
             elif call.name == "view_kpis":
                 await emit_turn_event(session_id, turn_started_at, ACTOR, "reading", "Looking at KPI details…")
                 text = _view_kpis(draft, call.input.get("names"))
+            elif call.name in rubric.TOOL_NAMES:
+                draft, text, used = await _rubric_tool(
+                    call, draft, state, client, builder_model_id, web_search_client, rubric_session,
+                    budget=min(
+                        MAX_RUBRIC_SEARCHES - rubric_searches,
+                        MAX_RUBRIC_SEARCHES_PER_SESSION - rubric_searches_before - rubric_searches,
+                    ),
+                    turn_started_at=turn_started_at,
+                )
+                rubric_searches += used
             elif call.name == "update_scoring_formula":
                 new_draft, text = _set_formula(draft, call.input.get("formula"))
                 if new_draft is not None:
@@ -491,7 +521,54 @@ async def converse(state: sb.BuilderState, config: RunnableConfig) -> dict[str, 
     # Step budget used up (or an empty truncated reply): answer with what the model said last, if anything.
     logger.warning("chat agent ended without a final answer (session=%s).", session_id)
     await emit_turn_event(session_id, turn_started_at, ACTOR, "completed", "Answered.")
-    return {**base, **_answer(None, draft, state, searches_before + searches)}
+    return {**base, **_answer(None, draft, state, searches_before + searches),
+            "rubric_searches_used": rubric_searches_before + rubric_searches}
+
+
+async def _rubric_tool(
+    call: ToolCall,
+    draft: ScorecardDraft,
+    state: sb.BuilderState,
+    client: BedrockClientProtocol,
+    builder_model_id: str | None,
+    web_search_client: WebSearchClientProtocol | None,
+    rs: rubric.RubricSession,
+    *,
+    budget: int,
+    turn_started_at: datetime | None,
+) -> tuple[ScorecardDraft, str, int]:
+    """Runs one rubric tool (app/ai/kpi_rubric_tools.py). Returns the draft (changed by rewrite / set), the tool
+    result and the number of web searches made."""
+    session_id = state["session_id"]
+    args = call.input or {}
+    if rs.health is None and call.name in ("review_rubrics", "rewrite_guidelines"):
+        rs.health = await rubric.scoring_health(await rubric.target_scorecard_id(session_id))
+    if call.name == "review_rubrics":
+        await emit_turn_event(session_id, turn_started_at, ACTOR, "reading", "Reviewing the KPI guidelines…")
+        return draft, rubric.review_text(draft, args, rs.health or {}), 0
+    if call.name == "research_kpis":
+        if web_search_client is None or budget <= 0:
+            return draft, "research_kpis is not available for the rest of this message: use what you have.", 0
+        count = len(args.get("kpis") or [])
+        await emit_turn_event(
+            session_id, turn_started_at, ACTOR, "searching", f"Researching {min(count, budget)} KPI(s)…"
+        )
+        text, used = await rubric.research(draft, args, web_search_client, rs, budget)
+        return draft, text, used
+    if call.name == "rewrite_guidelines":
+        await emit_turn_event(session_id, turn_started_at, ACTOR, "guidelines", "Rewriting KPI guidelines…")
+        new_draft, text = await rubric.rewrite(
+            draft, args, rs, client, builder_model_id, sb._conversation_context_text(state.get("messages") or [])
+        )
+        if new_draft is not draft:
+            await emit_turn_event(session_id, turn_started_at, ACTOR, "guidelines", text.splitlines()[0])
+        return new_draft, text, 0
+    # set_kpi_guidelines
+    new_draft, text = rubric.set_levels(draft, args)
+    if new_draft is None:
+        return draft, text, 0
+    await emit_turn_event(session_id, turn_started_at, ACTOR, "guidelines", text.splitlines()[0])
+    return new_draft, text, 0
 
 
 def _answer(text: str | None, draft: ScorecardDraft, state: sb.BuilderState, searches_used: int) -> dict[str, Any]:

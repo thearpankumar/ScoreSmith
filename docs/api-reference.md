@@ -115,7 +115,6 @@ All `Admin`, rate limited (`RATE_LIMIT_ADMIN`), audit logged. Rules: never yours
 | GET / PATCH / DELETE | `/evaluations/{evaluation_id}` | Scoped | Read (with results) / update name, score, band, client-settable status / delete (finished rows) |
 | GET / POST | `/evaluations/{evaluation_id}/results` | Scoped | Per-KPI results / add one (manual scoring) |
 | PATCH / DELETE | `/evaluations/{evaluation_id}/results/{result_id}` | Scoped | Edit / delete a KPI result |
-| POST | `/evaluations/{evaluation_id}/run` | Scoped | Legacy synchronous text-only ensemble judge (UI no longer uses it) |
 | POST | `/evaluations/{evaluation_id}/finalize` | Scoped | Manual scoring: compute final score and RAG band |
 | GET | `/evaluations/{evaluation_id}/progress` | Scoped | Status, stage, queue position, per-file state, event log |
 | POST | `/evaluations/{evaluation_id}/cancel` | Scoped | Cancel (202): `failed` + `error_code=cancelled` |

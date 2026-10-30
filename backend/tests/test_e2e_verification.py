@@ -361,6 +361,22 @@ def test_direct_kpi_edit_on_published_scorecard_persists(client: TestClient, see
     r = client.get(f"/api/v1/kpi-nodes/{correctness_id}")
     assert float(r.json()["weight"]) == 30.0
 
+    # --- A KPI that gets children becomes a category: its weight can be cleared (used to crash with a 500 while
+    # writing the activity summary for a None weight).
+    r = client.post(
+        f"/api/v1/scorecard-versions/{version['id']}/kpi-nodes/bulk",
+        json={"nodes": [
+            {"parent_id": speed_id, "level": 2, "name": f"Speed part {i}", "weight": 35, "display_order": i,
+             "guidelines": [{"score_level": 10, "qualitative_text": f"Part {i}."}]}
+            for i in range(2)
+        ]},
+        headers={"X-User-Id": user["id"]},
+    )
+    assert r.status_code == 201, r.text
+    r = client.patch(f"/api/v1/kpi-nodes/{speed_id}", json={"weight": None}, headers={"X-User-Id": user["id"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["weight"] is None
+
 
 # --- Section 2b: version-bump edit preserving the old version + its evaluations ---------
 

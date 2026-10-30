@@ -21,7 +21,6 @@ import type {
   ChatSessionStatus,
   ChatTurnEvent,
   ClarifyingQuestion,
-  CreateEvaluationInput,
   DraftKpi,
   Evaluation,
   EvaluationKpiResult,
@@ -62,10 +61,10 @@ import type {
  *
  * --- Bedrock-unavailable errors ---
  * Endpoints backed by AWS Bedrock (`POST /chat/sessions[...]`, `POST
- * /scorecards/suggest-similar`, `POST /evaluations/{id}/run`) return HTTP 502 with a
+ * /scorecards/suggest-similar`) return HTTP 502 with a
  * `{"detail": "..."}` body when Bedrock is unreachable (see
  * `backend/app/ai/bedrock_client.py::BedrockUnavailableError`, surfaced as 502 by each
- * router — see `chat.py`, `scorecards.py`, `evaluations.py`). `apiFetch` turns that into
+ * router — see `chat.py`, `scorecards.py`). `apiFetch` turns that into
  * a typed `BedrockUnavailableError` here so components can show a specific, friendly
  * message instead of a generic failure or an uncaught crash.
  */
@@ -1228,54 +1227,6 @@ export async function getEvaluation(id: string): Promise<Evaluation | undefined>
   return mapEvaluation(be, ctx);
 }
 
-/**
- * Creates a real evaluation row (`POST /api/v1/evaluations`), then runs the Bedrock
- * judge against it (`POST /api/v1/evaluations/{id}/run`) — matching the two real
- * backend calls this one mock function used to fake locally. If the judge run fails
- * because Bedrock is unavailable, the evaluation is NOT thrown away: the backend still
- * persists it (status "failed"), and this function returns that persisted evaluation
- * with `judgeError` set, so the caller can still navigate to a result page that
- * explains what happened (see EvaluationResultView's `notScored` branch) instead of
- * losing the user's input to an uncaught exception.
- */
-export async function createEvaluation(input: CreateEvaluationInput): Promise<Evaluation> {
-  const scorecard = await fetchBeScorecard(input.scorecardId);
-  if (!scorecard || !scorecard.current_version_id) {
-    throw new ApiError(`Scorecard ${input.scorecardId} has no active version to evaluate against.`, 422);
-  }
-
-  const created = await apiFetch<BeEvaluation>("/api/v1/evaluations", {
-    method: "POST",
-    body: {
-      scorecard_version_id: scorecard.current_version_id,
-      name: input.name,
-      input_reference: { summary: input.inputSummary },
-      domain: scorecard.domain,
-    },
-  });
-
-  let finalBe = created;
-  let judgeError: string | undefined;
-  try {
-    finalBe = await apiFetch<BeEvaluation>(`/api/v1/evaluations/${created.id}/run`, {
-      method: "POST",
-      body: { input_text: input.inputText },
-    });
-  } catch (err) {
-    if (!(err instanceof BedrockUnavailableError)) throw err;
-    judgeError = err.message;
-    // The run endpoint marks the row FAILED server-side even though the HTTP response
-    // itself was an error — re-fetch to pick up that persisted status.
-    finalBe = await apiFetch<BeEvaluation>(`/api/v1/evaluations/${created.id}`);
-  }
-
-  const ctx = await buildEnrichmentContext([finalBe]);
-  const evaluation = mapEvaluation(finalBe, ctx);
-  if (judgeError) evaluation.judgeError = judgeError;
-  cacheEvaluation(evaluation);
-  return evaluation;
-}
-
 export interface ManualKpiScore {
   kpiNodeId: string;
   score: number; // 0-10 integer, picked from the anchored guideline levels
@@ -1601,7 +1552,7 @@ export async function getAiBatch(id: string, signal?: AbortSignal): Promise<AiBa
  * Browser-only legacy fallback for evaluations that fail to load from the real backend
  * (e.g. transient network issue in the browser tab). Normal operation never needs this
  * any more — real evaluations are persisted server-side and `getEvaluation` finds them
- * directly — but `createEvaluation` still best-effort mirrors the result here so
+ * directly — but `createManualEvaluation` still best-effort mirrors the result here so
  * `EvaluationResultClientLoader` keeps working as a fallback.
  */
 export function getCachedEvaluation(id: string): Evaluation | undefined {

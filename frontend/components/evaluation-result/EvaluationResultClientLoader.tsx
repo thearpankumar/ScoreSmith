@@ -10,7 +10,7 @@ import type { Evaluation, KpiNode } from "@/lib/types";
 
 /**
  * Client-side fallback for evaluations that were created on the fly in the
- * Evaluate tab (see lib/api-client.ts createEvaluation). There's no real
+ * Evaluate tab (see lib/api-client.ts createManualEvaluation). There's no real
  * backend yet, so those only exist in this browser tab's sessionStorage —
  * the server-rendered page can't see them, hence this small client loader.
  * Evaluations already in the static mock dataset never hit this path; they

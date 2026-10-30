@@ -5,9 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from app.ai.judge import run_judge
 from app.models.enums import EvaluationStatus
-from app.models.evaluation import Evaluation
 from app.pipeline.dispatcher import Dispatcher
 from app.pipeline.scorecard_context import ScorecardContext
 from tests.ai_eval_helpers import get_eval, seed_queued, seed_scorecard
@@ -16,8 +14,6 @@ from tests.fakes import (
     FakeBedrockClient,
     FakeJevScoreClient,
     master_converse_fn,
-    text_result,
-    tool_use_result,
 )
 
 NAME = "Billing Support QA"
@@ -98,22 +94,3 @@ async def test_the_fallback_judge_gets_the_scorecard_context_too(async_db_sessio
     assert (await get_eval(ev.id)).status == EvaluationStatus.COMPLETED
     assert seen.get("record_kpi_judgment")
     assert all(PURPOSE in told for told in seen["record_kpi_judgment"])
-
-
-async def test_a_manual_judge_run_scores_with_the_scorecard_context(async_db_session) -> None:
-    owner, version = await _seed(async_db_session)
-    evaluation = Evaluation(scorecard_version_id=version.id, name="Manual run", evaluated_by=owner.id)
-    async_db_session.add(evaluation)
-    await async_db_session.commit()
-    prompts: list[str] = []
-
-    def converse_fn(*, messages, system, tools, force_tool_use, model_id):
-        if not tools:
-            return text_result("Evidence: the agent refunded the duplicate charge on the first call.")
-        prompts.append(messages[0]["content"][0]["text"])
-        return tool_use_result("record_kpi_judgment", {"matched_level": 7, "evidence_quotes": [],
-                                                       "reasoning": "Resolved on first contact.", "score": 7})
-
-    await run_judge(async_db_session, evaluation, "The agent refunded the duplicate charge on the first call.",
-                    FakeBedrockClient(converse_fn=converse_fn))
-    assert prompts and all(NAME in p and PURPOSE in p for p in prompts)

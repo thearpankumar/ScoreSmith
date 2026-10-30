@@ -265,7 +265,8 @@ async def test_draft_tools_are_offered_only_when_there_is_a_draft() -> None:
     await sb.send_message(session_id, "hi again", fake, web_search_client=FakeWebSearchClient())
     offered = {t.name for t in fake.agent_calls[1]["tools"]}
     assert offered == {"build_scorecard", "ask_user", "view_kpis", "edit_kpis", "update_scoring_formula",
-                       "save_scorecard", "web_search"}
+                       "save_scorecard", "web_search", "review_rubrics", "research_kpis", "rewrite_guidelines",
+                       "set_kpi_guidelines"}
     assert "KPI 0 (25%)" in fake.agent_calls[1]["system"]
 
 

@@ -49,8 +49,8 @@ export function EvaluationResultView({ evaluation, kpiNodes }: { evaluation: Eva
               {evaluation.status === "failed" ? "This evaluation could not be scored" : "This evaluation hasn’t finished scoring"}
             </p>
             <p className="mt-1 text-sm text-ink-muted">
-              {evaluation.judgeError ??
-                "The AI judge is unavailable right now, so no score or KPI breakdown was produced. Run it again once the AI service is reachable."}
+              The AI judge is unavailable right now, so no score or KPI breakdown was produced. Run it again once the AI
+              service is reachable.
             </p>
           </div>
         </GlassCard>

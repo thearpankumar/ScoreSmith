@@ -15,7 +15,7 @@
 
 **Score Smith** (formerly "KPI Metrics" / Quality Scorecard System; the app sidebar still reads "Quality Scorecards") is a generic scorecard creation and rating system, think Google Forms for quality
 scorecards. A user *defines* what quality means for any domain (a weighted, hierarchical set of KPIs with 11-level qualitative and quantitative guidelines) through a chat-driven, research-grounded builder,
-then applies it consistently: by hand, with an ensemble LLM judge, or with an AI pipeline that reads real submissions (videos, PDFs, Word documents, Google Drive folders, whole spreadsheets of them) and returns
+then applies it consistently: by hand, or with an AI pipeline that reads real submissions (videos, PDFs, Word documents, Google Drive folders, whole spreadsheets of them) and returns
 a reasoned, evidence-cited, RAG-banded score. Teams share charts and chats, see each other's evaluations and get notified. It is built against TalenciaGlobal's Quality Scorecard Framework and
 Data-Driven Development Framework (`References/`).
 
@@ -37,7 +37,7 @@ Data-Driven Development Framework (`References/`).
 - Chat turns run as background jobs with a live trace, cancel button and refresh-safe resume.
 
 **Evaluating**
-- Manual scoring, an ensemble LLM judge for pasted text, and an **AI pipeline** for real submissions: uploads and Drive links go through AWS Step Functions + Lambda (extract, transcribe, OCR), then Llama 4 Maverick selects evidence and Jev scores it.
+- Manual scoring and an **AI pipeline** for real submissions: uploads and Drive links go through AWS Step Functions + Lambda (extract, transcribe, OCR), then Llama 4 Maverick selects evidence and Jev scores it.
 - Spreadsheet batches (any column layout), queue with per-user fairness, progress, cancel, retry; infinite-scroll evaluations list with server-side filters, select-all-matching, bulk delete and Excel export.
 
 **Teams and accounts**

@@ -7,7 +7,7 @@ relevant evidence for this KPI?") riding in the SAME call: noul < 0.10 gives sco
 ({position, probabilities, confidence, noul}) is stored in `evaluation_kpi_results.jev_raw`.
 
 Failure policy: two retries with backoff, then fall back to ONE GLM judge call
-(`app.ai.judge._judge_one_kpi_call`), always flagged `needs_review=True`.
+(`app.ai.judge.judge_one_kpi_call`), always flagged `needs_review=True`.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import httpx
 
 from app.ai.bedrock_client import BedrockClientProtocol
 from app.ai.jev_client import _DECISIONS_URL, JevClient, JevUnavailableError
-from app.ai.judge import _judge_one_kpi_call
+from app.ai.judge import judge_one_kpi_call
 from app.models.kpi_guideline import KpiGuideline
 from app.models.kpi_node import KpiNode
 from app.pipeline.scorecard_context import ScorecardContext
@@ -301,7 +301,7 @@ async def _fallback_score(
     context: ScorecardContext | None = None,
 ) -> KpiScore:
     evidence_text = "\n".join(f"- {e}" for e in evidence)
-    call = await _judge_one_kpi_call(
+    call = await judge_one_kpi_call(
         bedrock, model_id, kpi, sorted(guidelines, key=lambda g: g.score_level), evidence_text, evidence_text,
         context_block=context.prompt_block() if context else "",
     )

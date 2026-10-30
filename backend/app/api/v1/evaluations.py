@@ -4,7 +4,6 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,13 +11,11 @@ from sqlalchemy.orm import selectinload
 
 from app import idempotency as idem
 from app.activity import log_edit
-from app.ai.bedrock_client import BedrockClientProtocol, BedrockUnavailableError
-from app.ai.judge import compute_final_score, effective_leaf_weights, leaf_nodes, run_judge
-from app.ai.providers import models_of
+from app.ai.judge import compute_final_score, effective_leaf_weights, leaf_nodes
 from app.audit import audit
 from app.authz import accessible_evaluations, get_accessible_evaluation, get_accessible_version
 from app.db import get_db
-from app.deps import get_bedrock_client, get_current_user
+from app.deps import get_current_user
 from app.models.enums import AuditAction, EvaluationStatus, rag_band_for_score
 from app.models.evaluation import Evaluation
 from app.models.evaluation_kpi_result import EvaluationKpiResult
@@ -39,48 +36,6 @@ from app.schemas.evaluation import (
 router = APIRouter(prefix="/evaluations", tags=["evaluations"])
 
 
-class EvaluationRunRequest(BaseModel):
-    input_text: str
-
-
-@router.post("/{evaluation_id}/run", response_model=EvaluationReadWithResults)
-async def run_evaluation(
-    evaluation_id: uuid.UUID,
-    payload: EvaluationRunRequest,
-    db: AsyncSession = Depends(get_db),
-    bedrock: BedrockClientProtocol = Depends(get_bedrock_client),
-    current_user: User = Depends(get_current_user),
-) -> Evaluation:
-    """Runs the LLM judge (see app/ai/judge.py) against `payload.input_text` for every
-    leaf KPI under this evaluation's scorecard version, and persists per-KPI results plus
-    the weighted final score / RAG band onto the existing `evaluations` /
-    `evaluation_kpi_results` rows."""
-    evaluation = await get_accessible_evaluation(db, current_user, evaluation_id)
-
-    # Keep a record of what was actually judged (input_reference is documented as
-    # free-form JSONB metadata about the evaluated input — see data_dictionary.md).
-    evaluation.input_reference = {**(evaluation.input_reference or {}), "text": payload.input_text}
-    await db.flush()
-
-    try:
-        await run_judge(db, evaluation, payload.input_text, bedrock, judge_model_id=models_of(bedrock).judge)
-    except BedrockUnavailableError as exc:
-        evaluation.status = EvaluationStatus.FAILED
-        await db.commit()
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-    except ValueError as exc:
-        evaluation.status = EvaluationStatus.FAILED
-        await db.commit()
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
-
-    result = await db.execute(
-        select(Evaluation)
-        .where(Evaluation.id == evaluation_id)
-        .options(selectinload(Evaluation.kpi_results))
-    )
-    return result.scalar_one()
-
-
 @router.post("/{evaluation_id}/finalize", response_model=EvaluationReadWithResults)
 async def finalize_evaluation(
     evaluation_id: uuid.UUID,
@@ -92,8 +47,8 @@ async def finalize_evaluation(
     whatever `EvaluationKpiResult` rows already exist for this evaluation (posted one per
     leaf KPI via `POST /{id}/results` — see the "Score manually" flow in
     `frontend/components/chart-detail/EvaluateTab.tsx`), via the SAME
-    `app/ai/judge.py::compute_final_score` the AI judge path (`POST /{id}/run` -> `run_judge`
-    above) uses — honoring the scorecard version's custom `scoring_formula` if it has one,
+    `app/ai/judge.py::compute_final_score` the AI scoring
+    graph (`app/pipeline/graph.py`) uses — honoring the scorecard version's custom `scoring_formula` if it has one,
     falling back byte-for-byte to the classic weighted average otherwise. This is the one
     shared server-side computation both scoring paths go through, so they can never
     silently disagree about what a scorecard's score means (previously the manual path

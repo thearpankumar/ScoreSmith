@@ -5433,6 +5433,9 @@ class BuilderState(TypedDict):
     build_brief: str | None
     answered_question: dict[str, Any] | None
     question_from: str | None
+    # Web searches the assistant's `research_kpis` tool has made in this session (app/ai/kpi_rubric_tools.py): a
+    # budget of its own, so per-KPI rubric research never eats the builder's MAX_WEB_SEARCH_CALLS_PER_SESSION.
+    rubric_searches_used: int
 
 
 def initial_state(session_id: str, first_user_message: str) -> BuilderState:

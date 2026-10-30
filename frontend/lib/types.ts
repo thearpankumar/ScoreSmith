@@ -132,13 +132,6 @@ export interface Evaluation {
   queuedAt?: string | null;
   startedAt?: string | null;
   finishedAt?: string | null;
-  /**
-   * Set by the api-client mapping layer when `POST /evaluations/{id}/run` fails with a
-   * `BedrockUnavailableError` (502) — the evaluation row itself is still created and
-   * persisted (status "failed"), just never scored. Lets result pages show a specific,
-   * friendly explanation instead of a table of zeros. Absent for normal evaluations.
-   */
-  judgeError?: string;
 }
 
 export interface EvaluationKpiResult {
@@ -336,13 +329,6 @@ export interface ScorecardFilters {
   domain?: string;
   owner?: string;
   status?: ScorecardStatus | "all";
-}
-
-export interface CreateEvaluationInput {
-  scorecardId: string;
-  name: string;
-  inputSummary: string;
-  inputText: string;
 }
 
 // ---------------------------------------------------------------------------

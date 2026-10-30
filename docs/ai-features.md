@@ -1,6 +1,6 @@
 # AI features in depth
 
-The chat scorecard builder, the ensemble judge and the AI evaluation pipeline for real submissions, with their flows,
+The chat scorecard builder and the AI evaluation pipeline for real submissions, with their flows,
 limits and measured performance. This page is the detailed companion of the [root README](../README.md); the
 system-level picture (processes, auth, sharing, data model) is in [architecture.md](architecture.md), and every
 environment variable is in [configuration.md](configuration.md).
@@ -20,6 +20,7 @@ environment variable is in [configuration.md](configuration.md).
 - **Genuine multi-agent, CATEGORY-based research fan-out (open-ended mode)** — before the first KPI is ever proposed, the graph decides named, business-recognizable KPI categories for the user's domain (e.g. "Schedule", "Budget", "Quality" for a project-milestone scorecard), then runs one independent research agent per category *concurrently* (`asyncio.gather`, not sequentially), each with its own real web-search budget via an AWS Bedrock AgentCore Gateway MCP tool. Each agent proposes its **own** batch of grounded KPIs nested under its category; their 11-level guidelines are then written in parallel, compact chunks. A cross-category dedup/merge pass resolves near-duplicate KPI concepts (obvious duplicates deterministically, borderline pairs by one batched judge call) before the result is shown, grouped by category, both on screen and in the saved `kpi_nodes` hierarchy.
 - **Dynamic KPI count, no fixed ceiling** — the number of KPIs follows the use case. Ask for "35 KPIs" (or "30-40", "forty") and the result lands within ±2 of that; if the task honestly doesn't support that many distinct, good KPIs it returns fewer and tells you why instead of padding. Only high safety limits apply (300 KPIs total, 60 per category, 24 categories).
 - **Follow-up edits are one small operation** — "make Customer Satisfaction Score 8% and scale the others" is applied by the server (`edit_kpis`: set weight with proportional rebalance, rename, remove, add, move, regenerate one KPI's guidelines), so the model never has to re-type the whole scorecard. The reply is a server-built summary of what really changed.
+- **Fix the rubrics the scorer struggles with** — the assistant can review, research and rewrite guidelines for one KPI, a hand-picked set or a whole category, or write exact levels itself, in several steps within one message. Its review shows how sure the evaluation scorer (Jev) was on each KPI across the chart's past evaluations. See [Fixing KPI guidelines from the chat](#fixing-kpi-guidelines-from-the-chat).
 - **Chat turns run in the background** — sending a message returns immediately (`202`); the UI polls the session and a live trace, so the draft header, your KPIs, weights and guidelines appear on screen as they are ready, with no refresh, an elapsed timer and a Cancel button. A refresh mid-turn resumes where it was.
 - **Cheap request routing** — a free keyword/format check, then Jev's multiple-choice `choice` question (or the small judge model) decides the mode; only a confident "open-ended" skips the full extraction, and a clearly structured list is parsed with zero model calls.
 - **Embedding-based reuse suggestions** — a new request is checked against existing scorecards (pgvector cosine similarity over Titan-embedded purpose text, threshold 0.75) and offered as "use as-is / adapt / start fresh" *before* generating from scratch.
@@ -40,13 +41,13 @@ The system-level architecture diagram lives in [architecture.md](architecture.md
 
 ### The chat assistant
 
-Every message first reaches the assistant (`converse` node), which runs on the chat model the user picked (OpenRouter) or the Bedrock chat model, with real tool calling (`tool_choice: auto`, native tool results, at most 6 model steps and 3 web searches per message):
+Every message first reaches the assistant (`converse` node), which runs on the chat model the user picked (OpenRouter) or the Bedrock chat model, with real tool calling (`tool_choice: auto`, native tool results, at most 12 model steps and 3 web searches per message, plus up to 16 `research_kpis` searches):
 
 ```mermaid
 flowchart TD
     Msg["User message"] --> Chip{"A chip answer to the<br/>builder's own question?"}
     Chip -->|yes, no model call| Builder
-    Chip -->|no| Agent["Chat assistant (picked model)<br/>web_search · view_kpis · read_attachment ·<br/>update_scoring_formula (applied at once)"]
+    Chip -->|no| Agent["Chat assistant (picked model)<br/>web_search · view_kpis · read_attachment ·<br/>update_scoring_formula · rubric tools (applied at once)"]
     Agent -->|plain answer| Reply["Reply, pause for the next message"]
     Agent -->|ask_user| Card["Question card with chips"]
     Agent -->|edit_kpis| Edit["Server applies the ops, rebalances weights,<br/>writes new rubrics on the builder model"]
@@ -57,6 +58,19 @@ flowchart TD
 The assistant sees a compact outline of the draft (names, weights, categories, what is missing) and pulls rubric text or more of a file with its tools only when needed. A brief it hands the builder is used for the similarity search and the research context, and shown to the builder's model as an internal note. Because small talk no longer reaches the builder, the once-per-session research fan-out is spent only when a scorecard is actually requested. `CHAT_AGENT=false` restores the old wiring (every message straight into the builder). The trace card shows the assistant as its own lane next to the builder ("Master") and the research agents.
 
 **Which model does what (OpenRouter):** the picked chat model answers and decides; `OPENROUTER_KPI_MODEL` (GPT-5.6 Luna) runs every builder call, the builder's judge-tier helpers, session titles and the web-search sub-call; `OPENROUTER_AGENT_MODEL` (GPT-5 mini) stays on evaluations. Claude 5.x rejects a forced `tool_choice`, so it is only ever sent `auto` (the client asks for a tool in words when a caller would force one) and never sampling parameters. The assistant's calls keep the provider's reasoning state between tool steps, put a prompt-cache point after the latest message (Claude), and send `x-session-id` for sticky routing. Each reply in the transcript is labelled with the model that wrote it.
+
+### Fixing KPI guidelines from the chat
+
+Evaluations are scored by Jev, which places the selected evidence on a KPI's guideline levels 1-10. When neighbouring levels cannot be told apart from what a submission shows ("Both declarations stated clearly" / "... signed or attributed"), Jev spreads its answer over several levels and its confidence drops, so the fix belongs in the rubric. The assistant has four tools for it (`app/ai/kpi_rubric_tools.py`), all applied inside its own loop so it can chain them in one message: review, research, fix one category, check, fix the next.
+
+| Tool | What it does |
+|---|---|
+| `review_rubrics` | Worst first, for given KPIs, a category or all: Jev's measured confidence on this chart's past evaluations (avg, share below 0.35, avg score; the chart the chat edits, all versions, matched by KPI name) and text checks (missing, identical or near-identical levels, terse levels, levels with no countable condition, thresholds that just restate the level number, too few distinct thresholds, the generic fallback rubric). |
+| `research_kpis` | One web search per KPI (up to 8 per call, 16 per message, 60 per session, separate from the builder's budget). The results go to `rewrite_guidelines` for those KPIs. |
+| `rewrite_guidelines` | Rewrites whole rubrics for named KPIs and/or a category (up to 30 per call) with the builder's rubric writer on the builder's model, given each KPI's current rubric, its problems, the measured confidence, the assistant's instructions and the research. A KPI the writer fails on keeps its old rubric. |
+| `set_kpi_guidelines` | Exact levels written by the assistant, for any subset of levels of up to 20 KPIs, with optional thresholds. Rejected as a whole if a level would duplicate another. |
+
+The measured confidence is the signal to trust. On the RADIX scorecard the text checks alone did not predict which KPIs Jev was unsure about (the five lowest, 0.20-0.33, had ordinary-looking criteria), which is why the review leads with it. Rubric changes apply to the chat's draft; saving it creates a new version of the chart, and new evaluations use it.
 
 ### Chat attachments
 
@@ -377,38 +391,30 @@ aws/teardown.sh                     # removes everything (asks you to type the b
 
 `bootstrap` writes `S3_BUCKET`, `SFN_STATE_MACHINE_ARN` and the backend user's access key into the git-ignored `infra/.env` (never printed). Without them the rest of the app works, and only the AI judge's file and Drive flow is unavailable.
 
-### Manual evaluation and the text-only ensemble judge (one shared computation)
+### Manual evaluation (same final-score computation as the AI pipeline)
 
 ```mermaid
 sequenceDiagram
     actor Evaluator
     participant UI as Charts › Evaluate tab
     participant API as FastAPI /evaluations
-    participant Judge as Ensemble judge (judge.py)
-    participant Bedrock as AWS Bedrock — GLM-4.7-Flash
     participant Formula as compute_final_score()
     participant DB as Postgres
 
-    Evaluator->>UI: Choose AI-assisted or manual scoring
-    alt AI ensemble judge
-        UI->>API: POST /evaluations/{id}/run with input_text
-        API->>Judge: run_judge(evaluation, input_text)
-        Judge->>Bedrock: one shared evidence-extraction call
-        Note over Judge,Bedrock: per leaf KPI, run concurrently -- k=3 record_kpi_judgment calls, guideline order perturbed each time
-        Bedrock-->>Judge: matched_level, evidence_quotes, reasoning, score (x3 per KPI)
-        Judge->>Judge: aggregate by median, flag needs_review when spread exceeds 2 pts or levels disagree
-    else Manual scoring
-        Evaluator->>UI: Score every leaf KPI by hand
-        UI->>API: POST /evaluations/{id}/results  (one score per KPI)
-        UI->>API: POST /evaluations/{id}/finalize
-    end
+    Evaluator->>UI: Score every leaf KPI by hand
+    UI->>API: POST /evaluations/{id}/results  (one score per KPI)
+    UI->>API: POST /evaluations/{id}/finalize
     API->>Formula: compute_final_score(leaves, scores, effective_weights, scoring_formula)
     Formula->>Formula: default weighted average, OR custom simpleeval formula, clamped to [0,10]
     Formula-->>API: final_weighted_score
     API->>API: rag_band_for_score() — 7-band RAG palette
     API->>DB: persist evaluation + evaluation_kpi_results
-    API-->>UI: score, RAG band, per-KPI reasoning + verbatim evidence
+    API-->>UI: score, RAG band, per-KPI scores
 ```
+
+AI-assisted scoring goes through the AI evaluation pipeline above (evidence selection, then Jev per KPI); its
+aggregate step calls the same `compute_final_score()`, so a manual and an AI evaluation of one scorecard never
+disagree about what its score means.
 
 ## Observed performance
 
@@ -455,4 +461,3 @@ What moved the numbers: compact rubrics (≈4× fewer output tokens per KPI), sm
 - **The scorecard decides what is measurable.** A submission is judged only against the KPIs it is run against; evidence that does not exist for a KPI scores low or zero by design (a customer-support scorecard run on a fleet-safety hackathon entry scores poorly).
 - **Jev is an alpha API** (32k-token context, at most 10 score levels, no published rate limits); a KPI Jev cannot score falls back to one model judgment and is flagged `needs_review`.
 - **Several dispatchers are supported.** Each evaluation is driven by the worker that holds its lease; when that worker dies or drains, another one adopts the row and resumes the Step Functions execution by ARN (scoring is idempotent). The global cap `AI_EVAL_MAX_CONCURRENT` is enforced in Postgres across all workers, and each user may have only one running evaluation job (see [architecture.md](architecture.md#2-evaluation-pipeline-and-lease-lifecycle)).
-- **The old synchronous `POST /evaluations/{id}/run` (text only) still exists** but the UI no longer uses it.
